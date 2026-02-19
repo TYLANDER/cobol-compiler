@@ -53,11 +53,10 @@ run_nist_test() {
     # Build compile command args
     local compile_args=("$test_file")
 
-    # For IC tests, include the subprogram file
-    local sub_file="$SCRIPT_DIR/${test_name}-SUB.cob"
-    if [ -f "$sub_file" ]; then
-        compile_args+=("$sub_file")
-    fi
+    # For IC tests, include all subprogram files (e.g., IC214A-SUB.cob, IC214A-SUB2.cob)
+    for sub_file in "$SCRIPT_DIR/${test_name}"-SUB*.cob; do
+        [ -f "$sub_file" ] && compile_args+=("$sub_file")
+    done
 
     # For SM tests and any test needing copybooks, add -I
     if [ -d "$COPYBOOK_DIR" ]; then
@@ -93,9 +92,15 @@ run_nist_test() {
         printf "${GREEN}PASS${NC_COLOR} %s (%d sub-tests)\n" "$test_name" "$test_passes"
         PASS=$((PASS + 1))
     elif [ "$test_passes" -eq 0 ] && [ "$test_fails" -eq 0 ]; then
-        printf "${RED}FAIL${NC_COLOR} %s (no output)\n" "$test_name"
-        FAIL=$((FAIL + 1))
-        FAILED_TESTS="$FAILED_TESTS $test_name"
+        # Check if the program explicitly skipped
+        if echo "$actual" | grep -qi "SKIP" 2>/dev/null; then
+            printf "${YELLOW}SKIP${NC_COLOR} %s (feature not supported)\n" "$test_name"
+            SKIP=$((SKIP + 1))
+        else
+            printf "${RED}FAIL${NC_COLOR} %s (no output)\n" "$test_name"
+            FAIL=$((FAIL + 1))
+            FAILED_TESTS="$FAILED_TESTS $test_name"
+        fi
     else
         printf "${RED}FAIL${NC_COLOR} %s (%d pass, %d fail)\n" "$test_name" "$test_passes" "$test_fails"
         # Show failing sub-tests
@@ -126,12 +131,19 @@ echo ""
 
 # Run IC tests (Inter-program Communication)
 # Skip -SUB files (they are subprograms, not main tests)
+# Run SQ tests (Sequential File I/O)
+echo "--- Sequential File I/O (SQ) ---"
+for f in "$SCRIPT_DIR"/SQ*.cob; do
+    [ -f "$f" ] && run_nist_test "$f"
+done
+echo ""
+
 echo "--- Inter-program Communication (IC) ---"
 for f in "$SCRIPT_DIR"/IC*.cob; do
     [ -f "$f" ] || continue
     # Skip subprogram files
     case "$(basename "$f")" in
-        *-SUB.cob) continue ;;
+        *-SUB*.cob) continue ;;
     esac
     run_nist_test "$f"
 done

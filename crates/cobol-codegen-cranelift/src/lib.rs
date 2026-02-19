@@ -415,6 +415,13 @@ impl CraneliftCodegen {
                 sig.params.push(AbiParam::new(types::I32)); // len
                 sig.returns.push(AbiParam::new(types::I32)); // 1=true, 0=false
             }
+            "cobolrt_sign_check" => {
+                sig.params.push(AbiParam::new(ptr)); // data ptr
+                sig.params.push(AbiParam::new(types::I32)); // len
+                sig.params.push(AbiParam::new(types::I32)); // scale
+                sig.params.push(AbiParam::new(types::I32)); // mode (0=POSITIVE, 1=NEGATIVE, 2=ZERO)
+                sig.returns.push(AbiParam::new(types::I32)); // 1=true, 0=false
+            }
             "cobolrt_last_size_error" => {
                 sig.returns.push(AbiParam::new(types::I32)); // 0 or 1
             }
@@ -534,6 +541,17 @@ impl CraneliftCodegen {
                 sig.params.push(AbiParam::new(types::I32)); // data_len
                 sig.params.push(AbiParam::new(ptr)); // pic string ptr
                 sig.params.push(AbiParam::new(types::I32)); // pic_len
+            }
+            "cobolrt_deedit" => {
+                // (src, src_len, pic, pic_len, dest, dest_len, dest_scale, dest_dot_pos)
+                sig.params.push(AbiParam::new(ptr)); // src ptr
+                sig.params.push(AbiParam::new(types::I32)); // src_len
+                sig.params.push(AbiParam::new(ptr)); // pic string ptr
+                sig.params.push(AbiParam::new(types::I32)); // pic_len
+                sig.params.push(AbiParam::new(ptr)); // dest ptr
+                sig.params.push(AbiParam::new(types::I32)); // dest_len
+                sig.params.push(AbiParam::new(types::I32)); // dest_scale
+                sig.params.push(AbiParam::new(types::I32)); // dest_dot_pos
             }
             "cobolrt_unstring_begin" => {
                 sig.params.push(AbiParam::new(types::I32)); // num_delimiters

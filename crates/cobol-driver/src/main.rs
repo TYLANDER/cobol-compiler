@@ -1532,6 +1532,124 @@ void cobolrt_format_numeric_edited(
     }
 }
 
+/*
+ * De-edit a numeric-edited field: strip editing characters ($, commas, spaces,
+ * asterisks, sign characters, B, /, etc.) and produce a raw numeric value in
+ * display format, right-justified and zero-padded into dest.
+ *
+ * src/src_len   : the edited source field (e.g. "$  1,234.56")
+ * pic/pic_len   : the PIC string of the source (e.g. "$ZZ,ZZ9.99")
+ * dest/dest_len : the target numeric field buffer
+ * dest_scale    : number of decimal digits in the target
+ * dest_dot_pos  : byte position of literal '.' in dest (-1 if none)
+ *
+ * Algorithm:
+ *  1. Walk source bytes: keep only digits and the decimal point '.'
+ *     Also detect sign from '-' characters or CR/DB suffixes.
+ *  2. Parse the cleaned string into integer and fractional parts.
+ *  3. Scale to dest_scale and write right-justified, zero-padded.
+ */
+void cobolrt_deedit(
+    const char *src, int src_len,
+    const char *pic, int pic_len,
+    char *dest, int dest_len,
+    int dest_scale, int dest_dot_pos
+) {
+    if (!src || !dest || src_len <= 0 || dest_len <= 0) return;
+
+    /* Step 1: Extract digits and decimal point from the edited source.
+     * We walk the source and keep only '0'-'9' and the first '.'.
+     * We also detect negative sign from '-', 'CR', 'DB'. */
+    int is_negative = 0;
+    char cleaned[256];
+    int cleaned_len = 0;
+    int found_dot = 0;
+
+    for (int i = 0; i < src_len && cleaned_len < (int)sizeof(cleaned) - 1; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (c >= '0' && c <= '9') {
+            cleaned[cleaned_len++] = (char)c;
+        } else if (c == '.' && !found_dot) {
+            cleaned[cleaned_len++] = '.';
+            found_dot = 1;
+        } else if (c == '-') {
+            is_negative = 1;
+        }
+    }
+    cleaned[cleaned_len] = '\0';
+
+    /* Check for CR/DB at the end of the source (sign indicators) */
+    if (src_len >= 2) {
+        char c1 = src[src_len - 2];
+        char c2 = src[src_len - 1];
+        if ((c1 == 'C' && c2 == 'R') || (c1 == 'D' && c2 == 'B')) {
+            is_negative = 1;
+        }
+    }
+
+    /* Step 2: Parse into integer and fractional parts */
+    long long int_part = 0;
+    long long frac_part = 0;
+    int frac_digits = 0;
+    int in_frac = 0;
+
+    for (int i = 0; i < cleaned_len; i++) {
+        if (cleaned[i] == '.') {
+            in_frac = 1;
+            continue;
+        }
+        if (cleaned[i] >= '0' && cleaned[i] <= '9') {
+            if (in_frac) {
+                frac_part = frac_part * 10 + (cleaned[i] - '0');
+                frac_digits++;
+            } else {
+                int_part = int_part * 10 + (cleaned[i] - '0');
+            }
+        }
+    }
+
+    /* Step 3: Build the result value scaled to dest_scale */
+    long long result = int_part;
+    if (dest_scale > 0) {
+        for (int i = 0; i < dest_scale; i++) {
+            result *= 10;
+        }
+        /* Adjust frac_part to dest_scale digits */
+        long long frac_adj = frac_part;
+        if (frac_digits < dest_scale) {
+            for (int i = 0; i < dest_scale - frac_digits; i++) {
+                frac_adj *= 10;
+            }
+        } else if (frac_digits > dest_scale) {
+            for (int i = 0; i < frac_digits - dest_scale; i++) {
+                frac_adj /= 10;
+            }
+        }
+        result += frac_adj;
+    }
+
+    /* Step 4: Write into dest, right-justified, zero-padded */
+    /* Fill with '0' */
+    memset(dest, '0', dest_len);
+    if (dest_dot_pos >= 0 && dest_dot_pos < dest_len) {
+        dest[dest_dot_pos] = '.';
+    }
+
+    /* Write digits right-to-left, skipping dot position */
+    unsigned long long val = (unsigned long long)(result < 0 ? -result : result);
+    for (int i = dest_len - 1; i >= 0; i--) {
+        if (dest_dot_pos >= 0 && i == dest_dot_pos) continue;
+        if (val > 0) {
+            dest[i] = '0' + (int)(val % 10);
+            val /= 10;
+        }
+    }
+
+    (void)pic;
+    (void)pic_len;
+    (void)is_negative;
+}
+
 /* ---- Class condition runtime functions ---- */
 
 /* IS NUMERIC: returns 1 if every byte is '0'-'9' (0x30-0x39). */

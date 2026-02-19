@@ -1130,7 +1130,9 @@ impl<'a> MirLowerer<'a> {
             cobol_hir::InitialValue::Numeric(n, _scale) => {
                 // Display format: ASCII digits, right-justified, zero-padded.
                 // For signed fields (PIC contains 'S'), negative values use
-                // trailing overpunch: last byte += 0x40.
+                // a leading '-' character (replacing the leading zero) so
+                // the runtime parse_display / parse_display_numeric can
+                // interpret the sign correctly.
                 let is_negative = *n < 0;
                 let is_signed = pic_str
                     .map(|p| p.to_ascii_uppercase().contains('S'))
@@ -1148,10 +1150,11 @@ impl<'a> MirLowerer<'a> {
                             bytes[pos] = num_bytes[num_bytes.len() - 1 - j];
                         }
                     }
-                    // Apply trailing overpunch for negative signed values
+                    // For negative signed values, replace leading zero with '-'
                     if is_signed && is_negative && !bytes.is_empty() {
-                        let last = bytes.len() - 1;
-                        bytes[last] = bytes[last].wrapping_add(0x40);
+                        if bytes[0] == b'0' {
+                            bytes[0] = b'-';
+                        }
                     }
                     MirConst::Bytes(bytes)
                 } else {
@@ -1166,10 +1169,11 @@ impl<'a> MirLowerer<'a> {
                             bytes[start + i] = *b;
                         }
                     }
-                    // Apply trailing overpunch for negative signed values
+                    // For negative signed values, replace leading zero with '-'
                     if is_signed && is_negative && !bytes.is_empty() {
-                        let last = bytes.len() - 1;
-                        bytes[last] = bytes[last].wrapping_add(0x40);
+                        if bytes[0] == b'0' {
+                            bytes[0] = b'-';
+                        }
                     }
                     MirConst::Bytes(bytes)
                 }
@@ -2558,7 +2562,7 @@ impl<'a> MirLowerer<'a> {
             };
 
             // Get target PIC info
-            let (target_is_numeric, target_scale, target_dot_pos, _target_is_signed) = self
+            let (target_is_numeric, target_scale, target_dot_pos, target_is_signed) = self
                 .data_item_pic_info(&target_name_str)
                 .unwrap_or((false, 0, -1, false));
 
@@ -2582,6 +2586,7 @@ impl<'a> MirLowerer<'a> {
                             // Scale the integer: e.g. MOVE 42 TO PIC 9(5)V99
                             // means 42.00, so internal representation is 4200
                             let scaled = (*n).unsigned_abs() * 10u64.pow(target_scale as u32);
+                            let is_negative = *n < 0;
                             if target_dot_pos >= 0 {
                                 // Edited numeric with literal '.'
                                 let mut bytes = Self::build_edited_zero_template(
@@ -2596,6 +2601,12 @@ impl<'a> MirLowerer<'a> {
                                 for (j, &pos) in digit_positions.iter().rev().enumerate() {
                                     if j < num_bytes.len() {
                                         bytes[pos] = num_bytes[num_bytes.len() - 1 - j];
+                                    }
+                                }
+                                // For negative signed values, replace leading zero with '-'
+                                if is_negative && target_is_signed && !bytes.is_empty() {
+                                    if bytes[0] == b'0' {
+                                        bytes[0] = b'-';
                                     }
                                 }
                                 let src_val = func.new_value();
@@ -2619,6 +2630,16 @@ impl<'a> MirLowerer<'a> {
                                 // Numeric without literal dot (V implies decimal)
                                 let display_str =
                                     format!("{:0>width$}", scaled, width = target_size as usize);
+                                // For negative signed values, replace leading zero with '-'
+                                let display_str = if is_negative && target_is_signed {
+                                    let mut bytes = display_str.into_bytes();
+                                    if !bytes.is_empty() && bytes[0] == b'0' {
+                                        bytes[0] = b'-';
+                                    }
+                                    String::from_utf8(bytes).unwrap()
+                                } else {
+                                    display_str
+                                };
                                 let src_val = func.new_value();
                                 instructions.push(MirInst::Const {
                                     dest: src_val,
@@ -2642,6 +2663,18 @@ impl<'a> MirLowerer<'a> {
                                 n.unsigned_abs(),
                                 width = target_size as usize
                             );
+                            // For negative values into signed targets, replace
+                            // the leading zero with '-' so the runtime can
+                            // interpret the sign.
+                            let display_str = if *n < 0 && target_is_signed {
+                                let mut bytes = display_str.into_bytes();
+                                if !bytes.is_empty() && bytes[0] == b'0' {
+                                    bytes[0] = b'-';
+                                }
+                                String::from_utf8(bytes).unwrap()
+                            } else {
+                                display_str
+                            };
                             let src_val = func.new_value();
                             instructions.push(MirInst::Const {
                                 dest: src_val,
@@ -2755,26 +2788,29 @@ impl<'a> MirLowerer<'a> {
                         .unwrap_or((false, 0, -1, false));
 
                     if src_is_numeric && target_is_numeric {
-                        // Check if the target is numeric-edited (has Z, *, $, etc.)
+                        // Check if source/target is numeric-edited (has Z, *, $, etc.)
+                        let src_is_edited = self.is_numeric_edited(&src_name);
                         let target_is_edited = self.is_numeric_edited(&target_name_str);
 
-                        if target_is_edited {
-                            // Numeric to NumericEdited: first do numeric move to
-                            // align digits, then apply numeric editing format.
+                        if src_is_edited && !target_is_edited {
+                            // NumericEdited to Numeric: de-edit the source.
+                            // Strip editing characters ($, commas, Z-spaces, etc.)
+                            // and extract the raw numeric value.
                             let v_src_len = func.new_value();
                             instructions.push(MirInst::Const {
                                 dest: v_src_len,
                                 value: MirConst::Int(src_size as i64),
                             });
-                            let v_src_scale = func.new_value();
+                            let src_pic_str = self.get_pic_string(&src_name).unwrap_or_default();
+                            let v_src_pic = func.new_value();
                             instructions.push(MirInst::Const {
-                                dest: v_src_scale,
-                                value: MirConst::Int(src_scale as i64),
+                                dest: v_src_pic,
+                                value: MirConst::Str(src_pic_str.clone()),
                             });
-                            let v_src_dot = func.new_value();
+                            let v_src_pic_len = func.new_value();
                             instructions.push(MirInst::Const {
-                                dest: v_src_dot,
-                                value: MirConst::Int(src_dot_pos as i64),
+                                dest: v_src_pic_len,
+                                value: MirConst::Int(src_pic_str.len() as i64),
                             });
                             let v_dest_len = func.new_value();
                             instructions.push(MirInst::Const {
@@ -2791,25 +2827,67 @@ impl<'a> MirLowerer<'a> {
                                 dest: v_dest_dot,
                                 value: MirConst::Int(target_dot_pos as i64),
                             });
-                            // Step 1: numeric move to get digits aligned
-                            let v_rounded_0a = func.new_value();
-                            instructions.push(MirInst::Const {
-                                dest: v_rounded_0a,
-                                value: MirConst::Int(0),
-                            });
                             instructions.push(MirInst::CallRuntime {
                                 dest: None,
-                                func: "cobolrt_move_numeric".to_string(),
+                                func: "cobolrt_deedit".to_string(),
                                 args: vec![
                                     src_addr,
                                     v_src_len,
-                                    v_src_scale,
-                                    v_src_dot,
+                                    v_src_pic,
+                                    v_src_pic_len,
                                     target_addr,
                                     v_dest_len,
                                     v_dest_scale,
                                     v_dest_dot,
-                                    v_rounded_0a,
+                                ],
+                            });
+                        } else if src_is_edited && target_is_edited {
+                            // NumericEdited to NumericEdited: de-edit source into
+                            // target (raw digits), then re-apply target editing.
+                            let v_src_len = func.new_value();
+                            instructions.push(MirInst::Const {
+                                dest: v_src_len,
+                                value: MirConst::Int(src_size as i64),
+                            });
+                            let src_pic_str = self.get_pic_string(&src_name).unwrap_or_default();
+                            let v_src_pic = func.new_value();
+                            instructions.push(MirInst::Const {
+                                dest: v_src_pic,
+                                value: MirConst::Str(src_pic_str.clone()),
+                            });
+                            let v_src_pic_len = func.new_value();
+                            instructions.push(MirInst::Const {
+                                dest: v_src_pic_len,
+                                value: MirConst::Int(src_pic_str.len() as i64),
+                            });
+                            let v_dest_len = func.new_value();
+                            instructions.push(MirInst::Const {
+                                dest: v_dest_len,
+                                value: MirConst::Int(target_size as i64),
+                            });
+                            let v_dest_scale = func.new_value();
+                            instructions.push(MirInst::Const {
+                                dest: v_dest_scale,
+                                value: MirConst::Int(target_scale as i64),
+                            });
+                            let v_dest_dot = func.new_value();
+                            instructions.push(MirInst::Const {
+                                dest: v_dest_dot,
+                                value: MirConst::Int(target_dot_pos as i64),
+                            });
+                            // Step 1: de-edit into target (raw numeric digits)
+                            instructions.push(MirInst::CallRuntime {
+                                dest: None,
+                                func: "cobolrt_deedit".to_string(),
+                                args: vec![
+                                    src_addr,
+                                    v_src_len,
+                                    v_src_pic,
+                                    v_src_pic_len,
+                                    target_addr,
+                                    v_dest_len,
+                                    v_dest_scale,
+                                    v_dest_dot,
                                 ],
                             });
                             // Step 2: apply numeric editing (Z suppress, comma, $, etc.)
@@ -2833,6 +2911,81 @@ impl<'a> MirLowerer<'a> {
                                 dest: None,
                                 func: "cobolrt_format_numeric_edited".to_string(),
                                 args: vec![target_addr, v_dest_len2, v_pic, v_pic_len],
+                            });
+                        } else if target_is_edited {
+                            // Numeric (plain) to NumericEdited: first do numeric
+                            // move to align digits, then apply numeric editing.
+                            let v_src_len_ne = func.new_value();
+                            instructions.push(MirInst::Const {
+                                dest: v_src_len_ne,
+                                value: MirConst::Int(src_size as i64),
+                            });
+                            let v_src_scale_ne = func.new_value();
+                            instructions.push(MirInst::Const {
+                                dest: v_src_scale_ne,
+                                value: MirConst::Int(src_scale as i64),
+                            });
+                            let v_src_dot_ne = func.new_value();
+                            instructions.push(MirInst::Const {
+                                dest: v_src_dot_ne,
+                                value: MirConst::Int(src_dot_pos as i64),
+                            });
+                            let v_dest_len_ne = func.new_value();
+                            instructions.push(MirInst::Const {
+                                dest: v_dest_len_ne,
+                                value: MirConst::Int(target_size as i64),
+                            });
+                            let v_dest_scale_ne = func.new_value();
+                            instructions.push(MirInst::Const {
+                                dest: v_dest_scale_ne,
+                                value: MirConst::Int(target_scale as i64),
+                            });
+                            let v_dest_dot_ne = func.new_value();
+                            instructions.push(MirInst::Const {
+                                dest: v_dest_dot_ne,
+                                value: MirConst::Int(target_dot_pos as i64),
+                            });
+                            let v_rounded_ne = func.new_value();
+                            instructions.push(MirInst::Const {
+                                dest: v_rounded_ne,
+                                value: MirConst::Int(0),
+                            });
+                            instructions.push(MirInst::CallRuntime {
+                                dest: None,
+                                func: "cobolrt_move_numeric".to_string(),
+                                args: vec![
+                                    src_addr,
+                                    v_src_len_ne,
+                                    v_src_scale_ne,
+                                    v_src_dot_ne,
+                                    target_addr,
+                                    v_dest_len_ne,
+                                    v_dest_scale_ne,
+                                    v_dest_dot_ne,
+                                    v_rounded_ne,
+                                ],
+                            });
+                            let pic_str_ne =
+                                self.get_pic_string(&target_name_str).unwrap_or_default();
+                            let v_pic_ne = func.new_value();
+                            instructions.push(MirInst::Const {
+                                dest: v_pic_ne,
+                                value: MirConst::Str(pic_str_ne.clone()),
+                            });
+                            let v_pic_len_ne = func.new_value();
+                            instructions.push(MirInst::Const {
+                                dest: v_pic_len_ne,
+                                value: MirConst::Int(pic_str_ne.len() as i64),
+                            });
+                            let v_dest_len2_ne = func.new_value();
+                            instructions.push(MirInst::Const {
+                                dest: v_dest_len2_ne,
+                                value: MirConst::Int(target_size as i64),
+                            });
+                            instructions.push(MirInst::CallRuntime {
+                                dest: None,
+                                func: "cobolrt_format_numeric_edited".to_string(),
+                                args: vec![target_addr, v_dest_len2_ne, v_pic_ne, v_pic_len_ne],
                             });
                         } else if src_scale == target_scale
                             && src_dot_pos == target_dot_pos
@@ -5944,17 +6097,19 @@ impl<'a> MirLowerer<'a> {
     ) -> Option<(Value, u32)> {
         match expr {
             cobol_hir::HirExpr::Literal(cobol_hir::LiteralValue::Integer(n)) => {
-                // Create a display-format string constant for the integer
-                let s = format!("{}", n.unsigned_abs());
+                // Create a display-format string constant for the integer.
+                // For negative values, include a leading '-' so the runtime
+                // arithmetic functions can determine the sign.
+                let s = if *n < 0 {
+                    format!("-{}", n.unsigned_abs())
+                } else {
+                    format!("{}", n)
+                };
                 let size = s.len().max(1) as u32;
                 let str_val = func.new_value();
                 instructions.push(MirInst::Const {
                     dest: str_val,
-                    value: MirConst::Str(format!(
-                        "{:0>width$}",
-                        n.unsigned_abs(),
-                        width = size as usize
-                    )),
+                    value: MirConst::Str(s),
                 });
                 let len_val = func.new_value();
                 instructions.push(MirInst::Const {
@@ -6428,11 +6583,19 @@ impl<'a> MirLowerer<'a> {
                                 |cv: &Option<cobol_hir::InitialValue>, psize: u32| -> String {
                                     match cv {
                                         Some(cobol_hir::InitialValue::Numeric(n, _)) => {
-                                            format!(
+                                            let mut s = format!(
                                                 "{:0>width$}",
                                                 n.unsigned_abs(),
                                                 width = psize as usize
-                                            )
+                                            );
+                                            if *n < 0 {
+                                                let mut bytes = s.into_bytes();
+                                                if !bytes.is_empty() && bytes[0] == b'0' {
+                                                    bytes[0] = b'-';
+                                                }
+                                                s = String::from_utf8(bytes).unwrap();
+                                            }
+                                            s
                                         }
                                         Some(cobol_hir::InitialValue::String_(s)) => s.clone(),
                                         Some(cobol_hir::InitialValue::Zero) => {
@@ -6829,8 +6992,14 @@ impl<'a> MirLowerer<'a> {
         match expr {
             cobol_hir::HirExpr::DataRef(_) => self.emit_expr_addr(expr, func, instructions),
             cobol_hir::HirExpr::Literal(cobol_hir::LiteralValue::Integer(n)) => {
-                // Create a string constant in display format for comparison
-                let s = format!("{}", n.unsigned_abs());
+                // Create a string constant in display format for comparison.
+                // For negative values, include a leading '-' so the runtime
+                // parse_display_numeric can determine the sign.
+                let s = if *n < 0 {
+                    format!("-{}", n.unsigned_abs())
+                } else {
+                    format!("{}", n)
+                };
                 let size = s.len() as u32;
                 let str_val = func.new_value();
                 instructions.push(MirInst::Const {
@@ -6872,6 +7041,13 @@ impl<'a> MirLowerer<'a> {
                     value: MirConst::Str(s),
                 });
                 Some((str_val, size))
+            }
+            cobol_hir::HirExpr::UnaryOp { .. }
+            | cobol_hir::HirExpr::BinaryOp { .. }
+            | cobol_hir::HirExpr::FunctionCall { .. } => {
+                // Delegate arithmetic expressions (including unary negation)
+                // to the arithmetic expression emitter.
+                self.emit_arithmetic_expr(expr, func, instructions)
             }
             _ => None,
         }
@@ -7109,11 +7285,19 @@ impl<'a> MirLowerer<'a> {
                     // Format the condition value as a string and move it to the parent
                     let val_str = match cond_value {
                         Some(Some(cobol_hir::InitialValue::Numeric(n, _))) => {
-                            format!(
+                            let mut s = format!(
                                 "{:0>width$}",
                                 n.unsigned_abs(),
                                 width = parent_size as usize
-                            )
+                            );
+                            if *n < 0 {
+                                let mut bytes = s.into_bytes();
+                                if !bytes.is_empty() && bytes[0] == b'0' {
+                                    bytes[0] = b'-';
+                                }
+                                s = String::from_utf8(bytes).unwrap();
+                            }
+                            s
                         }
                         Some(Some(cobol_hir::InitialValue::String_(s))) => {
                             format!("{:<width$}", s, width = parent_size as usize)
@@ -7606,11 +7790,14 @@ impl<'a> MirLowerer<'a> {
                 );
             }
             cobol_hir::PerformType::Varying {
+                target,
+                thru,
                 varying,
                 inline_body,
-                ..
             } => {
                 self.lower_perform_varying(
+                    *target,
+                    thru.as_ref().copied(),
                     varying,
                     inline_body.as_deref(),
                     func,
@@ -8422,6 +8609,8 @@ impl<'a> MirLowerer<'a> {
 
     fn lower_perform_varying(
         &mut self,
+        target: cobol_intern::Name,
+        thru: Option<cobol_intern::Name>,
         varying: &cobol_hir::VaryingClause,
         inline_body: Option<&[cobol_hir::HirStatement]>,
         func: &mut MirFunction,
@@ -8465,6 +8654,8 @@ impl<'a> MirLowerer<'a> {
         // If there are AFTER clauses, we generate nested inner loops recursively.
         // If there are no AFTER clauses, we just emit the body + increment.
         self.lower_varying_body(
+            target,
+            thru,
             &varying.after,
             inline_body,
             &var_name,
@@ -8491,6 +8682,8 @@ impl<'a> MirLowerer<'a> {
     /// we jump back to after incrementing the parent variable.
     fn lower_varying_body(
         &mut self,
+        target: cobol_intern::Name,
+        thru: Option<cobol_intern::Name>,
         after_clauses: &[cobol_hir::VaryingClause],
         inline_body: Option<&[cobol_hir::HirStatement]>,
         parent_var_name: &str,
@@ -8508,6 +8701,18 @@ impl<'a> MirLowerer<'a> {
             if let Some(stmts) = inline_body {
                 for stmt in stmts {
                     self.lower_statement_to_blocks(stmt, func, &mut body_bid, &mut body_insts);
+                }
+            } else {
+                // Out-of-line PERFORM VARYING: inline the paragraph range
+                let target_name = self.interner.resolve(target).to_string();
+                if target_name != "_INLINE" {
+                    self.lower_perform_out_of_line(
+                        target,
+                        thru,
+                        func,
+                        &mut body_bid,
+                        &mut body_insts,
+                    );
                 }
             }
             self.emit_varying_increment(
@@ -8567,6 +8772,8 @@ impl<'a> MirLowerer<'a> {
             // Recurse: the body of this AFTER level either contains
             // deeper AFTER levels or the actual inline body.
             self.lower_varying_body(
+                target,
+                thru,
                 &after_clauses[1..],
                 inline_body,
                 &after_var_name,

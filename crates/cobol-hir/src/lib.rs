@@ -2211,6 +2211,9 @@ impl<'a> HirLowerer<'a> {
                 SyntaxKind::EXIT_STMT => {
                     stmts.push(self.lower_exit_stmt(&child));
                 }
+                SyntaxKind::CONTINUE_STMT => {
+                    stmts.push(HirStatement::Continue);
+                }
                 SyntaxKind::OPEN_STMT => {
                     if let Some(s) = self.lower_open_stmt(&child) {
                         stmts.push(s);
@@ -2602,9 +2605,28 @@ impl<'a> HirLowerer<'a> {
     /// - `WS-ITEM(1)` → DataRef with literal subscript
     /// - `WS-ITEM(WS-I)` → DataRef with variable subscript
     /// - `42` → Integer literal
+    /// - `-42` → Negative integer literal
     fn parse_expr_at(&mut self, tokens: &[(SyntaxKind, String)], pos: usize) -> (HirExpr, usize) {
         if pos >= tokens.len() {
             return (HirExpr::Literal(LiteralValue::Integer(0)), pos);
+        }
+
+        // Handle leading minus sign: `-` followed by a numeric literal
+        if tokens[pos].0 == SyntaxKind::MINUS {
+            if pos + 1 < tokens.len() {
+                match tokens[pos + 1].0 {
+                    SyntaxKind::INTEGER_LITERAL => {
+                        if let Ok(n) = tokens[pos + 1].1.parse::<i64>() {
+                            return (HirExpr::Literal(LiteralValue::Integer(-n)), pos + 2);
+                        }
+                    }
+                    SyntaxKind::DECIMAL_LITERAL => {
+                        let neg = format!("-{}", tokens[pos + 1].1);
+                        return (HirExpr::Literal(LiteralValue::Decimal(neg)), pos + 2);
+                    }
+                    _ => {}
+                }
+            }
         }
 
         let (kind, text) = &tokens[pos];
@@ -5412,6 +5434,9 @@ impl<'a> HirLowerer<'a> {
             SyntaxKind::EXIT_STMT => {
                 stmts.push(self.lower_exit_stmt(node));
             }
+            SyntaxKind::CONTINUE_STMT => {
+                stmts.push(HirStatement::Continue);
+            }
             SyntaxKind::OPEN_STMT => {
                 if let Some(s) = self.lower_open_stmt(node) {
                     stmts.push(s);
@@ -6077,9 +6102,40 @@ impl<'a> HirLowerer<'a> {
                 Some(inline_stmts)
             };
 
+            // Check for out-of-line target paragraph before VARYING.
+            // Token layout: PERFORM [target [THRU thru]] VARYING var FROM ...
+            // Find the starting index (skip "PERFORM" at idx 0).
+            let perform_skip = if !tokens.is_empty() && tokens[0].1.eq_ignore_ascii_case("PERFORM")
+            {
+                1
+            } else {
+                0
+            };
+            let (vary_target, vary_thru) = if perform_skip < varying_idx {
+                // There are tokens between PERFORM and VARYING — first is
+                // the target paragraph name.
+                let target_name = tokens[perform_skip].1.to_ascii_uppercase();
+                let target = self.interner.intern(&target_name);
+                let mut thru = None;
+                let next = perform_skip + 1;
+                if next < varying_idx
+                    && (tokens[next].1.eq_ignore_ascii_case("THRU")
+                        || tokens[next].1.eq_ignore_ascii_case("THROUGH"))
+                {
+                    let thru_idx = next + 1;
+                    if thru_idx < varying_idx {
+                        let thru_name = tokens[thru_idx].1.to_ascii_uppercase();
+                        thru = Some(self.interner.intern(&thru_name));
+                    }
+                }
+                (target, thru)
+            } else {
+                (self.interner.intern("_INLINE"), None)
+            };
+
             Some(HirStatement::Perform(PerformType::Varying {
-                target: self.interner.intern("_INLINE"),
-                thru: None,
+                target: vary_target,
+                thru: vary_thru,
                 varying: VaryingClause {
                     identifier: var_ref,
                     from: from_expr,

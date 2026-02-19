@@ -2865,6 +2865,14 @@ impl<'t> Parser<'t> {
         }
 
         // Left side: an arithmetic expression (one or more atoms with +,-,*,/,**)
+        // Handle unary minus/plus before a literal (e.g., IF -5 = WS-A)
+        if !self.at_end()
+            && (self.current_kind() == cobol_lexer::TokenKind::Minus
+                || self.current_kind() == cobol_lexer::TokenKind::Plus)
+        {
+            self.bump(); // consume the sign
+            self.skip_ws();
+        }
         if self.at_literal()
             || self.at_figurative()
             || self.at_identifier()
@@ -2941,6 +2949,14 @@ impl<'t> Parser<'t> {
 
             // Right side
             self.skip_ws();
+            // Handle unary minus/plus before a literal (e.g., IF X = -5)
+            if !self.at_end()
+                && (self.current_kind() == cobol_lexer::TokenKind::Minus
+                    || self.current_kind() == cobol_lexer::TokenKind::Plus)
+            {
+                self.bump(); // consume the sign
+                self.skip_ws();
+            }
             if self.at_literal()
                 || self.at_figurative()
                 || self.at_identifier()

@@ -8,6 +8,24 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 /// NIST CCVS Test Runner for cobolc
+///
+/// Supported test modules (NC series):
+///   NC101A-NC127A : Core nucleus tests (MOVE, IF, PERFORM, COMPUTE, etc.)
+///   NC128A-NC170A : Intermediate nucleus (tables, STRING, UNSTRING, INSPECT)
+///   NC171A-NC199A : Advanced nucleus (SORT, MERGE, file I/O basics)
+///   NC200A-NC299A : Extended nucleus features
+///   NC300A-NC330A : Complex EVALUATE, group MOVE, DIVIDE, ON SIZE ERROR
+///   NC331A-NC340A : Advanced features:
+///     NC331A - INSPECT TALLYING with multiple BEFORE/AFTER phrases
+///     NC332A - INSPECT REPLACING LEADING/TRAILING with BEFORE/AFTER
+///     NC333A - Reference modification on group items
+///     NC334A - Qualification with OF/IN (nested group access)
+///     NC335A - PERFORM VARYING with AFTER (nested loop variables)
+///     NC336A - Numeric moves with truncation and zero-padding
+///     NC337A - Alphanumeric comparison rules (space padding)
+///     NC338A - Level-88 condition names with VALUES and THRU ranges
+///     NC339A - EVALUATE with ALSO (multi-subject EVALUATE)
+///     NC340A - MOVE CORRESPONDING with nested groups
 #[derive(Parser, Debug)]
 #[command(name = "nist-runner", version, about)]
 struct Cli {
@@ -26,6 +44,10 @@ struct Cli {
     /// Path to known_failures.toml
     #[arg(short, long)]
     known_failures: Option<PathBuf>,
+
+    /// Path to expected output directory (contains <TEST-NAME>.txt files)
+    #[arg(short, long)]
+    expected_dir: Option<PathBuf>,
 
     /// Output format: text, json
     #[arg(long, default_value = "text", value_parser = ["text", "json"])]
@@ -204,6 +226,7 @@ fn main() {
             Duration::from_secs(cli.timeout),
             cli.verbose,
             known_failures.reasons.get(&test_name).cloned(),
+            cli.expected_dir.as_deref(),
         );
 
         if cli.format == "text" {
@@ -256,6 +279,12 @@ fn discover_tests(suite_dir: &Path, module: &str, filter: Option<&str>) -> Vec<P
                 .to_string_lossy()
                 .to_string();
 
+            // Skip sub-program files (e.g., IC211A-SUB.cob, IC214A-SUB2.cob)
+            // These are compiled together with their main program, not standalone.
+            if name.contains("-SUB") {
+                continue;
+            }
+
             // Filter by module prefix (first 2 characters, e.g., "NC", "SM")
             if module != "all" {
                 let prefix = if name.len() >= 2 { &name[..2] } else { &name };
@@ -279,7 +308,46 @@ fn discover_tests(suite_dir: &Path, module: &str, filter: Option<&str>) -> Vec<P
     tests
 }
 
-/// Run a single NIST test: compile, execute, parse output.
+/// Find sub-program files associated with a test. For example, if the test
+/// is "IC211A", this looks for "IC211A-SUB.cob", "IC211A-SUB2.cob", etc.
+/// in the same directory as the source file.
+fn find_sub_programs(source: &Path, test_name: &str) -> Vec<PathBuf> {
+    let mut subs = Vec::new();
+    let dir = match source.parent() {
+        Some(d) => d,
+        None => return subs,
+    };
+
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return subs,
+    };
+
+    let prefix = format!("{}-SUB", test_name);
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Some(ext) = path.extension() {
+            if ext == "cob" || ext == "CBL" || ext == "cbl" {
+                let name = path
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                // Match "TESTNAME-SUB" or "TESTNAME-SUB2", "TESTNAME-SUB3", etc.
+                if name.starts_with(&prefix) {
+                    subs.push(path);
+                }
+            }
+        }
+    }
+
+    subs.sort();
+    subs
+}
+
+/// Run a single NIST test: compile, execute, parse output, and optionally
+/// verify against expected output file.
 fn run_test(
     compiler: &Path,
     source: &Path,
@@ -289,6 +357,7 @@ fn run_test(
     timeout: Duration,
     verbose: bool,
     reason: Option<String>,
+    expected_dir: Option<&Path>,
 ) -> TestResult {
     let start = Instant::now();
 
@@ -297,12 +366,18 @@ fn run_test(
     let _ = fs::create_dir_all(&tmp_dir);
     let binary = tmp_dir.join(test_name);
 
-    // Step 1: Compile
-    let compile_result = Command::new(compiler)
-        .arg(source)
-        .arg("-o")
-        .arg(&binary)
-        .output();
+    // Find sub-program files (e.g., IC211A-SUB.cob, IC214A-SUB2.cob)
+    // that should be compiled and linked with the main program.
+    let sub_programs = find_sub_programs(source, test_name);
+
+    // Step 1: Compile (main program + any sub-programs)
+    let mut cmd = Command::new(compiler);
+    cmd.arg(source);
+    for sub in &sub_programs {
+        cmd.arg(sub);
+    }
+    cmd.arg("-o").arg(&binary);
+    let compile_result = cmd.output();
 
     let compile_output = match compile_result {
         Ok(output) => output,
@@ -363,8 +438,32 @@ fn run_test(
                 eprintln!("  [stdout] {}", stdout.trim());
             }
 
-            let outcome = if fail_count > 0 {
-                // Test had failures
+            // Check against expected output file if expected_dir is provided
+            let expected_mismatch = if let Some(exp_dir) = expected_dir {
+                let expected_file = exp_dir.join(format!("{}.txt", test_name));
+                match fs::read_to_string(&expected_file) {
+                    Ok(expected) => {
+                        let actual_trimmed = stdout.trim();
+                        let expected_trimmed = expected.trim();
+                        if actual_trimmed != expected_trimmed {
+                            if verbose {
+                                eprintln!("  [expected output mismatch]");
+                                eprintln!("    expected: {}", expected_trimmed);
+                                eprintln!("    actual:   {}", actual_trimmed);
+                            }
+                            Some(format!("Output mismatch vs {}", expected_file.display()))
+                        } else {
+                            None
+                        }
+                    }
+                    Err(_) => None, // No expected file; skip comparison
+                }
+            } else {
+                None
+            };
+
+            let outcome = if fail_count > 0 || expected_mismatch.is_some() {
+                // Test had failures or output mismatch
                 if is_expected_runtime_fail || is_expected_compile_fail {
                     TestOutcome::ExpectedFail
                 } else {
@@ -392,7 +491,7 @@ fn run_test(
                 pass_count,
                 fail_count,
                 duration_ms: elapsed.as_millis() as u64,
-                detail: reason.or_else(|| {
+                detail: reason.or(expected_mismatch).or_else(|| {
                     if fail_count > 0 {
                         Some(format!("{} pass, {} fail", pass_count, fail_count))
                     } else if pass_count == 0 {

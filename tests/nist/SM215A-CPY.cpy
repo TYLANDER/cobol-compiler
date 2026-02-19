@@ -1,0 +1,2 @@
+       01 :PFX:-ITEM PIC X(10) VALUE :LIT:.
+       01 :PFX:-COUNT PIC 9(4) VALUE :NUM:.
