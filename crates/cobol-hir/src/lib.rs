@@ -348,6 +348,7 @@ pub enum HirStatement {
         returning: Option<HirDataRef>,
     },
     StopRun,
+    GoBack,
     Accept {
         target: HirDataRef,
         source: AcceptSource,
@@ -389,6 +390,9 @@ pub enum HirStatement {
     },
     Initialize {
         targets: Vec<HirDataRef>,
+        /// Optional REPLACING clause: (category, replacement_value) pairs.
+        /// Categories: "NUMERIC", "ALPHANUMERIC", "ALPHABETIC", etc.
+        replacing: Vec<(String, HirExpr)>,
     },
     Search {
         table: HirDataRef,
@@ -526,11 +530,22 @@ pub enum PerformType {
         thru: Option<cobol_intern::Name>,
         times: HirExpr,
     },
+    /// Inline PERFORM n TIMES ... END-PERFORM (no paragraph name)
+    InlineTimes {
+        times: HirExpr,
+        statements: Vec<HirStatement>,
+    },
     Until {
         target: cobol_intern::Name,
         thru: Option<cobol_intern::Name>,
         condition: HirExpr,
         test_before: bool,
+    },
+    /// Inline PERFORM UNTIL condition ... END-PERFORM (no paragraph name)
+    InlineUntil {
+        condition: HirExpr,
+        test_before: bool,
+        statements: Vec<HirStatement>,
     },
     Varying {
         target: cobol_intern::Name,
@@ -1786,7 +1801,12 @@ impl<'a> HirLowerer<'a> {
                     stmts.push(self.lower_display_stmt(&child));
                 }
                 SyntaxKind::STOP_STMT => {
-                    stmts.push(HirStatement::StopRun);
+                    let tokens = self.collect_all_tokens(&child);
+                    if tokens.iter().any(|(_, t)| t.eq_ignore_ascii_case("GOBACK")) {
+                        stmts.push(HirStatement::GoBack);
+                    } else {
+                        stmts.push(HirStatement::StopRun);
+                    }
                 }
                 SyntaxKind::MOVE_STMT => {
                     if let Some(s) = self.lower_move_stmt(&child) {
@@ -1909,52 +1929,57 @@ impl<'a> HirLowerer<'a> {
     }
 
     fn lower_display_stmt(&mut self, node: &cobol_ast::SyntaxNode) -> HirStatement {
+        let tokens = self.collect_tokens(node);
         let mut args = Vec::new();
         let mut no_advancing = false;
+        let mut i = 0;
 
-        for el in node.children_with_tokens() {
-            if let Some(tok) = el.into_token() {
-                match tok.kind() {
-                    SyntaxKind::STRING_LITERAL => {
-                        let text = tok.text().to_string();
-                        let inner = if (text.starts_with('"') && text.ends_with('"'))
-                            || (text.starts_with('\'') && text.ends_with('\''))
-                        {
-                            text[1..text.len() - 1].to_string()
-                        } else {
-                            text
-                        };
-                        args.push(HirExpr::Literal(LiteralValue::String_(inner)));
-                    }
-                    SyntaxKind::INTEGER_LITERAL => {
-                        let text = tok.text().to_string();
-                        if let Ok(n) = text.parse::<i64>() {
-                            args.push(HirExpr::Literal(LiteralValue::Integer(n)));
+        while i < tokens.len() {
+            let (kind, ref text) = tokens[i];
+            let upper = text.to_ascii_uppercase();
+
+            match upper.as_str() {
+                "DISPLAY" | "UPON" | "WITH" | "IS" | "STANDARD-1" | "STANDARD-2"
+                | "CONSOLE" => {
+                    i += 1;
+                }
+                "NO" => {
+                    i += 1;
+                }
+                "ADVANCING" => {
+                    no_advancing = true;
+                    i += 1;
+                }
+                "(" | ")" | ":" | "," => {
+                    i += 1; // skip stray punctuation
+                }
+                _ => {
+                    match kind {
+                        SyntaxKind::STRING_LITERAL => {
+                            let inner = if (text.starts_with('"') && text.ends_with('"'))
+                                || (text.starts_with('\'') && text.ends_with('\''))
+                            {
+                                text[1..text.len() - 1].to_string()
+                            } else {
+                                text.clone()
+                            };
+                            args.push(HirExpr::Literal(LiteralValue::String_(inner)));
+                            i += 1;
+                        }
+                        SyntaxKind::INTEGER_LITERAL | SyntaxKind::DECIMAL_LITERAL => {
+                            args.push(self.token_to_expr(kind, text));
+                            i += 1;
+                        }
+                        SyntaxKind::WORD => {
+                            // Use parse_expr_at to handle subscripts and ref-mod
+                            let (expr, next) = self.parse_expr_at(&tokens, i);
+                            args.push(expr);
+                            i = next;
+                        }
+                        _ => {
+                            i += 1;
                         }
                     }
-                    SyntaxKind::WORD => {
-                        let upper = tok.text().to_ascii_uppercase();
-                        match upper.as_str() {
-                            "DISPLAY" | "UPON" | "WITH" | "NO" | "ADVANCING"
-                            | "IS" | "STANDARD-1" | "STANDARD-2" | "CONSOLE" => {
-                                if upper == "ADVANCING" {
-                                    no_advancing = true;
-                                }
-                            }
-                            _ => {
-                                // Data reference
-                                let name = self.interner.intern(&upper);
-                                args.push(HirExpr::DataRef(Box::new(HirDataRef {
-                                    name,
-                                    qualifiers: Vec::new(),
-                                    subscripts: Vec::new(),
-                                    ref_mod: None,
-                                    resolved: None,
-                                })));
-                            }
-                        }
-                    }
-                    _ => {}
                 }
             }
         }
@@ -1963,129 +1988,36 @@ impl<'a> HirLowerer<'a> {
     }
 
     fn lower_move_stmt(&mut self, node: &cobol_ast::SyntaxNode) -> Option<HirStatement> {
-        let mut tokens: Vec<(SyntaxKind, String)> = Vec::new();
-        for el in node.children_with_tokens() {
-            if let Some(tok) = el.into_token() {
-                let kind = tok.kind();
-                if kind == SyntaxKind::WHITESPACE || kind == SyntaxKind::NEWLINE {
-                    continue;
-                }
-                tokens.push((kind, tok.text().to_string()));
-            }
-        }
+        let tokens = self.collect_tokens(node);
 
         // Find TO separator
         let to_idx = tokens.iter().position(|(_, text)| text.eq_ignore_ascii_case("TO"))?;
 
-        // Source is between MOVE and TO
+        // Source: parse from position 1 (after MOVE) using parse_expr_at for
+        // subscript/ref-mod awareness
         let source = if to_idx > 1 {
-            let (kind, text) = &tokens[1]; // token after MOVE
-            match kind {
-                SyntaxKind::STRING_LITERAL => {
-                    let inner = if (text.starts_with('"') && text.ends_with('"'))
-                        || (text.starts_with('\'') && text.ends_with('\''))
-                    {
-                        text[1..text.len() - 1].to_string()
-                    } else {
-                        text.clone()
-                    };
-                    HirExpr::Literal(LiteralValue::String_(inner))
-                }
-                SyntaxKind::INTEGER_LITERAL => {
-                    if let Ok(n) = text.parse::<i64>() {
-                        HirExpr::Literal(LiteralValue::Integer(n))
-                    } else {
-                        return None;
-                    }
-                }
-                _ => {
-                    let upper = text.to_ascii_uppercase();
-                    match upper.as_str() {
-                        "ZERO" | "ZEROS" | "ZEROES" => {
-                            HirExpr::Literal(LiteralValue::Figurative(FigurativeConstant::Zero))
-                        }
-                        "SPACE" | "SPACES" => {
-                            HirExpr::Literal(LiteralValue::Figurative(FigurativeConstant::Space))
-                        }
-                        "HIGH-VALUE" | "HIGH-VALUES" => {
-                            HirExpr::Literal(LiteralValue::Figurative(FigurativeConstant::HighValue))
-                        }
-                        "LOW-VALUE" | "LOW-VALUES" => {
-                            HirExpr::Literal(LiteralValue::Figurative(FigurativeConstant::LowValue))
-                        }
-                        "QUOTE" | "QUOTES" => {
-                            HirExpr::Literal(LiteralValue::Figurative(FigurativeConstant::Quote))
-                        }
-                        _ => {
-                            let name = self.interner.intern(&upper);
-                            // Check for subscripts: look for '(' after the name
-                            let mut subscripts = Vec::new();
-                            let src_start = 2; // token after MOVE and name
-                            if src_start < to_idx && tokens[src_start].1 == "(" {
-                                let mut si = src_start + 1;
-                                while si < to_idx && tokens[si].1 != ")" {
-                                    let (sub_kind, ref sub_text) = tokens[si];
-                                    if sub_text != "," {
-                                        let sub_expr = self.token_to_expr(sub_kind, sub_text);
-                                        subscripts.push(sub_expr);
-                                    }
-                                    si += 1;
-                                }
-                            }
-                            HirExpr::DataRef(Box::new(HirDataRef {
-                                name,
-                                qualifiers: Vec::new(),
-                                subscripts,
-                                ref_mod: None,
-                                resolved: None,
-                            }))
-                        }
-                    }
-                }
-            }
+            let (expr, _) = self.parse_expr_at(&tokens, 1);
+            expr
         } else {
             return None;
         };
 
-        // Targets are after TO — parse with subscripts
+        // Targets: parse after TO using parse_data_ref_at
         let mut targets = Vec::new();
-        let target_tokens = &tokens[to_idx + 1..];
-        let mut t = 0;
-        while t < target_tokens.len() {
-            let (kind, ref text) = target_tokens[t];
-            // Skip parentheses, commas, and period tokens that aren't part of a name
-            if text == "(" || text == ")" || text == "," || kind == SyntaxKind::PERIOD {
+        let mut t = to_idx + 1;
+        while t < tokens.len() {
+            let (kind, ref text) = tokens[t];
+            if text == "(" || text == ")" || text == "," || text == ":" || kind == SyntaxKind::PERIOD {
                 t += 1;
                 continue;
             }
-            // This should be a data name
-            let upper = text.to_ascii_uppercase();
-            let name = self.interner.intern(&upper);
-            let mut subscripts = Vec::new();
-            // Check if next token is '(' for subscripts
-            if t + 1 < target_tokens.len() && target_tokens[t + 1].1 == "(" {
-                t += 2; // skip name and '('
-                while t < target_tokens.len() && target_tokens[t].1 != ")" {
-                    let (sub_kind, ref sub_text) = target_tokens[t];
-                    if sub_text != "," {
-                        let sub_expr = self.token_to_expr(sub_kind, sub_text);
-                        subscripts.push(sub_expr);
-                    }
-                    t += 1;
-                }
-                if t < target_tokens.len() && target_tokens[t].1 == ")" {
-                    t += 1; // skip ')'
-                }
+            if kind == SyntaxKind::WORD {
+                let (dr, next) = self.parse_data_ref_at(&tokens, t);
+                targets.push(dr);
+                t = next;
             } else {
                 t += 1;
             }
-            targets.push(HirDataRef {
-                name,
-                qualifiers: Vec::new(),
-                subscripts,
-                ref_mod: None,
-                resolved: None,
-            });
         }
 
         Some(HirStatement::Move {
@@ -2095,46 +2027,62 @@ impl<'a> HirLowerer<'a> {
     }
 
     fn lower_initialize_stmt(&mut self, node: &cobol_ast::SyntaxNode) -> Option<HirStatement> {
-        let mut tokens: Vec<(SyntaxKind, String)> = Vec::new();
-        for el in node.children_with_tokens() {
-            if let Some(tok) = el.into_token() {
-                let kind = tok.kind();
-                if kind == SyntaxKind::WHITESPACE || kind == SyntaxKind::NEWLINE {
-                    continue;
-                }
-                tokens.push((kind, tok.text().to_string()));
+        let tokens = self.collect_tokens(node);
+
+        let mut targets = Vec::new();
+        let mut replacing = Vec::new();
+        let mut i = 1; // skip INITIALIZE keyword
+
+        // Parse target identifiers until REPLACING or end
+        while i < tokens.len() {
+            let upper = tokens[i].1.to_ascii_uppercase();
+            if upper == "REPLACING" {
+                i += 1;
+                break;
+            }
+            if tokens[i].0 == SyntaxKind::WORD || tokens[i].0 == SyntaxKind::KEYWORD {
+                let (dr, next) = self.parse_data_ref_at(&tokens, i);
+                targets.push(dr);
+                i = next;
+            } else {
+                i += 1;
             }
         }
 
-        // tokens[0] is INITIALIZE keyword, remaining are target identifiers
-        // (ignoring REPLACING clause for now - basic form only)
-        let mut targets = Vec::new();
-        let mut i = 1; // skip INITIALIZE keyword
+        // Parse REPLACING clauses: REPLACING {category} [DATA] BY {value} ...
         while i < tokens.len() {
-            let (kind, ref text) = tokens[i];
-            let upper = text.to_ascii_uppercase();
-            // Stop if we hit REPLACING keyword (not yet supported)
-            if upper == "REPLACING" {
-                break;
+            let upper = tokens[i].1.to_ascii_uppercase();
+            match upper.as_str() {
+                "NUMERIC" | "ALPHANUMERIC" | "ALPHABETIC"
+                | "ALPHANUMERIC-EDITED" | "NUMERIC-EDITED" => {
+                    let category = upper.clone();
+                    i += 1;
+                    // Skip optional "DATA"
+                    if i < tokens.len() && tokens[i].1.eq_ignore_ascii_case("DATA") {
+                        i += 1;
+                    }
+                    // Expect "BY"
+                    if i < tokens.len() && tokens[i].1.eq_ignore_ascii_case("BY") {
+                        i += 1;
+                    }
+                    // Parse the replacement value
+                    if i < tokens.len() {
+                        let (expr, next) = self.parse_expr_at(&tokens, i);
+                        replacing.push((category, expr));
+                        i = next;
+                    }
+                }
+                _ => {
+                    i += 1;
+                }
             }
-            if kind == SyntaxKind::WORD || kind == SyntaxKind::KEYWORD {
-                let name = self.interner.intern(&upper);
-                targets.push(HirDataRef {
-                    name,
-                    qualifiers: Vec::new(),
-                    subscripts: Vec::new(),
-                    ref_mod: None,
-                    resolved: None,
-                });
-            }
-            i += 1;
         }
 
         if targets.is_empty() {
             return None;
         }
 
-        Some(HirStatement::Initialize { targets })
+        Some(HirStatement::Initialize { targets, replacing })
     }
 
     /// Helper: collect non-whitespace tokens from a CST node.
@@ -2227,6 +2175,160 @@ impl<'a> HirLowerer<'a> {
                 }
             }
         }
+    }
+
+    /// Parse a single expression (possibly subscripted) from a token slice starting
+    /// at position `pos`. Returns `(expr, next_pos)`.
+    ///
+    /// Handles patterns like:
+    /// - `WS-SUM` → DataRef with no subscripts
+    /// - `WS-ITEM(1)` → DataRef with literal subscript
+    /// - `WS-ITEM(WS-I)` → DataRef with variable subscript
+    /// - `42` → Integer literal
+    fn parse_expr_at(&mut self, tokens: &[(SyntaxKind, String)], pos: usize) -> (HirExpr, usize) {
+        if pos >= tokens.len() {
+            return (HirExpr::Literal(LiteralValue::Integer(0)), pos);
+        }
+
+        let (kind, text) = &tokens[pos];
+        let base_expr = self.token_to_expr(*kind, text);
+
+        // Check if this is a DataRef followed by subscripts or ref-mod in parens
+        if let HirExpr::DataRef(ref dr) = base_expr {
+            if pos + 1 < tokens.len() && tokens[pos + 1].1 == "(" {
+                // Peek inside parens to determine if this is ref-mod (has ':') or subscripts
+                let has_colon = tokens[pos + 2..].iter()
+                    .take_while(|(_, t)| t != ")")
+                    .any(|(_, t)| t == ":");
+
+                let name = dr.name;
+                let mut i = pos + 2; // skip name and '('
+
+                if has_colon {
+                    // Reference modification: name(start:length)
+                    let start_expr = if i < tokens.len() && tokens[i].1 != ":" {
+                        let e = self.token_to_expr(tokens[i].0, &tokens[i].1);
+                        i += 1;
+                        e
+                    } else {
+                        HirExpr::Literal(LiteralValue::Integer(1))
+                    };
+                    // Skip ':'
+                    if i < tokens.len() && tokens[i].1 == ":" { i += 1; }
+                    // Optional length
+                    let length_expr = if i < tokens.len() && tokens[i].1 != ")" {
+                        let e = self.token_to_expr(tokens[i].0, &tokens[i].1);
+                        i += 1;
+                        Some(Box::new(e))
+                    } else {
+                        None
+                    };
+                    if i < tokens.len() && tokens[i].1 == ")" { i += 1; }
+
+                    return (
+                        HirExpr::DataRef(Box::new(HirDataRef {
+                            name,
+                            qualifiers: Vec::new(),
+                            subscripts: Vec::new(),
+                            ref_mod: Some((Box::new(start_expr), length_expr)),
+                            resolved: None,
+                        })),
+                        i,
+                    );
+                } else {
+                    // Subscripts: name(expr, expr, ...)
+                    let mut subscripts = Vec::new();
+                    while i < tokens.len() && tokens[i].1 != ")" {
+                        let sub_text = &tokens[i].1;
+                        if sub_text != "," {
+                            subscripts.push(self.token_to_expr(tokens[i].0, sub_text));
+                        }
+                        i += 1;
+                    }
+                    if i < tokens.len() && tokens[i].1 == ")" { i += 1; }
+
+                    return (
+                        HirExpr::DataRef(Box::new(HirDataRef {
+                            name,
+                            qualifiers: Vec::new(),
+                            subscripts,
+                            ref_mod: None,
+                            resolved: None,
+                        })),
+                        i,
+                    );
+                }
+            }
+        }
+
+        (base_expr, pos + 1)
+    }
+
+    /// Parse a data reference (possibly subscripted) from a token slice at `pos`.
+    /// Returns `(data_ref, next_pos)`.
+    fn parse_data_ref_at(&mut self, tokens: &[(SyntaxKind, String)], pos: usize) -> (HirDataRef, usize) {
+        if pos >= tokens.len() {
+            let name = self.interner.intern("?");
+            return (HirDataRef { name, qualifiers: Vec::new(), subscripts: Vec::new(), ref_mod: None, resolved: None }, pos);
+        }
+
+        let text = &tokens[pos].1;
+        let upper = text.to_ascii_uppercase();
+        let name = self.interner.intern(&upper);
+
+        // Check for subscripts or ref-mod
+        if pos + 1 < tokens.len() && tokens[pos + 1].1 == "(" {
+            let has_colon = tokens[pos + 2..].iter()
+                .take_while(|(_, t)| t != ")")
+                .any(|(_, t)| t == ":");
+
+            let mut i = pos + 2;
+
+            if has_colon {
+                // Reference modification: name(start:length)
+                let start_expr = if i < tokens.len() && tokens[i].1 != ":" {
+                    let e = self.token_to_expr(tokens[i].0, &tokens[i].1);
+                    i += 1;
+                    e
+                } else {
+                    HirExpr::Literal(LiteralValue::Integer(1))
+                };
+                if i < tokens.len() && tokens[i].1 == ":" { i += 1; }
+                let length_expr = if i < tokens.len() && tokens[i].1 != ")" {
+                    let e = self.token_to_expr(tokens[i].0, &tokens[i].1);
+                    i += 1;
+                    Some(Box::new(e))
+                } else {
+                    None
+                };
+                if i < tokens.len() && tokens[i].1 == ")" { i += 1; }
+                return (
+                    HirDataRef {
+                        name, qualifiers: Vec::new(), subscripts: Vec::new(),
+                        ref_mod: Some((Box::new(start_expr), length_expr)),
+                        resolved: None,
+                    },
+                    i,
+                );
+            } else {
+                // Subscripts
+                let mut subscripts = Vec::new();
+                while i < tokens.len() && tokens[i].1 != ")" {
+                    let sub_text = &tokens[i].1;
+                    if sub_text != "," {
+                        subscripts.push(self.token_to_expr(tokens[i].0, sub_text));
+                    }
+                    i += 1;
+                }
+                if i < tokens.len() && tokens[i].1 == ")" { i += 1; }
+                return (
+                    HirDataRef { name, qualifiers: Vec::new(), subscripts, ref_mod: None, resolved: None },
+                    i,
+                );
+            }
+        }
+
+        (HirDataRef { name, qualifiers: Vec::new(), subscripts: Vec::new(), ref_mod: None, resolved: None }, pos + 1)
     }
 
     /// Helper: make a data ref from a name string.
@@ -2355,20 +2457,34 @@ impl<'a> HirLowerer<'a> {
         let mut rounded = false;
 
         let mut phase = 0; // 0=operands, 1=to-targets, 2=giving-targets
-        for (kind, text) in &tokens[1..] { // Skip ADD
-            let upper = text.to_ascii_uppercase();
+        let mut i = 1; // Skip ADD
+        while i < tokens.len() {
+            let upper = tokens[i].1.to_ascii_uppercase();
             match upper.as_str() {
-                "TO" => { phase = 1; continue; }
-                "GIVING" => { phase = 2; continue; }
-                "ROUNDED" => { rounded = true; continue; }
+                "TO" => { phase = 1; i += 1; continue; }
+                "GIVING" => { phase = 2; i += 1; continue; }
+                "ROUNDED" => { rounded = true; i += 1; continue; }
                 "ON" | "SIZE" | "ERROR" | "NOT" | "END-ADD" => break,
+                "(" | ")" | "," => { i += 1; continue; } // stray parens (shouldn't happen with parse_*_at)
                 _ => {}
             }
             match phase {
-                0 => operands.push(self.token_to_expr(*kind, text)),
-                1 => to_targets.push(self.make_data_ref(text)),
-                2 => giving_targets.push(self.make_data_ref(text)),
-                _ => {}
+                0 => {
+                    let (expr, next) = self.parse_expr_at(&tokens, i);
+                    operands.push(expr);
+                    i = next;
+                }
+                1 => {
+                    let (dr, next) = self.parse_data_ref_at(&tokens, i);
+                    to_targets.push(dr);
+                    i = next;
+                }
+                2 => {
+                    let (dr, next) = self.parse_data_ref_at(&tokens, i);
+                    giving_targets.push(dr);
+                    i = next;
+                }
+                _ => { i += 1; }
             }
         }
 
@@ -2403,20 +2519,34 @@ impl<'a> HirLowerer<'a> {
         let mut rounded = false;
         let mut phase = 0;
 
-        for (kind, text) in &tokens[1..] {
-            let upper = text.to_ascii_uppercase();
+        let mut i = 1; // Skip SUBTRACT
+        while i < tokens.len() {
+            let upper = tokens[i].1.to_ascii_uppercase();
             match upper.as_str() {
-                "FROM" => { phase = 1; continue; }
-                "GIVING" => { phase = 2; continue; }
-                "ROUNDED" => { rounded = true; continue; }
+                "FROM" => { phase = 1; i += 1; continue; }
+                "GIVING" => { phase = 2; i += 1; continue; }
+                "ROUNDED" => { rounded = true; i += 1; continue; }
                 "ON" | "SIZE" | "ERROR" | "NOT" | "END-SUBTRACT" => break,
+                "(" | ")" | "," => { i += 1; continue; }
                 _ => {}
             }
             match phase {
-                0 => operands.push(self.token_to_expr(*kind, text)),
-                1 => from_targets.push(self.make_data_ref(text)),
-                2 => giving_targets.push(self.make_data_ref(text)),
-                _ => {}
+                0 => {
+                    let (expr, next) = self.parse_expr_at(&tokens, i);
+                    operands.push(expr);
+                    i = next;
+                }
+                1 => {
+                    let (dr, next) = self.parse_data_ref_at(&tokens, i);
+                    from_targets.push(dr);
+                    i = next;
+                }
+                2 => {
+                    let (dr, next) = self.parse_data_ref_at(&tokens, i);
+                    giving_targets.push(dr);
+                    i = next;
+                }
+                _ => { i += 1; }
             }
         }
 
@@ -2437,20 +2567,34 @@ impl<'a> HirLowerer<'a> {
         let mut rounded = false;
         let mut phase = 0; // 0=operand1, 1=by, 2=giving
 
-        for (kind, text) in &tokens[1..] {
-            let upper = text.to_ascii_uppercase();
+        let mut i = 1; // Skip MULTIPLY
+        while i < tokens.len() {
+            let upper = tokens[i].1.to_ascii_uppercase();
             match upper.as_str() {
-                "BY" => { phase = 1; continue; }
-                "GIVING" => { phase = 2; continue; }
-                "ROUNDED" => { rounded = true; continue; }
+                "BY" => { phase = 1; i += 1; continue; }
+                "GIVING" => { phase = 2; i += 1; continue; }
+                "ROUNDED" => { rounded = true; i += 1; continue; }
                 "ON" | "SIZE" | "ERROR" | "NOT" | "END-MULTIPLY" => break,
+                "(" | ")" | "," => { i += 1; continue; }
                 _ => {}
             }
             match phase {
-                0 => operand1 = Some(self.token_to_expr(*kind, text)),
-                1 => by_operand = Some(self.token_to_expr(*kind, text)),
-                2 => giving_targets.push(self.make_data_ref(text)),
-                _ => {}
+                0 => {
+                    let (expr, next) = self.parse_expr_at(&tokens, i);
+                    operand1 = Some(expr);
+                    i = next;
+                }
+                1 => {
+                    let (expr, next) = self.parse_expr_at(&tokens, i);
+                    by_operand = Some(expr);
+                    i = next;
+                }
+                2 => {
+                    let (dr, next) = self.parse_data_ref_at(&tokens, i);
+                    giving_targets.push(dr);
+                    i = next;
+                }
+                _ => { i += 1; }
             }
         }
 
@@ -2472,22 +2616,40 @@ impl<'a> HirLowerer<'a> {
         let mut rounded = false;
         let mut phase = 0; // 0=operand1, 1=into/by, 2=giving, 3=remainder
 
-        for (kind, text) in &tokens[1..] {
-            let upper = text.to_ascii_uppercase();
+        let mut i = 1; // Skip DIVIDE
+        while i < tokens.len() {
+            let upper = tokens[i].1.to_ascii_uppercase();
             match upper.as_str() {
-                "INTO" | "BY" => { phase = 1; continue; }
-                "GIVING" => { phase = 2; continue; }
-                "REMAINDER" => { phase = 3; continue; }
-                "ROUNDED" => { rounded = true; continue; }
+                "INTO" | "BY" => { phase = 1; i += 1; continue; }
+                "GIVING" => { phase = 2; i += 1; continue; }
+                "REMAINDER" => { phase = 3; i += 1; continue; }
+                "ROUNDED" => { rounded = true; i += 1; continue; }
                 "ON" | "SIZE" | "ERROR" | "NOT" | "END-DIVIDE" => break,
+                "(" | ")" | "," => { i += 1; continue; }
                 _ => {}
             }
             match phase {
-                0 => operand1 = Some(self.token_to_expr(*kind, text)),
-                1 => into_or_by = Some(self.token_to_expr(*kind, text)),
-                2 => giving_targets.push(self.make_data_ref(text)),
-                3 => remainder = Some(self.make_data_ref(text)),
-                _ => {}
+                0 => {
+                    let (expr, next) = self.parse_expr_at(&tokens, i);
+                    operand1 = Some(expr);
+                    i = next;
+                }
+                1 => {
+                    let (expr, next) = self.parse_expr_at(&tokens, i);
+                    into_or_by = Some(expr);
+                    i = next;
+                }
+                2 => {
+                    let (dr, next) = self.parse_data_ref_at(&tokens, i);
+                    giving_targets.push(dr);
+                    i = next;
+                }
+                3 => {
+                    let (dr, next) = self.parse_data_ref_at(&tokens, i);
+                    remainder = Some(dr);
+                    i = next;
+                }
+                _ => { i += 1; }
             }
         }
 
@@ -3758,7 +3920,14 @@ impl<'a> HirLowerer<'a> {
     ) {
         match node.kind() {
             SyntaxKind::DISPLAY_STMT => stmts.push(self.lower_display_stmt(node)),
-            SyntaxKind::STOP_STMT => stmts.push(HirStatement::StopRun),
+            SyntaxKind::STOP_STMT => {
+                let tokens = self.collect_all_tokens(node);
+                if tokens.iter().any(|(_, t)| t.eq_ignore_ascii_case("GOBACK")) {
+                    stmts.push(HirStatement::GoBack);
+                } else {
+                    stmts.push(HirStatement::StopRun);
+                }
+            }
             SyntaxKind::MOVE_STMT => {
                 if let Some(s) = self.lower_move_stmt(node) { stmts.push(s); }
             }
@@ -4106,19 +4275,70 @@ impl<'a> HirLowerer<'a> {
             let from_expr = self.token_to_expr(tokens[from_idx + 1].0, &tokens[from_idx + 1].1);
             let by_expr = self.token_to_expr(tokens[by_idx + 1].0, &tokens[by_idx + 1].1);
 
-            // Extract UNTIL condition from CONDITION_EXPR child node
-            let mut until_expr = HirExpr::Literal(LiteralValue::Integer(0));
+            // Parse AFTER clauses: AFTER var FROM expr BY expr [AFTER ...]
+            let mut after_clauses = Vec::new();
+            let after_positions: Vec<usize> = tokens.iter().enumerate()
+                .filter(|(_, (_, t))| t.eq_ignore_ascii_case("AFTER"))
+                .map(|(i, _)| i)
+                .collect();
+
+            for &after_pos in &after_positions {
+                // AFTER var FROM expr BY expr
+                if after_pos + 1 >= tokens.len() { continue; }
+                let after_var = self.make_data_ref(&tokens[after_pos + 1].1);
+                // Find FROM and BY after this AFTER
+                let mut after_from = None;
+                let mut after_by = None;
+                let mut j = after_pos + 2;
+                while j < tokens.len() {
+                    let u = tokens[j].1.to_ascii_uppercase();
+                    if u == "FROM" && j + 1 < tokens.len() {
+                        after_from = Some(self.token_to_expr(tokens[j + 1].0, &tokens[j + 1].1));
+                        j += 2;
+                    } else if u == "BY" && j + 1 < tokens.len() {
+                        after_by = Some(self.token_to_expr(tokens[j + 1].0, &tokens[j + 1].1));
+                        j += 2;
+                    } else if u == "AFTER" || u == "END-PERFORM" {
+                        break;
+                    } else {
+                        j += 1;
+                    }
+                }
+                after_clauses.push(VaryingClause {
+                    identifier: after_var,
+                    from: after_from.unwrap_or(HirExpr::Literal(LiteralValue::Integer(1))),
+                    by: after_by.unwrap_or(HirExpr::Literal(LiteralValue::Integer(1))),
+                    until: HirExpr::Literal(LiteralValue::Integer(0)), // filled below
+                    after: Vec::new(),
+                });
+            }
+
+            // Extract UNTIL conditions from CONDITION_EXPR child nodes.
+            // First CONDITION_EXPR is for the outer VARYING, subsequent ones
+            // are for each AFTER clause in order.
+            let mut condition_exprs = Vec::new();
             let mut inline_stmts = Vec::new();
 
             for child in node.children() {
                 if child.kind() == SyntaxKind::CONDITION_EXPR {
                     let cond_tokens = self.collect_all_tokens(&child);
                     if let Some(cond) = self.parse_condition_tokens(&cond_tokens) {
-                        until_expr = cond;
+                        condition_exprs.push(cond);
                     }
                 } else {
                     // Statement node — inline body
                     self.lower_child_statement(&child, &mut inline_stmts);
+                }
+            }
+
+            let until_expr = condition_exprs.first()
+                .cloned()
+                .unwrap_or(HirExpr::Literal(LiteralValue::Integer(0)));
+
+            // Assign UNTIL conditions to AFTER clauses
+            for (i, ac) in after_clauses.iter_mut().enumerate() {
+                if i + 1 < condition_exprs.len() {
+                    ac.until = condition_exprs[i + 1].clone();
                 }
             }
 
@@ -4132,7 +4352,7 @@ impl<'a> HirLowerer<'a> {
                     from: from_expr,
                     by: by_expr,
                     until: until_expr,
-                    after: Vec::new(),
+                    after: after_clauses,
                 },
                 inline_body: body,
             }))
@@ -4150,97 +4370,154 @@ impl<'a> HirLowerer<'a> {
             let has_until = tokens.iter().any(|(_, t)| t.eq_ignore_ascii_case("UNTIL"));
 
             if has_times && idx < tokens.len() {
-                // PERFORM target [THRU thru] expr TIMES
-                let target_name = tokens[idx].1.to_ascii_uppercase();
-                let target = self.interner.intern(&target_name);
-                idx += 1;
+                // Check if this is inline PERFORM n TIMES (first token is a literal)
+                let first_is_literal = tokens[idx].0 == SyntaxKind::INTEGER_LITERAL
+                    || tokens[idx].0 == SyntaxKind::DECIMAL_LITERAL;
+                let inline_times = first_is_literal && has_end_perform;
 
-                // Optional THRU
-                let mut thru = None;
-                if idx < tokens.len() && (tokens[idx].1.eq_ignore_ascii_case("THRU")
-                    || tokens[idx].1.eq_ignore_ascii_case("THROUGH")) {
-                    idx += 1;
-                    if idx < tokens.len() {
-                        let thru_name = tokens[idx].1.to_ascii_uppercase();
-                        thru = Some(self.interner.intern(&thru_name));
-                        idx += 1;
+                if inline_times {
+                    // Inline PERFORM n TIMES ... END-PERFORM
+                    let times_expr = self.token_to_expr(tokens[idx].0, &tokens[idx].1);
+                    // Collect inline body statements
+                    let mut inline_stmts = Vec::new();
+                    for child in node.children() {
+                        self.lower_child_statement(&child, &mut inline_stmts);
                     }
-                }
-
-                // Parse the TIMES expression (number or data reference before TIMES keyword)
-                let times_expr = if idx < tokens.len() {
-                    self.token_to_expr(tokens[idx].0, &tokens[idx].1)
+                    Some(HirStatement::Perform(PerformType::InlineTimes {
+                        times: times_expr,
+                        statements: inline_stmts,
+                    }))
                 } else {
-                    HirExpr::Literal(LiteralValue::Integer(1))
-                };
-
-                Some(HirStatement::Perform(PerformType::Times {
-                    target,
-                    thru,
-                    times: times_expr,
-                }))
-            } else if has_until && idx < tokens.len() {
-                // PERFORM target [THRU thru] [WITH TEST BEFORE|AFTER] UNTIL condition
-                let target_name = tokens[idx].1.to_ascii_uppercase();
-                let target = self.interner.intern(&target_name);
-                idx += 1;
-
-                // Optional THRU
-                let mut thru = None;
-                if idx < tokens.len() && (tokens[idx].1.eq_ignore_ascii_case("THRU")
-                    || tokens[idx].1.eq_ignore_ascii_case("THROUGH")) {
+                    // Out-of-line PERFORM target [THRU thru] expr TIMES
+                    let target_name = tokens[idx].1.to_ascii_uppercase();
+                    let target = self.interner.intern(&target_name);
                     idx += 1;
-                    if idx < tokens.len() {
-                        let thru_name = tokens[idx].1.to_ascii_uppercase();
-                        thru = Some(self.interner.intern(&thru_name));
-                        idx += 1;
-                    }
-                }
 
-                // Optional WITH TEST BEFORE|AFTER
-                let mut test_before = true;
-                if idx < tokens.len() && tokens[idx].1.eq_ignore_ascii_case("WITH") {
-                    idx += 1;
-                    if idx < tokens.len() && tokens[idx].1.eq_ignore_ascii_case("TEST") {
+                    // Optional THRU
+                    let mut thru = None;
+                    if idx < tokens.len() && (tokens[idx].1.eq_ignore_ascii_case("THRU")
+                        || tokens[idx].1.eq_ignore_ascii_case("THROUGH")) {
                         idx += 1;
-                    }
-                    if idx < tokens.len() {
-                        if tokens[idx].1.eq_ignore_ascii_case("AFTER") {
-                            test_before = false;
+                        if idx < tokens.len() {
+                            let thru_name = tokens[idx].1.to_ascii_uppercase();
+                            thru = Some(self.interner.intern(&thru_name));
+                            idx += 1;
                         }
-                        idx += 1;
                     }
-                }
 
-                // Skip UNTIL keyword
-                if idx < tokens.len() && tokens[idx].1.eq_ignore_ascii_case("UNTIL") {
-                    idx += 1;
-                }
+                    // Parse the TIMES expression (number or data reference before TIMES keyword)
+                    let times_expr = if idx < tokens.len() {
+                        self.token_to_expr(tokens[idx].0, &tokens[idx].1)
+                    } else {
+                        HirExpr::Literal(LiteralValue::Integer(1))
+                    };
 
-                // Parse condition from remaining tokens or CONDITION_EXPR child
-                let mut condition = HirExpr::Literal(LiteralValue::Integer(0));
-                for child in node.children() {
-                    if child.kind() == SyntaxKind::CONDITION_EXPR {
-                        let cond_tokens = self.collect_all_tokens(&child);
+                    Some(HirStatement::Perform(PerformType::Times {
+                        target,
+                        thru,
+                        times: times_expr,
+                    }))
+                }
+            } else if has_until && idx < tokens.len() {
+                // Check if this is inline PERFORM UNTIL (first token is UNTIL)
+                let inline_until = tokens[idx].1.eq_ignore_ascii_case("UNTIL") && has_end_perform;
+
+                if inline_until {
+                    // Inline PERFORM UNTIL condition ... END-PERFORM
+                    // Parse condition from CONDITION_EXPR child
+                    let mut condition = HirExpr::Literal(LiteralValue::Integer(0));
+                    let mut inline_stmts = Vec::new();
+                    for child in node.children() {
+                        if child.kind() == SyntaxKind::CONDITION_EXPR {
+                            let cond_tokens = self.collect_all_tokens(&child);
+                            if let Some(cond) = self.parse_condition_tokens(&cond_tokens) {
+                                condition = cond;
+                            }
+                        } else {
+                            self.lower_child_statement(&child, &mut inline_stmts);
+                        }
+                    }
+                    // Also try from flat tokens (skip UNTIL keyword)
+                    let mut cond_idx = idx + 1;
+                    if cond_idx < tokens.len() {
+                        // Collect tokens until END-PERFORM or a statement keyword
+                        let cond_end = tokens[cond_idx..].iter()
+                            .position(|(_, t)| t.eq_ignore_ascii_case("END-PERFORM"))
+                            .map(|p| cond_idx + p)
+                            .unwrap_or(tokens.len());
+                        let cond_tokens: Vec<(SyntaxKind, String)> = tokens[cond_idx..cond_end].to_vec();
                         if let Some(cond) = self.parse_condition_tokens(&cond_tokens) {
                             condition = cond;
                         }
                     }
-                }
-                // Also try to parse condition from the remaining flat tokens
-                if idx < tokens.len() {
-                    let cond_tokens: Vec<(SyntaxKind, String)> = tokens[idx..].to_vec();
-                    if let Some(cond) = self.parse_condition_tokens(&cond_tokens) {
-                        condition = cond;
-                    }
-                }
+                    Some(HirStatement::Perform(PerformType::InlineUntil {
+                        condition,
+                        test_before: true,
+                        statements: inline_stmts,
+                    }))
+                } else {
+                    // Out-of-line PERFORM target [THRU thru] [WITH TEST BEFORE|AFTER] UNTIL condition
+                    let target_name = tokens[idx].1.to_ascii_uppercase();
+                    let target = self.interner.intern(&target_name);
+                    idx += 1;
 
-                Some(HirStatement::Perform(PerformType::Until {
-                    target,
-                    thru,
-                    condition,
-                    test_before,
-                }))
+                    // Optional THRU
+                    let mut thru = None;
+                    if idx < tokens.len() && (tokens[idx].1.eq_ignore_ascii_case("THRU")
+                        || tokens[idx].1.eq_ignore_ascii_case("THROUGH")) {
+                        idx += 1;
+                        if idx < tokens.len() {
+                            let thru_name = tokens[idx].1.to_ascii_uppercase();
+                            thru = Some(self.interner.intern(&thru_name));
+                            idx += 1;
+                        }
+                    }
+
+                    // Optional WITH TEST BEFORE|AFTER
+                    let mut test_before = true;
+                    if idx < tokens.len() && tokens[idx].1.eq_ignore_ascii_case("WITH") {
+                        idx += 1;
+                        if idx < tokens.len() && tokens[idx].1.eq_ignore_ascii_case("TEST") {
+                            idx += 1;
+                        }
+                        if idx < tokens.len() {
+                            if tokens[idx].1.eq_ignore_ascii_case("AFTER") {
+                                test_before = false;
+                            }
+                            idx += 1;
+                        }
+                    }
+
+                    // Skip UNTIL keyword
+                    if idx < tokens.len() && tokens[idx].1.eq_ignore_ascii_case("UNTIL") {
+                        idx += 1;
+                    }
+
+                    // Parse condition from remaining tokens or CONDITION_EXPR child
+                    let mut condition = HirExpr::Literal(LiteralValue::Integer(0));
+                    for child in node.children() {
+                        if child.kind() == SyntaxKind::CONDITION_EXPR {
+                            let cond_tokens = self.collect_all_tokens(&child);
+                            if let Some(cond) = self.parse_condition_tokens(&cond_tokens) {
+                                condition = cond;
+                            }
+                        }
+                    }
+                    // Also try to parse condition from the remaining flat tokens
+                    if idx < tokens.len() {
+                        let cond_tokens: Vec<(SyntaxKind, String)> = tokens[idx..].to_vec();
+                        if let Some(cond) = self.parse_condition_tokens(&cond_tokens) {
+                            condition = cond;
+                        }
+                    }
+
+                    Some(HirStatement::Perform(PerformType::Until {
+                        target,
+                        thru,
+                        condition,
+                        test_before,
+                    }))
+                }
             } else if idx < tokens.len() && !has_end_perform {
                 // Simple out-of-line PERFORM: PERFORM target [THRU thru]
                 let target_name = tokens[idx].1.to_ascii_uppercase();

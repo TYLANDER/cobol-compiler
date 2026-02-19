@@ -1,0 +1,2 @@
+       01 :PFX:-FIRST PIC X(5) VALUE "AAAAA".
+       01 :PFX:-SECOND PIC X(5) VALUE "BBBBB".

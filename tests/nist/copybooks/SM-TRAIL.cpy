@@ -1,0 +1,2 @@
+       01 ITEM-:SFX: PIC X(5) VALUE SPACES.
+       01 COUNT-:SFX: PIC 9(4) VALUE 0.

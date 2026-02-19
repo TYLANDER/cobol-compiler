@@ -1,0 +1,2 @@
+       01 :TAG:-NAME PIC X(10) VALUE SPACES.
+       01 :TAG:-COUNT PIC 9(4) VALUE 0.

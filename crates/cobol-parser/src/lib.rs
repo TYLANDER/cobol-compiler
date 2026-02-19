@@ -2739,6 +2739,89 @@ impl<'t> Parser<'t> {
             return;
         }
 
+        // Check for inline PERFORM UNTIL ... END-PERFORM (no paragraph name)
+        if self.at_word("UNTIL") || self.at_kind(cobol_lexer::TokenKind::Until) {
+            self.bump(); // UNTIL
+            self.skip_ws();
+            self.parse_condition();
+            // Parse inline body
+            self.skip_ws();
+            while !self.at_end()
+                && self.current_kind() != cobol_lexer::TokenKind::Period
+                && !self.at_word("END-PERFORM")
+                && !self.at_kind(cobol_lexer::TokenKind::EndPerform)
+                && !self.at_division()
+            {
+                self.skip_ws();
+                if self.at_end()
+                    || self.current_kind() == cobol_lexer::TokenKind::Period
+                    || self.at_word("END-PERFORM")
+                    || self.at_kind(cobol_lexer::TokenKind::EndPerform)
+                {
+                    break;
+                }
+                if self.at_statement_start() {
+                    self.parse_statement();
+                } else {
+                    self.bump();
+                }
+                self.skip_ws();
+            }
+            self.skip_ws();
+            if !self.at_end()
+                && (self.at_word("END-PERFORM")
+                    || self.at_kind(cobol_lexer::TokenKind::EndPerform))
+            {
+                self.bump();
+            }
+            self.finish_node();
+            return;
+        }
+
+        // Check for inline PERFORM n TIMES ... END-PERFORM (no paragraph name)
+        if self.at_literal() {
+            let saved = self.pos;
+            self.bump(); // literal
+            self.skip_ws();
+            if !self.at_end() && (self.at_word("TIMES") || self.at_kind(cobol_lexer::TokenKind::Times)) {
+                self.bump(); // TIMES
+                // Parse inline body
+                self.skip_ws();
+                while !self.at_end()
+                    && self.current_kind() != cobol_lexer::TokenKind::Period
+                    && !self.at_word("END-PERFORM")
+                    && !self.at_kind(cobol_lexer::TokenKind::EndPerform)
+                    && !self.at_division()
+                {
+                    self.skip_ws();
+                    if self.at_end()
+                        || self.current_kind() == cobol_lexer::TokenKind::Period
+                        || self.at_word("END-PERFORM")
+                        || self.at_kind(cobol_lexer::TokenKind::EndPerform)
+                    {
+                        break;
+                    }
+                    if self.at_statement_start() {
+                        self.parse_statement();
+                    } else {
+                        self.bump();
+                    }
+                    self.skip_ws();
+                }
+                self.skip_ws();
+                if !self.at_end()
+                    && (self.at_word("END-PERFORM")
+                        || self.at_kind(cobol_lexer::TokenKind::EndPerform))
+                {
+                    self.bump();
+                }
+                self.finish_node();
+                return;
+            }
+            // Not TIMES, restore position
+            self.pos = saved;
+        }
+
         // Paragraph/section reference
         if self.at_identifier() || self.current_is_word_like() {
             // Check if this is VARYING (inline PERFORM VARYING without a target)

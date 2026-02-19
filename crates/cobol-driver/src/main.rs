@@ -841,23 +841,102 @@ void cobolrt_unstring_field(
     }
 }
 
-/* ---- COMPUTE/PERFORM support: negate, decimal ops, counter support ---- */
+/* ---- COMPUTE result storage ---- */
 
-/* Negate a display-format numeric value. Returns pointer to thread-local buffer. */
-static char negate_buf[64];
-char* cobolrt_negate_numeric(const char *data, unsigned int data_len) {
-    if (!data || data_len == 0) return negate_buf;
-    unsigned int out_len = data_len + 1;
-    if (out_len > sizeof(negate_buf)) out_len = sizeof(negate_buf);
-    negate_buf[0] = '-';
-    unsigned int copy_len = out_len - 1 < data_len ? out_len - 1 : data_len;
-    memcpy(negate_buf + 1, data, copy_len);
-    return negate_buf;
+/*
+ * Store a COMPUTE arithmetic result (which may contain a '.' for decimal)
+ * into a target display-format field. Auto-detects the source scale from
+ * the position of '.' in the source string.
+ *
+ * For example: src = "25.0000" (from 100/4), dest PIC 9(8):
+ *   src_scale detected as 4, src_val = 250000
+ *   dest_scale = 0, so scale_diff = -4 → 250000 / 10000 = 25
+ *   int_to_display(25, dest, 8) → "00000025"
+ */
+void cobolrt_store_compute_result(
+    const char *src, unsigned int src_len,
+    char *dest, unsigned int dest_len, int dest_scale, int dest_dot_pos, int rounded
+) {
+    /* Use actual string length (null-terminated) rather than estimated size */
+    unsigned int actual_len = (unsigned int)strlen(src);
+    if (actual_len < src_len) src_len = actual_len;
+
+    /* Auto-detect source scale from '.' position */
+    int src_scale = 0;
+    int dot_found = 0;
+    int is_negative = 0;
+    for (unsigned int i = 0; i < src_len; i++) {
+        if (src[i] == '.') { dot_found = 1; continue; }
+        if (src[i] == '-') { is_negative = 1; continue; }
+        if (dot_found && src[i] >= '0' && src[i] <= '9') src_scale++;
+    }
+
+    /* Parse the value, skipping '.' and '-' */
+    long long src_val = display_to_int_skip(src, src_len);
+    if (is_negative && src_val > 0) src_val = -src_val;
+
+    /* Scale adjustment */
+    int scale_diff = dest_scale - src_scale;
+    long long adjusted = src_val;
+    int neg = (adjusted < 0);
+    if (neg) adjusted = -adjusted;
+
+    if (scale_diff > 0) {
+        for (int i = 0; i < scale_diff; i++)
+            adjusted *= 10;
+    } else if (scale_diff < 0) {
+        if (rounded) {
+            for (int i = 0; i < (-scale_diff) - 1; i++)
+                adjusted /= 10;
+            long long remainder = adjusted % 10;
+            adjusted /= 10;
+            if (remainder >= 5) adjusted++;
+        } else {
+            for (int i = 0; i < -scale_diff; i++)
+                adjusted /= 10;
+        }
+    }
+
+    if (neg) adjusted = -adjusted;
+
+    if (dest_dot_pos >= 0) {
+        int_to_display_edited(adjusted, dest, dest_len, dest_dot_pos);
+    } else {
+        int_to_display(adjusted, dest, dest_len);
+    }
 }
 
-/* Display-format decimal arithmetic for COMPUTE expressions.
-   These return a pointer to a thread-local result buffer. */
-static char decimal_result_buf[128];
+/* ---- COMPUTE/PERFORM support: negate, decimal ops, counter support ---- */
+
+/* Rotating pool of decimal result buffers.
+ * Each runtime function that returns a pointer to a decimal string gets
+ * its own buffer, preventing aliasing when building complex expression trees
+ * like COMPUTE X = A ** 2 + B * C (where pow and mul results must coexist). */
+#define DECIMAL_BUF_COUNT 16
+#define DECIMAL_BUF_SIZE 128
+static char decimal_bufs[DECIMAL_BUF_COUNT][DECIMAL_BUF_SIZE];
+static int decimal_buf_idx = 0;
+
+static char* get_decimal_buf(void) {
+    char *buf = decimal_bufs[decimal_buf_idx];
+    decimal_buf_idx = (decimal_buf_idx + 1) % DECIMAL_BUF_COUNT;
+    memset(buf, 0, DECIMAL_BUF_SIZE);
+    return buf;
+}
+
+/* Negate a display-format numeric value. Returns pointer to rotating buffer. */
+char* cobolrt_negate_numeric(const char *data, unsigned int data_len) {
+    char *buf = get_decimal_buf();
+    if (!data || data_len == 0) return buf;
+    unsigned int out_len = data_len + 1;
+    if (out_len > DECIMAL_BUF_SIZE) out_len = DECIMAL_BUF_SIZE;
+    buf[0] = '-';
+    unsigned int copy_len = out_len - 1 < data_len ? out_len - 1 : data_len;
+    memcpy(buf + 1, data, copy_len);
+    return buf;
+}
+
+/* Display-format decimal arithmetic for COMPUTE expressions. */
 
 static long long parse_display_val(const char *data, unsigned int len, int *scale) {
     long long val = 0;
@@ -876,6 +955,7 @@ static long long parse_display_val(const char *data, unsigned int len, int *scal
 }
 
 static char* write_decimal_result(long long val, int scale) {
+    char *result_buf = get_decimal_buf();
     int neg = 0;
     if (val < 0) { neg = 1; val = -val; }
     /* Write digits right-to-left */
@@ -890,8 +970,6 @@ static char* write_decimal_result(long long val, int scale) {
         /* Insert decimal point if needed */
         if (scale > 0 && scale < digit_count) {
             /* Shift digits to make room for dot */
-            int dot_pos_from_right = scale;
-            int result_len = digit_count + 1;
             char tmp2[64];
             int src = pos, dst = 0;
             for (int i = 0; i < digit_count - scale; i++) tmp2[dst++] = tmp[src++];
@@ -915,11 +993,11 @@ static char* write_decimal_result(long long val, int scale) {
         }
     }
     int result_start = 0;
-    if (neg) { decimal_result_buf[result_start++] = '-'; }
+    if (neg) { result_buf[result_start++] = '-'; }
     int len = strlen(tmp + pos);
-    memcpy(decimal_result_buf + result_start, tmp + pos, len);
-    decimal_result_buf[result_start + len] = '\0';
-    return decimal_result_buf;
+    memcpy(result_buf + result_start, tmp + pos, len);
+    result_buf[result_start + len] = '\0';
+    return result_buf;
 }
 
 char* cobolrt_decimal_add(const char *left, unsigned int left_len,

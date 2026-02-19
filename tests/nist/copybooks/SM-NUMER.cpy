@@ -1,0 +1,1 @@
+       01 SM-N-FIELD PIC 9(4) VALUE 5555.

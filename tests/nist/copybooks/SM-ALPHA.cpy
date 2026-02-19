@@ -1,0 +1,1 @@
+       01 SM-A-FIELD PIC X(5) VALUE "ALPHA".

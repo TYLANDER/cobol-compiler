@@ -68,6 +68,8 @@ struct CraneliftCodegen {
     data_ids: HashMap<String, DataId>,
     /// The pointer type for the current target (I32 or I64).
     pointer_type: ir::Type,
+    /// Maps child global names to their (parent_name, byte_offset) for group items.
+    parent_offsets: HashMap<String, (String, u32)>,
 }
 
 impl CraneliftCodegen {
@@ -107,6 +109,7 @@ impl CraneliftCodegen {
             module,
             data_ids: HashMap::new(),
             pointer_type,
+            parent_offsets: HashMap::new(),
         })
     }
 
@@ -177,6 +180,15 @@ impl CraneliftCodegen {
                     continue;
                 }
             }
+            if let Some((ref parent_name, byte_offset)) = g.parent_offset {
+                // Child of a group item: share the parent's DataId.
+                // The actual offset is applied at GlobalAddr emission time.
+                if let Some(&parent_id) = self.data_ids.get(parent_name) {
+                    self.data_ids.insert(g.name.clone(), parent_id);
+                    self.parent_offsets.insert(g.name.clone(), (parent_name.clone(), byte_offset));
+                    continue;
+                }
+            }
             let data_id = self
                 .module
                 .declare_data(&g.name, Linkage::Local, true /* writable */, false /* tls */)
@@ -187,41 +199,88 @@ impl CraneliftCodegen {
     }
 
     fn define_globals(&mut self, globals: &[MirGlobal]) -> Result<(), CodegenError> {
+        // Build a map of parent -> children for composite initialization
+        let mut children_of: HashMap<String, Vec<(u32, &MirGlobal)>> = HashMap::new();
+        for g in globals {
+            if let Some((ref parent_name, byte_offset)) = g.parent_offset {
+                children_of.entry(parent_name.clone()).or_default().push((byte_offset, g));
+            }
+        }
+
         for g in globals {
             // Skip REDEFINES items — they share the data section of the redefined item
             if g.redefines.is_some() {
                 continue;
             }
+            // Skip children of group items — they share the parent's data section
+            if g.parent_offset.is_some() {
+                continue;
+            }
             let data_id = self.data_ids[&g.name];
             let mut desc = DataDescription::new();
 
-            match &g.initial_value {
-                Some(MirConst::Str(s)) => {
-                    desc.define(s.as_bytes().to_vec().into_boxed_slice());
+            // Check if this is a group item with children that need composite init
+            let has_children = children_of.contains_key(&g.name);
+
+            if has_children && g.initial_value.is_none() {
+                // Group item: build composite initial value from children
+                let size = mir_type_size(&g.ty);
+                let mut buf = vec![b' '; size]; // default: spaces (alphanumeric default)
+
+                if let Some(children) = children_of.get(&g.name) {
+                    for &(offset, child) in children {
+                        let child_size = mir_type_size(&child.ty);
+                        let child_bytes: Vec<u8> = match &child.initial_value {
+                            Some(MirConst::Str(s)) => {
+                                let mut b = s.as_bytes().to_vec();
+                                b.resize(child_size, b' ');
+                                b
+                            }
+                            Some(MirConst::Bytes(b)) => b.clone(),
+                            Some(MirConst::Int(n)) => n.to_le_bytes().to_vec(),
+                            None => {
+                                // No VALUE clause: default zeros for numeric (PIC 9),
+                                // spaces for alpha. Use zeros as default (common for PIC 9).
+                                vec![b'0'; child_size]
+                            }
+                            _ => vec![0u8; child_size],
+                        };
+                        let start = offset as usize;
+                        let end = (start + child_bytes.len()).min(buf.len());
+                        let copy_len = end - start;
+                        buf[start..end].copy_from_slice(&child_bytes[..copy_len]);
+                    }
                 }
-                Some(MirConst::Bytes(b)) => {
-                    desc.define(b.clone().into_boxed_slice());
-                }
-                Some(MirConst::Int(n)) => {
-                    desc.define(n.to_le_bytes().to_vec().into_boxed_slice());
-                }
-                Some(MirConst::Int128(n)) => {
-                    desc.define(n.to_le_bytes().to_vec().into_boxed_slice());
-                }
-                Some(MirConst::Float(f)) => {
-                    desc.define(f.to_le_bytes().to_vec().into_boxed_slice());
-                }
-                Some(MirConst::Bool(b)) => {
-                    desc.define(vec![*b as u8].into_boxed_slice());
-                }
-                Some(MirConst::Null) | None => {
-                    let size = mir_type_size(&g.ty);
-                    if size > 0 {
-                        desc.define_zeroinit(size);
-                    } else {
-                        // zero-sized (Void) -- define a single zero byte so
-                        // Cranelift doesn't complain about an empty data object.
-                        desc.define_zeroinit(1);
+                desc.define(buf.into_boxed_slice());
+            } else {
+                match &g.initial_value {
+                    Some(MirConst::Str(s)) => {
+                        desc.define(s.as_bytes().to_vec().into_boxed_slice());
+                    }
+                    Some(MirConst::Bytes(b)) => {
+                        desc.define(b.clone().into_boxed_slice());
+                    }
+                    Some(MirConst::Int(n)) => {
+                        desc.define(n.to_le_bytes().to_vec().into_boxed_slice());
+                    }
+                    Some(MirConst::Int128(n)) => {
+                        desc.define(n.to_le_bytes().to_vec().into_boxed_slice());
+                    }
+                    Some(MirConst::Float(f)) => {
+                        desc.define(f.to_le_bytes().to_vec().into_boxed_slice());
+                    }
+                    Some(MirConst::Bool(b)) => {
+                        desc.define(vec![*b as u8].into_boxed_slice());
+                    }
+                    Some(MirConst::Null) | None => {
+                        let size = mir_type_size(&g.ty);
+                        if size > 0 {
+                            desc.define_zeroinit(size);
+                        } else {
+                            // zero-sized (Void) -- define a single zero byte so
+                            // Cranelift doesn't complain about an empty data object.
+                            desc.define_zeroinit(1);
+                        }
                     }
                 }
             }
@@ -370,6 +429,16 @@ impl CraneliftCodegen {
                 sig.params.push(AbiParam::new(types::I32)); // right len
                 sig.params.push(AbiParam::new(types::I32)); // result len
                 sig.returns.push(AbiParam::new(ptr));       // result ptr
+            }
+            "cobolrt_store_compute_result" => {
+                // (src_ptr, src_len, dest_ptr, dest_len, dest_scale, dest_dot_pos, rounded) -> void
+                sig.params.push(AbiParam::new(ptr));        // src ptr
+                sig.params.push(AbiParam::new(types::I32)); // src len
+                sig.params.push(AbiParam::new(ptr));        // dest ptr
+                sig.params.push(AbiParam::new(types::I32)); // dest len
+                sig.params.push(AbiParam::new(types::I32)); // dest scale
+                sig.params.push(AbiParam::new(types::I32)); // dest dot pos
+                sig.params.push(AbiParam::new(types::I32)); // rounded
             }
             "cobolrt_decimal_cmp" => {
                 sig.params.push(AbiParam::new(ptr)); // left ptr
@@ -559,7 +628,18 @@ impl CraneliftCodegen {
                     CodegenError::BackendError(format!("unknown global '{}'", name))
                 })?;
                 let gv = self.module.declare_data_in_func(*data_id, builder.func);
-                let v = builder.ins().global_value(ptr_ty, gv);
+                let base = builder.ins().global_value(ptr_ty, gv);
+                // If this is a child of a group item, add the byte offset
+                let v = if let Some((_parent, byte_offset)) = self.parent_offsets.get(name) {
+                    if *byte_offset > 0 {
+                        let offset_val = builder.ins().iconst(ptr_ty, *byte_offset as i64);
+                        builder.ins().iadd(base, offset_val)
+                    } else {
+                        base
+                    }
+                } else {
+                    base
+                };
                 val_map.insert(dest.raw(), v);
             }
 
@@ -791,6 +871,7 @@ impl CraneliftCodegen {
             MirInst::SizeError { .. } => {
                 // TODO: implement SIZE ERROR handling.
             }
+
         }
         Ok(())
     }
@@ -1136,6 +1217,7 @@ mod tests {
                 initial_value: Some(MirConst::Str("HELLO, WORLD!".into())),
                 offset: 0,
                 redefines: None,
+                parent_offset: None,
             }],
             file_descriptors: vec![],
         };

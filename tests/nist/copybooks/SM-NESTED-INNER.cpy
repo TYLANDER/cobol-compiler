@@ -1,0 +1,1 @@
+       01 SM-INNER-VAR PIC X(5) VALUE "INNER".

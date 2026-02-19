@@ -658,15 +658,13 @@ fn apply_pseudo_text_replacement(text: &str, from: &str, to: &str) -> String {
         return text.to_string();
     }
 
-    // COBOL pseudo-text replacement works on a word/token level.
-    // We match the normalized from-text against normalized sequences of tokens
-    // in the source. For simplicity, we do case-insensitive comparison on
-    // whitespace-normalized text.
-    //
-    // Simple approach: find occurrences of the from-text in the source,
-    // doing case-insensitive comparison with whitespace normalization.
+    // COBOL pseudo-text replacement operates on text sequences.
+    // For pseudo-text containing non-alphanumeric characters (like :TAG:),
+    // we do simple substring matching since these are tag-style patterns
+    // designed to match within compound identifiers (e.g. :TAG:-NAME → WS-NAME).
+    // For pure alphanumeric/hyphen pseudo-text, we use word boundary matching
+    // to avoid replacing substrings of unrelated words.
 
-    // First try direct case-insensitive replacement
     let mut result = String::with_capacity(text.len());
     let text_upper = text.to_ascii_uppercase();
     let from_upper = from.to_ascii_uppercase();
@@ -676,10 +674,20 @@ fn apply_pseudo_text_replacement(text: &str, from: &str, to: &str) -> String {
         return text.to_string();
     }
 
+    // Check if the from-text contains special characters (like colons) that
+    // indicate it's a tag-style pattern needing substring matching
+    let has_special = from.bytes().any(|b| !b.is_ascii_alphanumeric() && b != b'-');
+
     let mut pos = 0;
     while pos < text.len() {
         if pos + from_len <= text.len() && text_upper[pos..pos + from_len] == from_upper {
-            // Check word boundaries for multi-word replacements
+            if has_special {
+                // Tag-style pattern: do substring replacement without boundary checks
+                result.push_str(to);
+                pos += from_len;
+                continue;
+            }
+            // Word-style pattern: check word boundaries
             let before_ok =
                 pos == 0 || is_word_boundary_char(text.as_bytes()[pos - 1]);
             let after_ok = pos + from_len >= text.len()
@@ -874,8 +882,13 @@ impl<'a> Preprocessor<'a> {
                 LineDirective::None => {
                     // No more directives; append the rest of the source.
                     let remaining = &source[pos..];
+                    let text_to_add = if !self.active_replace.is_empty() {
+                        apply_replacements(remaining, &self.active_replace)
+                    } else {
+                        remaining.to_string()
+                    };
                     let out_start = output.len();
-                    output.push_str(remaining);
+                    output.push_str(&text_to_add);
                     let out_end = output.len();
                     if out_end > out_start {
                         self.expansion_map.entries.push(ExpansionEntry {
@@ -896,8 +909,13 @@ impl<'a> Preprocessor<'a> {
                     // Emit the text before the COPY directive
                     if start_offset > pos {
                         let before = &source[pos..start_offset];
+                        let text_to_add = if !self.active_replace.is_empty() {
+                            apply_replacements(before, &self.active_replace)
+                        } else {
+                            before.to_string()
+                        };
                         let out_start = output.len();
-                        output.push_str(before);
+                        output.push_str(&text_to_add);
                         let out_end = output.len();
                         if out_end > out_start {
                             self.expansion_map.entries.push(ExpansionEntry {
@@ -975,11 +993,17 @@ impl<'a> Preprocessor<'a> {
                     end_offset,
                     directive: replace_dir,
                 } => {
-                    // Emit text before the REPLACE directive
+                    // Emit text before the REPLACE directive, applying
+                    // any currently active REPLACE substitutions
                     if start_offset > pos {
                         let before = &source[pos..start_offset];
+                        let text_to_add = if !self.active_replace.is_empty() {
+                            apply_replacements(before, &self.active_replace)
+                        } else {
+                            before.to_string()
+                        };
                         let out_start = output.len();
-                        output.push_str(before);
+                        output.push_str(&text_to_add);
                         let out_end = output.len();
                         if out_end > out_start {
                             self.expansion_map.entries.push(ExpansionEntry {
