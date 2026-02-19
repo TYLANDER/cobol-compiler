@@ -1634,6 +1634,104 @@ int cobolrt_sign_check(const char *data, int len, int scale, int mode) {
     /* value > 0 */
     return (mode == 0) ? 1 : 0;
 }
+
+/* ---- Intrinsic function runtime support ---- */
+
+/* Static temp buffer for intrinsic function results.
+ * Reused across calls; caller must consume before next intrinsic call. */
+static char _intrinsic_temp[4096];
+
+/* FUNCTION UPPER-CASE: convert src to uppercase, return pointer to temp buffer.
+ * Result is space-padded to dest_len. */
+char* cobolrt_upper_case(const char *src, unsigned int src_len, unsigned int dest_len) {
+    unsigned int copy_len = src_len < dest_len ? src_len : dest_len;
+    for (unsigned int i = 0; i < copy_len; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (c >= 'a' && c <= 'z') {
+            _intrinsic_temp[i] = (char)(c - 32);
+        } else {
+            _intrinsic_temp[i] = (char)c;
+        }
+    }
+    for (unsigned int i = copy_len; i < dest_len; i++) {
+        _intrinsic_temp[i] = ' ';
+    }
+    return _intrinsic_temp;
+}
+
+/* FUNCTION LOWER-CASE: convert src to lowercase, return pointer to temp buffer. */
+char* cobolrt_lower_case(const char *src, unsigned int src_len, unsigned int dest_len) {
+    unsigned int copy_len = src_len < dest_len ? src_len : dest_len;
+    for (unsigned int i = 0; i < copy_len; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (c >= 'A' && c <= 'Z') {
+            _intrinsic_temp[i] = (char)(c + 32);
+        } else {
+            _intrinsic_temp[i] = (char)c;
+        }
+    }
+    for (unsigned int i = copy_len; i < dest_len; i++) {
+        _intrinsic_temp[i] = ' ';
+    }
+    return _intrinsic_temp;
+}
+
+/* FUNCTION REVERSE: reverse the string, return pointer to temp buffer. */
+char* cobolrt_reverse(const char *src, unsigned int src_len, unsigned int dest_len) {
+    unsigned int copy_len = src_len < dest_len ? src_len : dest_len;
+    for (unsigned int i = 0; i < copy_len; i++) {
+        _intrinsic_temp[i] = src[copy_len - 1 - i];
+    }
+    for (unsigned int i = copy_len; i < dest_len; i++) {
+        _intrinsic_temp[i] = ' ';
+    }
+    return _intrinsic_temp;
+}
+
+/* FUNCTION TRIM: remove leading and trailing spaces, return pointer to temp buffer.
+ * Result is left-justified and space-padded to dest_len. */
+char* cobolrt_trim(const char *src, unsigned int src_len, unsigned int dest_len) {
+    /* Find start of non-space content */
+    unsigned int start = 0;
+    while (start < src_len && src[start] == ' ') start++;
+    /* Find end of non-space content */
+    unsigned int end = src_len;
+    while (end > start && src[end - 1] == ' ') end--;
+    unsigned int content_len = end - start;
+    unsigned int copy_len = content_len < dest_len ? content_len : dest_len;
+    memcpy(_intrinsic_temp, src + start, copy_len);
+    for (unsigned int i = copy_len; i < dest_len; i++) {
+        _intrinsic_temp[i] = ' ';
+    }
+    return _intrinsic_temp;
+}
+
+/* FUNCTION MAX: compare two display-format numeric values, return pointer to the larger.
+ * Returns the address of whichever argument is greater. */
+char* cobolrt_max_numeric(
+    const char *a, unsigned int a_len,
+    const char *b, unsigned int b_len
+) {
+    long long va = display_to_int(a, a_len);
+    long long vb = display_to_int(b, b_len);
+    if (vb > va) {
+        return (char*)b;
+    }
+    return (char*)a;
+}
+
+/* FUNCTION MIN: compare two display-format numeric values, return pointer to the smaller. */
+char* cobolrt_min_numeric(
+    const char *a, unsigned int a_len,
+    const char *b, unsigned int b_len
+) {
+    long long va = display_to_int(a, a_len);
+    long long vb = display_to_int(b, b_len);
+    if (vb < va) {
+        return (char*)b;
+    }
+    return (char*)a;
+}
 "#;
 
 /// cobolc -- The World's Best Open-Source COBOL Compiler

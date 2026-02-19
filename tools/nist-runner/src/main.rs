@@ -248,7 +248,7 @@ fn discover_tests(suite_dir: &Path, module: &str, filter: Option<&str>) -> Vec<P
         let path = entry.path();
         if path
             .extension()
-            .map_or(false, |ext| ext == "cob" || ext == "CBL" || ext == "cbl")
+            .is_some_and(|ext| ext == "cob" || ext == "CBL" || ext == "cbl")
         {
             let name = path
                 .file_stem()
@@ -259,7 +259,7 @@ fn discover_tests(suite_dir: &Path, module: &str, filter: Option<&str>) -> Vec<P
             // Filter by module prefix (first 2 characters, e.g., "NC", "SM")
             if module != "all" {
                 let prefix = if name.len() >= 2 { &name[..2] } else { &name };
-                if !prefix.eq_ignore_ascii_case(&module) {
+                if !prefix.eq_ignore_ascii_case(module) {
                     continue;
                 }
             }

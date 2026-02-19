@@ -366,16 +366,15 @@ fn find_next_directive(source: &str, from: usize) -> LineDirective {
             && (rest.len() == 7
                 || rest.as_bytes()[7].is_ascii_whitespace()
                 || rest.as_bytes()[7] == b'.')
+            && (search_pos == 0 || is_word_boundary(search_text.as_bytes()[search_pos - 1]))
         {
-            if search_pos == 0 || is_word_boundary(search_text.as_bytes()[search_pos - 1]) {
-                let abs_start = from + search_pos;
-                if let Some((directive, end_offset)) = parse_replace_directive(source, abs_start) {
-                    return LineDirective::Replace {
-                        start_offset: abs_start,
-                        end_offset,
-                        directive,
-                    };
-                }
+            let abs_start = from + search_pos;
+            if let Some((directive, end_offset)) = parse_replace_directive(source, abs_start) {
+                return LineDirective::Replace {
+                    start_offset: abs_start,
+                    end_offset,
+                    directive,
+                };
             }
         }
 

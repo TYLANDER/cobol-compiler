@@ -400,7 +400,7 @@ mod tests {
 
     #[test]
     fn lsp_converter_warning() {
-        let converter = LspDiagnosticConverter::default();
+        let converter = LspDiagnosticConverter;
         let diag = Diagnostic::warning("unused", test_span());
 
         let lsp_diag = converter.convert(&diag);

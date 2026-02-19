@@ -135,7 +135,10 @@ mod tests {
         let a = b"3";
         let b = b"3";
         // SAFETY: Both pointers are valid for 1 byte.
-        assert_eq!(unsafe { cobolrt_compare_numeric(a.as_ptr(), 1, b.as_ptr(), 1) }, 0);
+        assert_eq!(
+            unsafe { cobolrt_compare_numeric(a.as_ptr(), 1, b.as_ptr(), 1) },
+            0
+        );
     }
 
     #[test]
@@ -143,7 +146,10 @@ mod tests {
         let a = b"3";
         let b = b"5";
         // SAFETY: Both pointers are valid for 1 byte.
-        assert_eq!(unsafe { cobolrt_compare_numeric(a.as_ptr(), 1, b.as_ptr(), 1) }, -1);
+        assert_eq!(
+            unsafe { cobolrt_compare_numeric(a.as_ptr(), 1, b.as_ptr(), 1) },
+            -1
+        );
     }
 
     #[test]
@@ -151,7 +157,10 @@ mod tests {
         let a = b"9";
         let b = b"3";
         // SAFETY: Both pointers are valid for 1 byte.
-        assert_eq!(unsafe { cobolrt_compare_numeric(a.as_ptr(), 1, b.as_ptr(), 1) }, 1);
+        assert_eq!(
+            unsafe { cobolrt_compare_numeric(a.as_ptr(), 1, b.as_ptr(), 1) },
+            1
+        );
     }
 
     #[test]
@@ -159,7 +168,10 @@ mod tests {
         let a = b"03";
         let b = b"3";
         // SAFETY: Both pointers are valid for their respective lengths.
-        assert_eq!(unsafe { cobolrt_compare_numeric(a.as_ptr(), 2, b.as_ptr(), 1) }, 0);
+        assert_eq!(
+            unsafe { cobolrt_compare_numeric(a.as_ptr(), 2, b.as_ptr(), 1) },
+            0
+        );
     }
 
     #[test]
@@ -167,7 +179,10 @@ mod tests {
         let a = b"12.50";
         let b = b"12.50";
         // SAFETY: Both pointers are valid for 5 bytes.
-        assert_eq!(unsafe { cobolrt_compare_numeric(a.as_ptr(), 5, b.as_ptr(), 5) }, 0);
+        assert_eq!(
+            unsafe { cobolrt_compare_numeric(a.as_ptr(), 5, b.as_ptr(), 5) },
+            0
+        );
     }
 
     #[test]

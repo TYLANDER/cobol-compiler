@@ -166,7 +166,11 @@ pub unsafe extern "C" fn cobolrt_intrinsic_numval(data: *const u8, len: u32) -> 
 ///
 /// - `data` must point to at least `len` readable bytes, or be null.
 #[no_mangle]
-pub unsafe extern "C" fn cobolrt_intrinsic_numval_c(data: *const u8, len: u32, currency: u8) -> f64 {
+pub unsafe extern "C" fn cobolrt_intrinsic_numval_c(
+    data: *const u8,
+    len: u32,
+    currency: u8,
+) -> f64 {
     let _ = (data, len, currency);
     0.0
 }
@@ -201,7 +205,7 @@ pub extern "C" fn cobolrt_intrinsic_ord(c: u8) -> i64 {
 /// FUNCTION CHAR
 #[no_mangle]
 pub extern "C" fn cobolrt_intrinsic_char(n: i64) -> u8 {
-    if n < 1 || n > 256 {
+    if !(1..=256).contains(&n) {
         0
     } else {
         (n - 1) as u8

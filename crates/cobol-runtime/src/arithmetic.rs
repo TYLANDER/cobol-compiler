@@ -1020,7 +1020,10 @@ mod tests {
     #[test]
     fn display_to_int_with_sign() {
         // SAFETY: Byte literal is valid for 5 bytes.
-        assert_eq!(unsafe { cobolrt_display_to_int(b"-0123".as_ptr(), 5) }, -123);
+        assert_eq!(
+            unsafe { cobolrt_display_to_int(b"-0123".as_ptr(), 5) },
+            -123
+        );
     }
 
     #[test]
@@ -1033,7 +1036,10 @@ mod tests {
     fn display_to_int_with_decimal() {
         // Decimal point is skipped; digits are concatenated.
         // SAFETY: Byte literal is valid for 5 bytes.
-        assert_eq!(unsafe { cobolrt_display_to_int(b"12.50".as_ptr(), 5) }, 1250);
+        assert_eq!(
+            unsafe { cobolrt_display_to_int(b"12.50".as_ptr(), 5) },
+            1250
+        );
     }
 
     // -- string_append tests --

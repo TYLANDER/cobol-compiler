@@ -539,23 +539,38 @@ impl CraneliftCodegen {
                 sig.params.push(AbiParam::new(types::I32)); // num_delimiters
             }
             "cobolrt_unstring_add_delim" => {
-                sig.params.push(AbiParam::new(ptr));        // delim ptr
+                sig.params.push(AbiParam::new(ptr)); // delim ptr
                 sig.params.push(AbiParam::new(types::I32)); // delim_len
                 sig.params.push(AbiParam::new(types::I32)); // all_flag
             }
             "cobolrt_unstring_field" => {
-                sig.params.push(AbiParam::new(ptr));        // source
+                sig.params.push(AbiParam::new(ptr)); // source
                 sig.params.push(AbiParam::new(types::I32)); // source_len
-                sig.params.push(AbiParam::new(ptr));        // target
+                sig.params.push(AbiParam::new(ptr)); // target
                 sig.params.push(AbiParam::new(types::I32)); // target_len
-                sig.params.push(AbiParam::new(ptr));        // pointer
+                sig.params.push(AbiParam::new(ptr)); // pointer
                 sig.params.push(AbiParam::new(types::I32)); // pointer_len
-                sig.params.push(AbiParam::new(ptr));        // tally
+                sig.params.push(AbiParam::new(ptr)); // tally
                 sig.params.push(AbiParam::new(types::I32)); // tally_len
-                sig.params.push(AbiParam::new(ptr));        // count_in
+                sig.params.push(AbiParam::new(ptr)); // count_in
                 sig.params.push(AbiParam::new(types::I32)); // count_in_len
-                sig.params.push(AbiParam::new(ptr));        // delim_in
+                sig.params.push(AbiParam::new(ptr)); // delim_in
                 sig.params.push(AbiParam::new(types::I32)); // delim_in_len
+            }
+            "cobolrt_upper_case" | "cobolrt_lower_case" | "cobolrt_reverse" | "cobolrt_trim" => {
+                // (src_ptr, src_len, dest_len) -> result_ptr
+                sig.params.push(AbiParam::new(ptr)); // src ptr
+                sig.params.push(AbiParam::new(types::I32)); // src_len
+                sig.params.push(AbiParam::new(types::I32)); // dest_len
+                sig.returns.push(AbiParam::new(ptr)); // result ptr
+            }
+            "cobolrt_max_numeric" | "cobolrt_min_numeric" => {
+                // (a_ptr, a_len, b_ptr, b_len) -> result_ptr
+                sig.params.push(AbiParam::new(ptr)); // a ptr
+                sig.params.push(AbiParam::new(types::I32)); // a_len
+                sig.params.push(AbiParam::new(ptr)); // b ptr
+                sig.params.push(AbiParam::new(types::I32)); // b_len
+                sig.returns.push(AbiParam::new(ptr)); // result ptr (points to a or b)
             }
             _ => {
                 // Unknown function (likely a subprogram call).
@@ -1330,7 +1345,7 @@ mod tests {
 
     #[test]
     fn cranelift_backend_default() {
-        let backend = CraneliftBackend::default();
+        let backend = CraneliftBackend;
         assert_eq!(backend.name(), "cranelift");
     }
 

@@ -557,7 +557,7 @@ fn tokenize_line(text: &str, base_offset: u32, file_id: FileId, tokens: &mut Vec
                 let mut has_dot = false;
                 while pos < len {
                     let b = bytes[pos];
-                    if b >= b'0' && b <= b'9' {
+                    if b.is_ascii_digit() {
                         pos += 1;
                     } else if b == b'.' && !has_dot {
                         // Check if this is a decimal point in a number or a
@@ -619,9 +619,9 @@ fn tokenize_line(text: &str, base_offset: u32, file_id: FileId, tokens: &mut Vec
                 // END-IF, PROGRAM-ID). They must start with a letter.
                 while pos < len {
                     let b = bytes[pos];
-                    if (b >= b'A' && b <= b'Z')
-                        || (b >= b'a' && b <= b'z')
-                        || (b >= b'0' && b <= b'9')
+                    if b.is_ascii_uppercase()
+                        || b.is_ascii_lowercase()
+                        || b.is_ascii_digit()
                         || b == b'-'
                     {
                         pos += 1;

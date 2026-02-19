@@ -280,13 +280,12 @@ pub unsafe extern "C" fn cobolrt_decimal_div(
         let remainder_scale = (*remainder).scale;
         // remainder = left - quotient * right (at remainder's scale)
         let q_actual = quotient; // at result_scale
-        // Convert quotient back to left's scale for remainder calculation
+                                 // Convert quotient back to left's scale for remainder calculation
         let q_at_left_scale = scale_value(q_actual, result_scale, left_scale, false);
         let product_at_left = q_at_left_scale * right_val;
         // product has scale = left_scale + right_scale
         let product_scale = left_scale + right_scale;
-        let product_at_left_scale =
-            scale_value(product_at_left, product_scale, left_scale, false);
+        let product_at_left_scale = scale_value(product_at_left, product_scale, left_scale, false);
         let rem = left_val - product_at_left_scale;
         let rem_final = scale_value(rem, left_scale, remainder_scale, false);
         i128_to_packed(rem_final, remainder);
@@ -451,7 +450,7 @@ mod tests {
         // Pack digits into BCD format
         // Number of bytes needed: (digits.len() + 1) / 2 rounded up, +1 for sign nibble
         let total_nibbles = digits.len() + 1; // digits + sign
-        let num_bytes = (total_nibbles + 1) / 2;
+        let num_bytes = total_nibbles.div_ceil(2);
         let mut data = vec![0u8; num_bytes];
 
         // Pad digits on the left to fill the available nibbles

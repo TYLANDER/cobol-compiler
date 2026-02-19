@@ -69,11 +69,7 @@ pub unsafe extern "C" fn cobolrt_accept(buffer: *mut u8, buffer_len: u32) -> u32
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer, copy_len);
             // Pad with spaces (COBOL standard)
             if copy_len < buffer_len as usize {
-                std::ptr::write_bytes(
-                    buffer.add(copy_len),
-                    b' ',
-                    buffer_len as usize - copy_len,
-                );
+                std::ptr::write_bytes(buffer.add(copy_len), b' ', buffer_len as usize - copy_len);
             }
             copy_len as u32
         }

@@ -231,8 +231,13 @@ pub struct HirModule {
     /// Diagnostics produced during lowering.
     pub diagnostics: Vec<HirDiagnostic>,
     /// Maps 88-level condition names to (parent DataItemId, list of (value, optional THRU value) pairs).
-    pub condition_names:
-        std::collections::HashMap<String, (DataItemId, Vec<(Option<InitialValue>, Option<InitialValue>)>)>,
+    pub condition_names: std::collections::HashMap<
+        String,
+        (
+            DataItemId,
+            Vec<(Option<InitialValue>, Option<InitialValue>)>,
+        ),
+    >,
 }
 
 /// A FILE SECTION FD entry.
@@ -372,6 +377,8 @@ pub enum HirStatement {
         program: HirExpr,
         using: Vec<CallArg>,
         returning: Option<HirDataRef>,
+        on_exception: Vec<HirStatement>,
+        not_on_exception: Vec<HirStatement>,
     },
     StopRun,
     GoBack,
@@ -959,8 +966,13 @@ struct HirLowerer<'a> {
     /// File descriptors built from SELECT + FD.
     file_items: Vec<FileDescriptor>,
     /// Maps 88-level condition names to (parent DataItemId, list of (value, optional THRU value) pairs).
-    condition_names:
-        std::collections::HashMap<String, (DataItemId, Vec<(Option<InitialValue>, Option<InitialValue>)>)>,
+    condition_names: std::collections::HashMap<
+        String,
+        (
+            DataItemId,
+            Vec<(Option<InitialValue>, Option<InitialValue>)>,
+        ),
+    >,
     /// Tracks the last non-88 data item ID for parenting 88-level items.
     last_non_88_item: Option<DataItemId>,
 }
@@ -1307,7 +1319,7 @@ impl<'a> HirLowerer<'a> {
                 }
                 current_fd_name = fd_name;
                 if let Some(ref name) = current_fd_name {
-                    self.fd_records.entry(name.clone()).or_insert_with(Vec::new);
+                    self.fd_records.entry(name.clone()).or_default();
                 }
             } else if child.kind() == SyntaxKind::DATA_ITEM {
                 // This is a record item under the current FD
@@ -1323,7 +1335,7 @@ impl<'a> HirLowerer<'a> {
                                 let rec_name_str = self.interner.resolve(rec_name).to_string();
                                 self.fd_records
                                     .entry(fd_name.clone())
-                                    .or_insert_with(Vec::new)
+                                    .or_default()
                                     .push(rec_name_str);
                             }
                         }
@@ -1645,7 +1657,7 @@ impl<'a> HirLowerer<'a> {
             UsageType::Comp2 => 8,
             UsageType::Comp3 | UsageType::PackedDecimal => {
                 // Packed BCD: each byte holds 2 digits, last nibble is sign
-                (pic.size + 1) / 2
+                pic.size.div_ceil(2)
             }
             UsageType::Index => 4,
             UsageType::Pointer | UsageType::FunctionPointer => 4,
@@ -2070,7 +2082,8 @@ impl<'a> HirLowerer<'a> {
         // Handle sections and their contained paragraphs
         for section in proc_div.sections() {
             let section_name = if let Some(tok) = section.name() {
-                self.interner.intern(&tok.text().to_string().to_ascii_uppercase())
+                self.interner
+                    .intern(&tok.text().to_string().to_ascii_uppercase())
             } else {
                 self.interner.intern("UNNAMED-SECTION")
             };
@@ -2084,9 +2097,9 @@ impl<'a> HirLowerer<'a> {
             }
             if !section_loose_stmts.is_empty() {
                 // Create an implicit paragraph for the loose sentences
-                let implicit_name = self.interner.intern(
-                    &format!("_{}", self.interner.resolve(section_name)),
-                );
+                let implicit_name = self
+                    .interner
+                    .intern(&format!("_{}", self.interner.resolve(section_name)));
                 self.paragraphs.push(HirParagraph {
                     name: implicit_name,
                     statements: section_loose_stmts,
@@ -2112,7 +2125,7 @@ impl<'a> HirLowerer<'a> {
 
     fn lower_paragraph(&mut self, para: &cobol_ast::Paragraph) {
         let name = if let Some(tok) = para.name() {
-            self.interner.intern(&tok.text().to_string())
+            self.interner.intern(tok.text())
         } else {
             self.interner.intern("UNNAMED")
         };
@@ -2307,10 +2320,17 @@ impl<'a> HirLowerer<'a> {
                             i += 1;
                         }
                         SyntaxKind::WORD => {
-                            // Use parse_expr_at to handle subscripts and ref-mod
-                            let (expr, next) = self.parse_expr_at(&tokens, i);
-                            args.push(expr);
-                            i = next;
+                            // Handle FUNCTION intrinsic calls
+                            if upper == "FUNCTION" && i + 1 < tokens.len() {
+                                let (expr, next) = self.parse_function_call_at(&tokens, i);
+                                args.push(expr);
+                                i = next;
+                            } else {
+                                // Use parse_expr_at to handle subscripts and ref-mod
+                                let (expr, next) = self.parse_expr_at(&tokens, i);
+                                args.push(expr);
+                                i = next;
+                            }
                         }
                         _ => {
                             i += 1;
@@ -2348,10 +2368,15 @@ impl<'a> HirLowerer<'a> {
             .position(|(_, text)| text.eq_ignore_ascii_case("TO"))?;
 
         // Source: parse from position 1 (after MOVE) using parse_expr_at for
-        // subscript/ref-mod awareness
+        // subscript/ref-mod awareness. Handle FUNCTION intrinsic calls.
         let source = if to_idx > 1 {
-            let (expr, _) = self.parse_expr_at(&tokens, 1);
-            expr
+            if tokens[1].1.eq_ignore_ascii_case("FUNCTION") {
+                let (expr, _) = self.parse_function_call_at(&tokens, 1);
+                expr
+            } else {
+                let (expr, _) = self.parse_expr_at(&tokens, 1);
+                expr
+            }
         } else {
             return None;
         };
@@ -2462,7 +2487,7 @@ impl<'a> HirLowerer<'a> {
                 }
                 tokens.push((kind, tok.text().to_string()));
             } else if let Some(child) = el.as_node() {
-                tokens.extend(self.collect_all_tokens(&child));
+                tokens.extend(self.collect_all_tokens(child));
             }
         }
         tokens
@@ -2669,6 +2694,70 @@ impl<'a> HirLowerer<'a> {
         }
 
         (base_expr, pos + 1)
+    }
+
+    /// Parse a FUNCTION intrinsic call from a token slice starting at `pos` (which is "FUNCTION").
+    /// Returns `(HirExpr::FunctionCall, next_pos)`.
+    fn parse_function_call_at(
+        &mut self,
+        tokens: &[(SyntaxKind, String)],
+        pos: usize,
+    ) -> (HirExpr, usize) {
+        let mut i = pos + 1; // skip "FUNCTION"
+        if i >= tokens.len() {
+            return (HirExpr::Literal(LiteralValue::Integer(0)), i);
+        }
+        let func_name_str = tokens[i].1.to_ascii_uppercase();
+        let func_name = self.interner.intern(&func_name_str);
+        i += 1; // skip function name
+
+        let mut args = Vec::new();
+        if i < tokens.len() && tokens[i].1 == "(" {
+            i += 1; // skip '('
+            let mut paren_depth = 1u32;
+            let mut arg_tokens = Vec::new();
+            while i < tokens.len() && paren_depth > 0 {
+                if tokens[i].1 == "(" {
+                    paren_depth += 1;
+                    arg_tokens.push(tokens[i].clone());
+                    i += 1;
+                } else if tokens[i].1 == ")" {
+                    paren_depth -= 1;
+                    if paren_depth == 0 {
+                        i += 1; // skip closing ')'
+                        break;
+                    }
+                    arg_tokens.push(tokens[i].clone());
+                    i += 1;
+                } else if tokens[i].1 == "," && paren_depth == 1 {
+                    // Argument separator
+                    if !arg_tokens.is_empty() {
+                        let mut ap = 0;
+                        let arg = self.parse_arith_additive(&arg_tokens, &mut ap);
+                        args.push(arg);
+                        arg_tokens.clear();
+                    }
+                    i += 1; // skip ','
+                } else {
+                    arg_tokens.push(tokens[i].clone());
+                    i += 1;
+                }
+            }
+            // Parse the last argument
+            if !arg_tokens.is_empty() {
+                let mut ap = 0;
+                let arg = self.parse_arith_additive(&arg_tokens, &mut ap);
+                args.push(arg);
+            }
+        }
+
+        (
+            HirExpr::FunctionCall {
+                name: func_name,
+                args,
+            },
+            i,
+        )
     }
 
     /// Parse a data reference (possibly subscripted, qualified with OF/IN) from a token slice at `pos`.
@@ -2917,7 +3006,12 @@ impl<'a> HirLowerer<'a> {
                 let handler_start = to_idx + 2;
                 let (on_size_error, not_on_size_error) =
                     self.extract_size_error_handlers(&tokens, handler_start, "END-ADD");
-                return Some(HirStatement::AddCorresponding { from, to, on_size_error, not_on_size_error });
+                return Some(HirStatement::AddCorresponding {
+                    from,
+                    to,
+                    on_size_error,
+                    not_on_size_error,
+                });
             }
         }
 
@@ -2951,8 +3045,8 @@ impl<'a> HirLowerer<'a> {
                     i += 1;
                     continue;
                 }
-                "ON" | "SIZE" | "ERROR" | "NOT" | "END-ADD" | "ELSE"
-                | "END-IF" | "END-PERFORM" | "END-EVALUATE" | "WHEN" => break,
+                "ON" | "SIZE" | "ERROR" | "NOT" | "END-ADD" | "ELSE" | "END-IF" | "END-PERFORM"
+                | "END-EVALUATE" | "WHEN" => break,
                 "(" | ")" | "," => {
                     i += 1;
                     continue;
@@ -3070,8 +3164,8 @@ impl<'a> HirLowerer<'a> {
                     i += 1;
                     continue;
                 }
-                "ON" | "SIZE" | "ERROR" | "NOT" | "END-SUBTRACT" | "ELSE"
-                | "END-IF" | "END-PERFORM" | "END-EVALUATE" | "WHEN" => break,
+                "ON" | "SIZE" | "ERROR" | "NOT" | "END-SUBTRACT" | "ELSE" | "END-IF"
+                | "END-PERFORM" | "END-EVALUATE" | "WHEN" => break,
                 "(" | ")" | "," => {
                     i += 1;
                     continue;
@@ -3162,7 +3256,7 @@ impl<'a> HirLowerer<'a> {
         }
 
         // Check for NOT ON SIZE ERROR
-        if pos < tokens.len() && tokens[pos].1.to_ascii_uppercase() == "NOT" {
+        if pos < tokens.len() && tokens[pos].1.eq_ignore_ascii_case("NOT") {
             pos += 1; // skip NOT
             while pos < tokens.len() {
                 let upper = tokens[pos].1.to_ascii_uppercase();
@@ -3253,7 +3347,7 @@ impl<'a> HirLowerer<'a> {
         }
 
         // Check for NOT ON OVERFLOW
-        if pos < tokens.len() && tokens[pos].1.to_ascii_uppercase() == "NOT" {
+        if pos < tokens.len() && tokens[pos].1.eq_ignore_ascii_case("NOT") {
             pos += 1; // skip NOT
             while pos < tokens.len() {
                 let upper = tokens[pos].1.to_ascii_uppercase();
@@ -3311,7 +3405,7 @@ impl<'a> HirLowerer<'a> {
                     let (from_expr, next) = self.parse_expr_at(tokens, i);
                     i = next;
                     // Skip TO
-                    if i < tokens.len() && tokens[i].1.to_ascii_uppercase() == "TO" {
+                    if i < tokens.len() && tokens[i].1.eq_ignore_ascii_case("TO") {
                         i += 1;
                     }
                     let mut targets = Vec::new();
@@ -3391,8 +3485,8 @@ impl<'a> HirLowerer<'a> {
                     i += 1;
                     continue;
                 }
-                "ON" | "SIZE" | "ERROR" | "NOT" | "END-MULTIPLY" | "ELSE"
-                | "END-IF" | "END-PERFORM" | "END-EVALUATE" | "WHEN" => break,
+                "ON" | "SIZE" | "ERROR" | "NOT" | "END-MULTIPLY" | "ELSE" | "END-IF"
+                | "END-PERFORM" | "END-EVALUATE" | "WHEN" => break,
                 "(" | ")" | "," => {
                     i += 1;
                     continue;
@@ -3479,8 +3573,8 @@ impl<'a> HirLowerer<'a> {
                     i += 1;
                     continue;
                 }
-                "ON" | "SIZE" | "ERROR" | "NOT" | "END-DIVIDE" | "ELSE"
-                | "END-IF" | "END-PERFORM" | "END-EVALUATE" | "WHEN" => break,
+                "ON" | "SIZE" | "ERROR" | "NOT" | "END-DIVIDE" | "ELSE" | "END-IF"
+                | "END-PERFORM" | "END-EVALUATE" | "WHEN" => break,
                 "(" | ")" | "," => {
                     i += 1;
                     continue;
@@ -3570,27 +3664,22 @@ impl<'a> HirLowerer<'a> {
                 // Check if this is part of a SIZE ERROR phrase by looking ahead
                 let mut j = idx + 1;
                 // Skip ON after NOT
-                if u == "NOT" && j < after_eq.len()
-                    && after_eq[j].1.eq_ignore_ascii_case("ON")
-                {
+                if u == "NOT" && j < after_eq.len() && after_eq[j].1.eq_ignore_ascii_case("ON") {
                     j += 1;
                 }
                 // Now check for SIZE
-                if u == "ON" && j < after_eq.len()
-                    && after_eq[j].1.eq_ignore_ascii_case("SIZE")
-                {
+                if u == "ON" && j < after_eq.len() && after_eq[j].1.eq_ignore_ascii_case("SIZE") {
                     size_error_start = idx;
                     break;
                 }
-                if u == "NOT" && j < after_eq.len()
-                    && after_eq[j].1.eq_ignore_ascii_case("SIZE")
-                {
+                if u == "NOT" && j < after_eq.len() && after_eq[j].1.eq_ignore_ascii_case("SIZE") {
                     size_error_start = idx;
                     break;
                 }
             }
             // Also detect bare "SIZE ERROR" (without leading ON)
-            if u == "SIZE" && idx + 1 < after_eq.len()
+            if u == "SIZE"
+                && idx + 1 < after_eq.len()
                 && after_eq[idx + 1].1.eq_ignore_ascii_case("ERROR")
             {
                 size_error_start = idx;
@@ -3726,13 +3815,69 @@ impl<'a> HirLowerer<'a> {
         }
     }
 
-    /// atom = '(' additive ')' | literal | data-ref
+    /// atom = '(' additive ')' | FUNCTION name '(' args ')' | literal | data-ref
     fn parse_arith_atom(&mut self, tokens: &[(SyntaxKind, String)], pos: &mut usize) -> HirExpr {
         if *pos >= tokens.len() {
             return HirExpr::Literal(LiteralValue::Integer(0));
         }
 
         let (kind, text) = &tokens[*pos];
+
+        // FUNCTION intrinsic-function-name ( args )
+        if text.eq_ignore_ascii_case("FUNCTION") {
+            *pos += 1; // skip FUNCTION
+            if *pos >= tokens.len() {
+                return HirExpr::Literal(LiteralValue::Integer(0));
+            }
+            let func_name_str = tokens[*pos].1.to_ascii_uppercase();
+            let func_name = self.interner.intern(&func_name_str);
+            *pos += 1; // skip function name
+                       // Parse parenthesized argument list
+            let mut args = Vec::new();
+            if *pos < tokens.len() && tokens[*pos].1 == "(" {
+                *pos += 1; // skip '('
+                           // Collect tokens inside parens, split by comma for multiple args
+                let mut paren_depth = 1u32;
+                let mut arg_tokens = Vec::new();
+                while *pos < tokens.len() && paren_depth > 0 {
+                    if tokens[*pos].1 == "(" {
+                        paren_depth += 1;
+                        arg_tokens.push(tokens[*pos].clone());
+                        *pos += 1;
+                    } else if tokens[*pos].1 == ")" {
+                        paren_depth -= 1;
+                        if paren_depth == 0 {
+                            *pos += 1; // skip closing ')'
+                            break;
+                        }
+                        arg_tokens.push(tokens[*pos].clone());
+                        *pos += 1;
+                    } else if tokens[*pos].1 == "," && paren_depth == 1 {
+                        // Argument separator -- parse the accumulated tokens as one arg
+                        if !arg_tokens.is_empty() {
+                            let mut ap = 0;
+                            let arg = self.parse_arith_additive(&arg_tokens, &mut ap);
+                            args.push(arg);
+                            arg_tokens.clear();
+                        }
+                        *pos += 1; // skip ','
+                    } else {
+                        arg_tokens.push(tokens[*pos].clone());
+                        *pos += 1;
+                    }
+                }
+                // Parse the last argument
+                if !arg_tokens.is_empty() {
+                    let mut ap = 0;
+                    let arg = self.parse_arith_additive(&arg_tokens, &mut ap);
+                    args.push(arg);
+                }
+            }
+            return HirExpr::FunctionCall {
+                name: func_name,
+                args,
+            };
+        }
 
         // Parenthesized sub-expression
         if text == "(" {
@@ -4427,7 +4572,8 @@ impl<'a> HirLowerer<'a> {
                     }
                     break;
                 }
-                "END-CALL" | "ON" | "NOT" => break,
+                "END-CALL" => break,
+                "ON" | "NOT" => break, // handled below
                 _ => {
                     let expr = self.token_to_expr(tokens[i].0, &tokens[i].1);
                     using_args.push(CallArg { mode, value: expr });
@@ -4436,10 +4582,83 @@ impl<'a> HirLowerer<'a> {
             }
         }
 
+        // Parse ON EXCEPTION / NOT ON EXCEPTION blocks
+        let mut on_exception = Vec::new();
+        let mut not_on_exception = Vec::new();
+
+        while i < tokens.len() {
+            let upper = tokens[i].1.to_ascii_uppercase();
+            match upper.as_str() {
+                "END-CALL" => break,
+                "ON" => {
+                    i += 1; // skip ON
+                    if i < tokens.len() && tokens[i].1.eq_ignore_ascii_case("EXCEPTION") {
+                        i += 1; // skip EXCEPTION
+                                // Collect statements until NOT or END-CALL
+                        while i < tokens.len() {
+                            let u2 = tokens[i].1.to_ascii_uppercase();
+                            if u2 == "NOT" || u2 == "END-CALL" {
+                                break;
+                            }
+                            // Parse inline statement: DISPLAY is the most common
+                            if u2 == "DISPLAY" {
+                                i += 1;
+                                if i < tokens.len() {
+                                    let expr = self.token_to_expr(tokens[i].0, &tokens[i].1);
+                                    on_exception.push(HirStatement::Display {
+                                        args: vec![expr],
+                                        no_advancing: false,
+                                    });
+                                    i += 1;
+                                }
+                            } else {
+                                i += 1;
+                            }
+                        }
+                    }
+                }
+                "NOT" => {
+                    i += 1; // skip NOT
+                            // Skip ON if present
+                    if i < tokens.len() && tokens[i].1.eq_ignore_ascii_case("ON") {
+                        i += 1;
+                    }
+                    if i < tokens.len() && tokens[i].1.eq_ignore_ascii_case("EXCEPTION") {
+                        i += 1; // skip EXCEPTION
+                                // Collect statements until END-CALL
+                        while i < tokens.len() {
+                            let u2 = tokens[i].1.to_ascii_uppercase();
+                            if u2 == "END-CALL" {
+                                break;
+                            }
+                            if u2 == "DISPLAY" {
+                                i += 1;
+                                if i < tokens.len() {
+                                    let expr = self.token_to_expr(tokens[i].0, &tokens[i].1);
+                                    not_on_exception.push(HirStatement::Display {
+                                        args: vec![expr],
+                                        no_advancing: false,
+                                    });
+                                    i += 1;
+                                }
+                            } else {
+                                i += 1;
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    i += 1;
+                }
+            }
+        }
+
         Some(HirStatement::Call {
             program: program_expr,
             using: using_args,
-            returning: None, // TODO: wire through when codegen supports return values
+            returning: None,
+            on_exception,
+            not_on_exception,
         })
     }
 
@@ -4471,7 +4690,7 @@ impl<'a> HirLowerer<'a> {
             let upper = tokens[i].1.to_ascii_uppercase();
             if upper == "DEPENDING" {
                 i += 1; // skip DEPENDING
-                // Skip ON
+                        // Skip ON
                 if i < tokens.len() && tokens[i].1.eq_ignore_ascii_case("ON") {
                     i += 1;
                 }
@@ -4495,10 +4714,8 @@ impl<'a> HirLowerer<'a> {
             if targets.is_empty() {
                 return None;
             }
-            let interned_targets: Vec<cobol_intern::Name> = targets
-                .iter()
-                .map(|t| self.interner.intern(t))
-                .collect();
+            let interned_targets: Vec<cobol_intern::Name> =
+                targets.iter().map(|t| self.interner.intern(t)).collect();
             let index_ref = HirDataRef {
                 name: self.interner.intern(&index_name),
                 qualifiers: Vec::new(),
@@ -4629,12 +4846,12 @@ impl<'a> HirLowerer<'a> {
             } else if let Some(child) = el.as_node() {
                 if child.kind() == SyntaxKind::CONDITION_EXPR {
                     // Extract condition tokens from the CONDITION_EXPR node
-                    let cond_tokens = self.collect_all_tokens(&child);
+                    let cond_tokens = self.collect_all_tokens(child);
                     condition = self.parse_condition_tokens(&cond_tokens);
                 } else {
                     // Statement node
                     let mut stmts = Vec::new();
-                    self.lower_child_statement(&child, &mut stmts);
+                    self.lower_child_statement(child, &mut stmts);
                     if in_else {
                         else_stmts.extend(stmts);
                     } else {
@@ -4668,7 +4885,7 @@ impl<'a> HirLowerer<'a> {
 
         // Skip "EVALUATE" keyword
         let mut idx = 0;
-        if idx < tokens.len() && tokens[idx].1.to_ascii_uppercase() == "EVALUATE" {
+        if idx < tokens.len() && tokens[idx].1.eq_ignore_ascii_case("EVALUATE") {
             idx += 1;
         }
 
@@ -4703,10 +4920,8 @@ impl<'a> HirLowerer<'a> {
                 if i == 0 {
                     is_evaluate_true = true;
                 }
-            } else if group.len() == 1 && group[0].1.eq_ignore_ascii_case("FALSE") {
-                if i == 0 {
-                    is_evaluate_false = true;
-                }
+            } else if group.len() == 1 && group[0].1.eq_ignore_ascii_case("FALSE") && i == 0 {
+                is_evaluate_false = true;
             }
             subjects.push(self.token_to_expr(group[0].0, &group[0].1));
         }
@@ -4808,7 +5023,7 @@ impl<'a> HirLowerer<'a> {
                 }
                 if in_when {
                     let mut child_stmts = Vec::new();
-                    self.lower_child_statement(&child, &mut child_stmts);
+                    self.lower_child_statement(child, &mut child_stmts);
                     current_stmts.extend(child_stmts);
                 }
             }
@@ -4932,7 +5147,7 @@ impl<'a> HirLowerer<'a> {
 
         let mut idx = 0;
         // Skip "SEARCH" keyword
-        if idx < tokens.len() && tokens[idx].1.to_ascii_uppercase() == "SEARCH" {
+        if idx < tokens.len() && tokens[idx].1.eq_ignore_ascii_case("SEARCH") {
             idx += 1;
         }
 
@@ -5024,11 +5239,11 @@ impl<'a> HirLowerer<'a> {
                 }
                 if in_at_end {
                     let mut child_stmts = Vec::new();
-                    self.lower_child_statement(&child, &mut child_stmts);
+                    self.lower_child_statement(child, &mut child_stmts);
                     at_end_stmts.extend(child_stmts);
                 } else if in_when {
                     let mut child_stmts = Vec::new();
-                    self.lower_child_statement(&child, &mut child_stmts);
+                    self.lower_child_statement(child, &mut child_stmts);
                     current_when_stmts.extend(child_stmts);
                 }
             }
@@ -5061,7 +5276,7 @@ impl<'a> HirLowerer<'a> {
         }
 
         let mut idx = 0;
-        if idx < tokens.len() && tokens[idx].1.to_ascii_uppercase() == "SET" {
+        if idx < tokens.len() && tokens[idx].1.eq_ignore_ascii_case("SET") {
             idx += 1;
         }
 
@@ -5312,9 +5527,9 @@ impl<'a> HirLowerer<'a> {
                 let inner = &tokens[2..tokens.len() - 1];
                 if let Some(inner_expr) = self.parse_condition_tokens(inner) {
                     let inner_cond = self.expr_to_condition(inner_expr);
-                    return Some(HirExpr::Condition(Box::new(HirCondition::Not(
-                        Box::new(inner_cond),
-                    ))));
+                    return Some(HirExpr::Condition(Box::new(HirCondition::Not(Box::new(
+                        inner_cond,
+                    )))));
                 }
             }
         }
@@ -5461,9 +5676,17 @@ impl<'a> HirLowerer<'a> {
             let mut is_idx = None;
             let mut pd = 0i32;
             for (i, (_, t)) in tokens.iter().enumerate() {
-                if t == "(" { pd += 1; continue; }
-                if t == ")" { pd -= 1; continue; }
-                if pd > 0 { continue; }
+                if t == "(" {
+                    pd += 1;
+                    continue;
+                }
+                if t == ")" {
+                    pd -= 1;
+                    continue;
+                }
+                if pd > 0 {
+                    continue;
+                }
                 if t.eq_ignore_ascii_case("IS") {
                     is_idx = Some(i);
                     break;
@@ -5492,14 +5715,55 @@ impl<'a> HirLowerer<'a> {
                                 if pos + 1 >= tokens.len() {
                                     // Build operand from tokens before IS
                                     let (operand, _) = self.parse_expr_at(tokens, 0);
-                                    let cond = HirCondition::SignCheck {
-                                        operand,
-                                        sign: st,
-                                    };
+                                    let cond = HirCondition::SignCheck { operand, sign: st };
                                     return if negated {
-                                        Some(HirExpr::Condition(Box::new(
-                                            HirCondition::Not(Box::new(cond)),
-                                        )))
+                                        Some(HirExpr::Condition(Box::new(HirCondition::Not(
+                                            Box::new(cond),
+                                        ))))
+                                    } else {
+                                        Some(HirExpr::Condition(Box::new(cond)))
+                                    };
+                                }
+                            }
+                            // Class condition: IS [NOT] NUMERIC/ALPHABETIC/ALPHABETIC-LOWER/ALPHABETIC-UPPER
+                            let class_type = match kw.as_str() {
+                                "NUMERIC" => Some(ClassType::Numeric),
+                                "ALPHABETIC" => {
+                                    // Check for ALPHABETIC-LOWER or ALPHABETIC-UPPER
+                                    if pos + 1 < tokens.len() {
+                                        let next = tokens[pos + 1].1.to_ascii_uppercase();
+                                        match next.as_str() {
+                                            // Handle hyphenated form split into separate tokens
+                                            _ => Some(ClassType::Alphabetic),
+                                        }
+                                    } else {
+                                        Some(ClassType::Alphabetic)
+                                    }
+                                }
+                                "ALPHABETIC-LOWER" => Some(ClassType::AlphabeticLower),
+                                "ALPHABETIC-UPPER" => Some(ClassType::AlphabeticUpper),
+                                _ => None,
+                            };
+                            if let Some(ct) = class_type {
+                                // For plain ALPHABETIC, ensure no extra tokens
+                                // For ALPHABETIC-LOWER/UPPER, pos+1 is the end
+                                let end_pos = if kw == "ALPHABETIC" && pos + 1 < tokens.len() {
+                                    let next = tokens[pos + 1].1.to_ascii_uppercase();
+                                    if next == "ALPHABETIC-LOWER" || next == "ALPHABETIC-UPPER" {
+                                        pos + 2
+                                    } else {
+                                        pos + 1
+                                    }
+                                } else {
+                                    pos + 1
+                                };
+                                if end_pos >= tokens.len() {
+                                    let (operand, _) = self.parse_expr_at(tokens, 0);
+                                    let cond = HirCondition::ClassCheck { operand, class: ct };
+                                    return if negated {
+                                        Some(HirExpr::Condition(Box::new(HirCondition::Not(
+                                            Box::new(cond),
+                                        ))))
                                     } else {
                                         Some(HirExpr::Condition(Box::new(cond)))
                                     };
@@ -5573,10 +5837,7 @@ impl<'a> HirLowerer<'a> {
             }
             found
         };
-        let op_idx = match actual_op_idx {
-            Some(i) => i,
-            None => return None,
-        };
+        let op_idx = actual_op_idx?;
 
         // Parse operator (may span multiple tokens like "NOT EQUAL")
         let (op, right_start) = {
@@ -5734,7 +5995,10 @@ impl<'a> HirLowerer<'a> {
             // negative BY value consumed the minus sign), extract the UNTIL
             // condition directly from the flat token stream.
             if condition_exprs.is_empty() {
-                if let Some(until_pos) = tokens.iter().position(|(_, t)| t.eq_ignore_ascii_case("UNTIL")) {
+                if let Some(until_pos) = tokens
+                    .iter()
+                    .position(|(_, t)| t.eq_ignore_ascii_case("UNTIL"))
+                {
                     // Collect condition tokens after UNTIL, stopping at known
                     // statement keywords, AFTER, or END-PERFORM.
                     let mut cond_end = until_pos + 1;
@@ -5742,14 +6006,45 @@ impl<'a> HirLowerer<'a> {
                         let u = tokens[cond_end].1.to_ascii_uppercase();
                         if matches!(
                             u.as_str(),
-                            "END-PERFORM" | "AFTER" | "ADD" | "SUBTRACT" | "MOVE"
-                            | "DISPLAY" | "COMPUTE" | "MULTIPLY" | "DIVIDE" | "PERFORM"
-                            | "IF" | "EVALUATE" | "CALL" | "GO" | "SET" | "STRING"
-                            | "UNSTRING" | "INSPECT" | "ACCEPT" | "STOP" | "READ"
-                            | "WRITE" | "REWRITE" | "DELETE" | "OPEN" | "CLOSE"
-                            | "START" | "RETURN" | "SEARCH" | "SORT" | "MERGE"
-                            | "RELEASE" | "INITIALIZE" | "EXIT" | "CONTINUE"
-                            | "GOBACK" | "ALTER" | "CANCEL" | "ENTER"
+                            "END-PERFORM"
+                                | "AFTER"
+                                | "ADD"
+                                | "SUBTRACT"
+                                | "MOVE"
+                                | "DISPLAY"
+                                | "COMPUTE"
+                                | "MULTIPLY"
+                                | "DIVIDE"
+                                | "PERFORM"
+                                | "IF"
+                                | "EVALUATE"
+                                | "CALL"
+                                | "GO"
+                                | "SET"
+                                | "STRING"
+                                | "UNSTRING"
+                                | "INSPECT"
+                                | "ACCEPT"
+                                | "STOP"
+                                | "READ"
+                                | "WRITE"
+                                | "REWRITE"
+                                | "DELETE"
+                                | "OPEN"
+                                | "CLOSE"
+                                | "START"
+                                | "RETURN"
+                                | "SEARCH"
+                                | "SORT"
+                                | "MERGE"
+                                | "RELEASE"
+                                | "INITIALIZE"
+                                | "EXIT"
+                                | "CONTINUE"
+                                | "GOBACK"
+                                | "ALTER"
+                                | "CANCEL"
+                                | "ENTER"
                         ) {
                             break;
                         }

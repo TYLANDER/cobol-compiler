@@ -114,6 +114,8 @@ run_test "SMOKE-SEARCH"
 run_test "SMOKE-FIGCONST"
 run_test "SMOKE-DIVIDE"
 run_test "SMOKE-SET"
+run_test "SMOKE-GOBACK" "$SCRIPT_DIR/SMOKE-GOBACK-SUB.cob"
+run_test "SMOKE-INTRINSIC"
 
 echo ""
 echo "=== Results ==="

@@ -369,7 +369,10 @@ pub unsafe extern "C" fn cobolrt_unstring(
 
     let delim = if !delimiter.is_null() && delimiter_len > 0 {
         // SAFETY: Caller guarantees `delimiter` points to `delimiter_len` readable bytes.
-        Some(std::slice::from_raw_parts(delimiter, delimiter_len as usize))
+        Some(std::slice::from_raw_parts(
+            delimiter,
+            delimiter_len as usize,
+        ))
     } else {
         None
     };
@@ -601,7 +604,10 @@ pub unsafe extern "C" fn cobolrt_unstring_field(
     // Find delimiter
     let delim = if !delimiter.is_null() && delimiter_len > 0 {
         // SAFETY: Caller guarantees `delimiter` points to `delimiter_len` readable bytes.
-        Some(std::slice::from_raw_parts(delimiter, delimiter_len as usize))
+        Some(std::slice::from_raw_parts(
+            delimiter,
+            delimiter_len as usize,
+        ))
     } else {
         None
     };
@@ -695,7 +701,11 @@ pub unsafe extern "C" fn cobolrt_unstring_field_or(
     let start_pos = if !pointer.is_null() && pointer_len > 0 {
         let ptr_slice = std::slice::from_raw_parts(pointer, pointer_len as usize);
         let val = read_display_numeric(ptr_slice);
-        if val < 1 { 0usize } else { (val - 1) as usize }
+        if val < 1 {
+            0usize
+        } else {
+            (val - 1) as usize
+        }
     } else {
         0
     };
@@ -715,7 +725,7 @@ pub unsafe extern "C" fn cobolrt_unstring_field_or(
         all: bool,
     }
     let mut delims: Vec<DelimInfo> = Vec::new();
-    let slots: [(* const u8, u32, u32); 3] = [
+    let slots: [(*const u8, u32, u32); 3] = [
         (delim1, delim1_len, delim1_all),
         (delim2, delim2_len, delim2_all),
         (delim3, delim3_len, delim3_all),
@@ -813,12 +823,17 @@ mod tests {
         // SAFETY: All pointers are valid for their respective lengths.
         unsafe {
             cobolrt_inspect_tallying(
-                data.as_ptr(), 11,
-                tally.as_mut_ptr(), 2,
+                data.as_ptr(),
+                11,
+                tally.as_mut_ptr(),
+                2,
                 1, // ALL
-                search.as_ptr(), 1,
-                std::ptr::null(), 0,
-                std::ptr::null(), 0,
+                search.as_ptr(),
+                1,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
             );
         }
         assert_eq!(&tally, b"03");
@@ -832,12 +847,17 @@ mod tests {
         // SAFETY: All pointers are valid for their respective lengths.
         unsafe {
             cobolrt_inspect_tallying(
-                data.as_ptr(), 6,
-                tally.as_mut_ptr(), 2,
+                data.as_ptr(),
+                6,
+                tally.as_mut_ptr(),
+                2,
                 2, // LEADING
-                search.as_ptr(), 1,
-                std::ptr::null(), 0,
-                std::ptr::null(), 0,
+                search.as_ptr(),
+                1,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
             );
         }
         assert_eq!(&tally, b"03");
@@ -850,12 +870,17 @@ mod tests {
         // SAFETY: All pointers are valid for their respective lengths.
         unsafe {
             cobolrt_inspect_tallying(
-                data.as_ptr(), 5,
-                tally.as_mut_ptr(), 2,
+                data.as_ptr(),
+                5,
+                tally.as_mut_ptr(),
+                2,
                 0, // CHARACTERS
-                std::ptr::null(), 0,
-                std::ptr::null(), 0,
-                std::ptr::null(), 0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
             );
         }
         assert_eq!(&tally, b"05");
@@ -869,12 +894,17 @@ mod tests {
         // SAFETY: All pointers are valid for their respective lengths.
         unsafe {
             cobolrt_inspect_replacing(
-                data.as_mut_ptr(), 11,
+                data.as_mut_ptr(),
+                11,
                 1, // ALL
-                search.as_ptr(), 1,
-                replacement.as_ptr(), 1,
-                std::ptr::null(), 0,
-                std::ptr::null(), 0,
+                search.as_ptr(),
+                1,
+                replacement.as_ptr(),
+                1,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
             );
         }
         assert_eq!(&data, b"HEXXO WORXD");
@@ -888,12 +918,17 @@ mod tests {
         // SAFETY: All pointers are valid for their respective lengths.
         unsafe {
             cobolrt_inspect_replacing(
-                data.as_mut_ptr(), 11,
+                data.as_mut_ptr(),
+                11,
                 3, // FIRST
-                search.as_ptr(), 1,
-                replacement.as_ptr(), 1,
-                std::ptr::null(), 0,
-                std::ptr::null(), 0,
+                search.as_ptr(),
+                1,
+                replacement.as_ptr(),
+                1,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
             );
         }
         assert_eq!(&data, b"HEXLO WORLD");
@@ -907,11 +942,16 @@ mod tests {
         // SAFETY: All pointers are valid for their respective lengths.
         unsafe {
             cobolrt_inspect_converting(
-                data.as_mut_ptr(), 5,
-                from.as_ptr(), 4,
-                to.as_ptr(), 4,
-                std::ptr::null(), 0,
-                std::ptr::null(), 0,
+                data.as_mut_ptr(),
+                5,
+                from.as_ptr(),
+                4,
+                to.as_ptr(),
+                4,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                0,
             );
         }
         assert_eq!(&data, b"hello");
@@ -935,12 +975,18 @@ mod tests {
         // SAFETY: All pointers are valid for their respective lengths.
         let result = unsafe {
             cobolrt_unstring(
-                source.as_ptr(), 13,
-                delimiter.as_ptr(), 1,
+                source.as_ptr(),
+                13,
+                delimiter.as_ptr(),
+                1,
                 0, // not ALL
-                targets.as_ptr(), target_lens.as_ptr(), 3,
-                std::ptr::null_mut(), 0,
-                std::ptr::null_mut(), 0,
+                targets.as_ptr(),
+                target_lens.as_ptr(),
+                3,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                0,
             )
         };
 
@@ -959,12 +1005,17 @@ mod tests {
         // SAFETY: All pointers are valid for their respective lengths.
         unsafe {
             cobolrt_inspect_tallying(
-                data.as_ptr(), 11,
-                tally.as_mut_ptr(), 2,
+                data.as_ptr(),
+                11,
+                tally.as_mut_ptr(),
+                2,
                 1, // ALL
-                search.as_ptr(), 1,
-                before.as_ptr(), 1, // BEFORE INITIAL " "
-                std::ptr::null(), 0,
+                search.as_ptr(),
+                1,
+                before.as_ptr(),
+                1, // BEFORE INITIAL " "
+                std::ptr::null(),
+                0,
             );
         }
         assert_eq!(&tally, b"02"); // only "L" in "HELLO" (before " ")

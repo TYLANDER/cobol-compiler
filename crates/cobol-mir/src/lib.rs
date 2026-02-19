@@ -734,7 +734,7 @@ impl<'a> MirLowerer<'a> {
             .collect();
 
         // Count name occurrences (excluding 88-level)
-        for (_i, &item_id) in self.hir.working_storage.iter().enumerate() {
+        for &item_id in self.hir.working_storage.iter() {
             let item = &self.hir.data_items[item_id.into_raw()];
             if item.level == 88 {
                 continue;
@@ -784,14 +784,14 @@ impl<'a> MirLowerer<'a> {
             }
 
             // Determine if this name needs qualification (appears more than once)
-            let is_duplicate = name_counts.get(&name).map_or(false, |&c| c > 1);
+            let is_duplicate = name_counts.get(&name).is_some_and(|&c| c > 1);
             let parent_name_str = &parent_for_item[idx];
 
             // Build group_children map
             if !parent_name_str.is_empty() {
                 self.group_children
                     .entry(parent_name_str.clone())
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(name.clone());
             }
 
@@ -799,7 +799,7 @@ impl<'a> MirLowerer<'a> {
                 let qualified = format!("{}.{}", name, parent_name_str);
                 self.qualified_names
                     .entry(name.clone())
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push((qualified.clone(), parent_name_str.clone()));
                 qualified
             } else {
@@ -900,7 +900,7 @@ impl<'a> MirLowerer<'a> {
                         .name
                         .map(|n| self.interner.resolve(n).to_string())
                         .unwrap_or_default();
-                    let has_occurs = it.occurs.as_ref().map_or(false, |o| o.max > 1);
+                    let has_occurs = it.occurs.as_ref().is_some_and(|o| o.max > 1);
                     (it.level, n, has_occurs)
                 })
                 .collect();
@@ -1267,7 +1267,10 @@ impl<'a> MirLowerer<'a> {
         // Build a mapping from paragraph index to its section exit block.
         // For each section, the exit block is the block of the first paragraph
         // AFTER the section, or the epilogue block if the section is last.
-        let para_names: Vec<String> = self.hir.paragraphs.iter()
+        let para_names: Vec<String> = self
+            .hir
+            .paragraphs
+            .iter()
             .map(|p| self.interner.resolve(p.name).to_string())
             .collect();
         let mut para_section_exit: Vec<Option<BlockId>> = vec![None; self.hir.paragraphs.len()];
@@ -1279,7 +1282,9 @@ impl<'a> MirLowerer<'a> {
             // the last paragraph in this section, or the epilogue.
             let last_para_idx = *section.paragraphs.last().unwrap();
             let section_exit = if last_para_idx + 1 < para_names.len() {
-                self.paragraph_block_map.get(&para_names[last_para_idx + 1]).copied()
+                self.paragraph_block_map
+                    .get(&para_names[last_para_idx + 1])
+                    .copied()
                     .or(epilogue_block)
             } else {
                 epilogue_block
@@ -1312,7 +1317,9 @@ impl<'a> MirLowerer<'a> {
             // block, or the epilogue if this is the last paragraph.
             if needs_paragraph_blocks {
                 let next_exit = if para_idx + 1 < para_names.len() {
-                    self.paragraph_block_map.get(&para_names[para_idx + 1]).copied()
+                    self.paragraph_block_map
+                        .get(&para_names[para_idx + 1])
+                        .copied()
                         .or(epilogue_block)
                 } else {
                     epilogue_block
@@ -1419,15 +1426,15 @@ impl<'a> MirLowerer<'a> {
                 then_branch
                     .iter()
                     .any(|s| self.stmt_needs_paragraph_blocks(s))
-                    || else_branch.as_ref().map_or(false, |eb| {
-                        eb.iter().any(|s| self.stmt_needs_paragraph_blocks(s))
-                    })
+                    || else_branch
+                        .as_ref()
+                        .is_some_and(|eb| eb.iter().any(|s| self.stmt_needs_paragraph_blocks(s)))
             }
-            cobol_hir::HirStatement::Evaluate { whens, .. } => {
-                whens.iter().any(|w| {
-                    w.statements.iter().any(|s| self.stmt_needs_paragraph_blocks(s))
-                })
-            }
+            cobol_hir::HirStatement::Evaluate { whens, .. } => whens.iter().any(|w| {
+                w.statements
+                    .iter()
+                    .any(|s| self.stmt_needs_paragraph_blocks(s))
+            }),
             _ => false,
         }
     }
@@ -1462,7 +1469,8 @@ impl<'a> MirLowerer<'a> {
                 // GOBACK returns from the current program.
                 // In a subprogram, this is a function return.
                 // In a main program, it's equivalent to STOP RUN.
-                if self.hir.linkage_items.is_empty() {
+                let is_subprogram = !self.is_main_program || !self.hir.using_params.is_empty();
+                if !is_subprogram {
                     // Main program: GOBACK = STOP RUN
                     let zero = func.new_value();
                     instructions.push(MirInst::Const {
@@ -1625,8 +1633,27 @@ impl<'a> MirLowerer<'a> {
                     );
                 }
             }
-            cobol_hir::HirStatement::Call { program, using, .. } => {
+            cobol_hir::HirStatement::Call {
+                program,
+                using,
+                on_exception,
+                not_on_exception,
+                ..
+            } => {
                 self.lower_call(program, using, func, instructions);
+                // After the call, NOT ON EXCEPTION handlers execute (call succeeded).
+                // ON EXCEPTION handlers would execute only on call failure.
+                // Since our AOT compiler links all subprograms at compile time,
+                // a successful link means the call will succeed, so we emit
+                // NOT ON EXCEPTION statements unconditionally and skip ON EXCEPTION.
+                if !not_on_exception.is_empty() {
+                    for stmt in not_on_exception {
+                        self.lower_statement_to_blocks(stmt, func, current_block_id, instructions);
+                    }
+                }
+                // ON EXCEPTION: in our AOT model, a linked call cannot fail at
+                // runtime, so these are dead code. We skip them intentionally.
+                let _ = on_exception;
             }
             cobol_hir::HirStatement::ExitProgram => {
                 // Finalize current block with Return (returns to caller)
@@ -1957,6 +1984,28 @@ impl<'a> MirLowerer<'a> {
                         });
                     }
                 }
+                cobol_hir::HirExpr::FunctionCall { name, args: fargs } => {
+                    // Evaluate the function call, then display the result
+                    if let Some((result_addr, result_size)) =
+                        self.emit_function_call(name, fargs, func, instructions)
+                    {
+                        let len_val = func.new_value();
+                        instructions.push(MirInst::Const {
+                            dest: len_val,
+                            value: MirConst::Int(result_size as i64),
+                        });
+                        let display_fn = if no_advancing {
+                            "cobolrt_display"
+                        } else {
+                            "cobolrt_display_line"
+                        };
+                        instructions.push(MirInst::CallRuntime {
+                            dest: None,
+                            func: display_fn.to_string(),
+                            args: vec![result_addr, len_val],
+                        });
+                    }
+                }
                 _ => {}
             }
         }
@@ -2180,18 +2229,18 @@ impl<'a> MirLowerer<'a> {
                     let src_size = self
                         .global_map
                         .get(src_global)
-                        .and_then(|&idx| match &self.module.globals[idx].ty {
-                            MirType::Bytes(n) => Some(*n),
-                            _ => Some(1),
+                        .map(|&idx| match &self.module.globals[idx].ty {
+                            MirType::Bytes(n) => *n,
+                            _ => 1,
                         })
                         .unwrap_or(1);
 
                     let dst_size = self
                         .global_map
                         .get(dst_global)
-                        .and_then(|&idx| match &self.module.globals[idx].ty {
-                            MirType::Bytes(n) => Some(*n),
-                            _ => Some(1),
+                        .map(|&idx| match &self.module.globals[idx].ty {
+                            MirType::Bytes(n) => *n,
+                            _ => 1,
                         })
                         .unwrap_or(1);
 
@@ -2263,18 +2312,18 @@ impl<'a> MirLowerer<'a> {
                     let src_size = self
                         .global_map
                         .get(src_global)
-                        .and_then(|&idx| match &self.module.globals[idx].ty {
-                            MirType::Bytes(n) => Some(*n),
-                            _ => Some(1),
+                        .map(|&idx| match &self.module.globals[idx].ty {
+                            MirType::Bytes(n) => *n,
+                            _ => 1,
                         })
                         .unwrap_or(1);
 
                     let dst_size = self
                         .global_map
                         .get(dst_global)
-                        .and_then(|&idx| match &self.module.globals[idx].ty {
-                            MirType::Bytes(n) => Some(*n),
-                            _ => Some(1),
+                        .map(|&idx| match &self.module.globals[idx].ty {
+                            MirType::Bytes(n) => *n,
+                            _ => 1,
                         })
                         .unwrap_or(1);
 
@@ -2327,7 +2376,9 @@ impl<'a> MirLowerer<'a> {
                     instructions.push(MirInst::CallRuntime {
                         dest: None,
                         func: "cobolrt_add_numeric".to_string(),
-                        args: vec![src_addr, src_len, dst_addr1, dst_len1, dst_addr2, dst_len2, sf],
+                        args: vec![
+                            src_addr, src_len, dst_addr1, dst_len1, dst_addr2, dst_len2, sf,
+                        ],
                     });
                     break;
                 }
@@ -2378,18 +2429,18 @@ impl<'a> MirLowerer<'a> {
                     let src_size = self
                         .global_map
                         .get(src_global)
-                        .and_then(|&idx| match &self.module.globals[idx].ty {
-                            MirType::Bytes(n) => Some(*n),
-                            _ => Some(1),
+                        .map(|&idx| match &self.module.globals[idx].ty {
+                            MirType::Bytes(n) => *n,
+                            _ => 1,
                         })
                         .unwrap_or(1);
 
                     let dst_size = self
                         .global_map
                         .get(dst_global)
-                        .and_then(|&idx| match &self.module.globals[idx].ty {
-                            MirType::Bytes(n) => Some(*n),
-                            _ => Some(1),
+                        .map(|&idx| match &self.module.globals[idx].ty {
+                            MirType::Bytes(n) => *n,
+                            _ => 1,
                         })
                         .unwrap_or(1);
 
@@ -2445,7 +2496,9 @@ impl<'a> MirLowerer<'a> {
                     instructions.push(MirInst::CallRuntime {
                         dest: None,
                         func: "cobolrt_subtract_numeric".to_string(),
-                        args: vec![dst_addr1, dst_len1, src_addr, src_len, dst_addr2, dst_len2, sf],
+                        args: vec![
+                            dst_addr1, dst_len1, src_addr, src_len, dst_addr2, dst_len2, sf,
+                        ],
                     });
 
                     // Read and accumulate the size error flag from this
@@ -2528,8 +2581,7 @@ impl<'a> MirLowerer<'a> {
                         if target_scale > 0 {
                             // Scale the integer: e.g. MOVE 42 TO PIC 9(5)V99
                             // means 42.00, so internal representation is 4200
-                            let scaled =
-                                (*n as i64).unsigned_abs() * 10u64.pow(target_scale as u32);
+                            let scaled = (*n).unsigned_abs() * 10u64.pow(target_scale as u32);
                             if target_dot_pos >= 0 {
                                 // Edited numeric with literal '.'
                                 let mut bytes = Self::build_edited_zero_template(
@@ -2964,6 +3016,28 @@ impl<'a> MirLowerer<'a> {
                         args: vec![src_val, src_len, target_addr, dest_len],
                     });
                 }
+                cobol_hir::HirExpr::FunctionCall { name, args: fargs } => {
+                    // Evaluate the function call, then move the result to target
+                    if let Some((result_addr, result_size)) =
+                        self.emit_function_call(name, fargs, func, instructions)
+                    {
+                        let src_len = func.new_value();
+                        instructions.push(MirInst::Const {
+                            dest: src_len,
+                            value: MirConst::Int(result_size as i64),
+                        });
+                        let dest_len = func.new_value();
+                        instructions.push(MirInst::Const {
+                            dest: dest_len,
+                            value: MirConst::Int(target_size as i64),
+                        });
+                        instructions.push(MirInst::CallRuntime {
+                            dest: None,
+                            func: move_alpha_func.to_string(),
+                            args: vec![result_addr, src_len, target_addr, dest_len],
+                        });
+                    }
+                }
                 _ => {
                     // Other expression types not yet supported in MOVE
                 }
@@ -2972,10 +3046,8 @@ impl<'a> MirLowerer<'a> {
             // Post-MOVE fixup: BLANK WHEN ZERO
             if self.is_blank_when_zero(&target_name_str) {
                 let bwz_addr = func.new_value();
-                let bwz_target_expr =
-                    cobol_hir::HirExpr::DataRef(Box::new(target_ref.clone()));
-                if let Some((addr, _sz)) =
-                    self.emit_expr_addr(&bwz_target_expr, func, instructions)
+                let bwz_target_expr = cobol_hir::HirExpr::DataRef(Box::new(target_ref.clone()));
+                if let Some((addr, _sz)) = self.emit_expr_addr(&bwz_target_expr, func, instructions)
                 {
                     let _ = bwz_addr; // use addr from emit_expr_addr
                     self.emit_blank_when_zero(addr, target_size, func, instructions);
@@ -3298,9 +3370,7 @@ impl<'a> MirLowerer<'a> {
             return Some((name, info.byte_size, info.scale, info.dot_pos));
         }
         let global_name = self.resolve_global_name(data_ref)?;
-        if self.global_map.get(&global_name).is_none() {
-            return None;
-        }
+        self.global_map.get(&global_name)?;
         // Find the HIR data item to get scale and PIC info
         for &item_id in &self.hir.working_storage {
             let item = &self.hir.data_items[item_id.into_raw()];
@@ -3999,14 +4069,21 @@ impl<'a> MirLowerer<'a> {
                 s.to_ascii_uppercase().replace('-', "_")
             }
             cobol_hir::HirExpr::DataRef(dr) => {
-                // Dynamic CALL via identifier — resolve from initial VALUE
+                // Dynamic CALL via identifier — resolve from initial VALUE.
+                // True runtime dispatch is not yet supported; we resolve at
+                // compile time from the data item's initial VALUE clause.
                 let name = self.interner.resolve(dr.name).to_string();
                 let initial = self.hir.working_storage.iter().find_map(|&item_id| {
                     let item = &self.hir.data_items[item_id.into_raw()];
                     let item_name = item.name.map(|n| self.interner.resolve(n).to_string());
                     if item_name.as_deref() == Some(&name) {
                         if let Some(cobol_hir::InitialValue::String_(ref s)) = item.value {
-                            Some(s.trim().to_ascii_uppercase().replace('-', "_"))
+                            let trimmed = s.trim().to_ascii_uppercase().replace('-', "_");
+                            if !trimmed.is_empty() {
+                                Some(trimmed)
+                            } else {
+                                None
+                            }
                         } else {
                             None
                         }
@@ -4015,13 +4092,14 @@ impl<'a> MirLowerer<'a> {
                     }
                 });
                 match initial {
-                    Some(pname) if !pname.is_empty() => pname,
-                    _ => {
+                    Some(pname) => pname,
+                    None => {
                         eprintln!(
-                            "warning: CALL via identifier '{}' cannot be resolved at compile time",
+                            "error: CALL via identifier '{}' cannot be resolved at compile time \
+                             (no VALUE clause found). Runtime dynamic CALL is not yet supported.",
                             name
                         );
-                        name.to_ascii_uppercase().replace('-', "_")
+                        return;
                     }
                 }
             }
@@ -4031,21 +4109,18 @@ impl<'a> MirLowerer<'a> {
         // Collect argument addresses (BY REFERENCE → pointer to data item)
         let mut arg_values = Vec::new();
         for call_arg in using {
-            match &call_arg.value {
-                cobol_hir::HirExpr::DataRef(dr) => {
-                    let name = self.interner.resolve(dr.name).to_string();
-                    if let Some(info) = self.linkage_map.get(&name) {
-                        arg_values.push(info.param_value);
-                    } else if let Some((gname, _size)) = self.resolve_data_ref(dr) {
-                        let addr = func.new_value();
-                        instructions.push(MirInst::GlobalAddr {
-                            dest: addr,
-                            name: gname,
-                        });
-                        arg_values.push(addr);
-                    }
+            if let cobol_hir::HirExpr::DataRef(dr) = &call_arg.value {
+                let name = self.interner.resolve(dr.name).to_string();
+                if let Some(info) = self.linkage_map.get(&name) {
+                    arg_values.push(info.param_value);
+                } else if let Some((gname, _size)) = self.resolve_data_ref(dr) {
+                    let addr = func.new_value();
+                    instructions.push(MirInst::GlobalAddr {
+                        dest: addr,
+                        name: gname,
+                    });
+                    arg_values.push(addr);
                 }
-                _ => {}
             }
         }
 
@@ -4135,7 +4210,15 @@ impl<'a> MirLowerer<'a> {
             instructions.push(MirInst::CallRuntime {
                 dest: None,
                 func: "cobolrt_add_numeric".to_string(),
-                args: vec![a_addr, a_len, b_addr, b_len, target_addr, target_len, signed_flag],
+                args: vec![
+                    a_addr,
+                    a_len,
+                    b_addr,
+                    b_len,
+                    target_addr,
+                    target_len,
+                    signed_flag,
+                ],
             });
 
             // If more than 2 operands, accumulate: target = target + operands[i]
@@ -4433,11 +4516,11 @@ impl<'a> MirLowerer<'a> {
             // Store the result to ALL GIVING targets, not just the first one
             for target_ref in giving_refs {
                 let te = cobol_hir::HirExpr::DataRef(Box::new(target_ref.clone()));
-                let (target_addr, target_size) =
-                    match self.emit_expr_addr(&te, func, instructions) {
-                        Some(v) => v,
-                        None => continue,
-                    };
+                let (target_addr, target_size) = match self.emit_expr_addr(&te, func, instructions)
+                {
+                    Some(v) => v,
+                    None => continue,
+                };
                 let target_len = func.new_value();
                 instructions.push(MirInst::Const {
                     dest: target_len,
@@ -4499,11 +4582,7 @@ impl<'a> MirLowerer<'a> {
 
     /// Emit a call to cobolrt_clear_size_error() to reset the overflow flag
     /// before an arithmetic operation.
-    fn emit_clear_size_error(
-        &self,
-        _func: &mut MirFunction,
-        instructions: &mut Vec<MirInst>,
-    ) {
+    fn emit_clear_size_error(&self, _func: &mut MirFunction, instructions: &mut Vec<MirInst>) {
         instructions.push(MirInst::CallRuntime {
             dest: None,
             func: "cobolrt_clear_size_error".to_string(),
@@ -4759,16 +4838,14 @@ impl<'a> MirLowerer<'a> {
         } else if is_into {
             // DIVIDE A INTO B (no GIVING) → target = B (same as dividend)
             match by_operand {
-                cobol_hir::HirExpr::DataRef(dr) => {
-                    match self.resolve_data_ref_full(dr) {
-                        Some((name, size, scale, dot_pos)) => {
-                            let addr = func.new_value();
-                            instructions.push(MirInst::GlobalAddr { dest: addr, name });
-                            targets.push((addr, size, scale, dot_pos));
-                        }
-                        None => return,
+                cobol_hir::HirExpr::DataRef(dr) => match self.resolve_data_ref_full(dr) {
+                    Some((name, size, scale, dot_pos)) => {
+                        let addr = func.new_value();
+                        instructions.push(MirInst::GlobalAddr { dest: addr, name });
+                        targets.push((addr, size, scale, dot_pos));
                     }
-                }
+                    None => return,
+                },
                 _ => return,
             }
         } else {
@@ -4913,12 +4990,15 @@ impl<'a> MirLowerer<'a> {
                         .module
                         .globals
                         .last()
-                        .map(|g| g.offset + match &g.ty {
-                            MirType::Bytes(n) => *n,
-                            MirType::I32 | MirType::Bool => 4,
-                            MirType::I64 => 8,
-                            MirType::I128 => 16,
-                            _ => 4,
+                        .map(|g| {
+                            g.offset
+                                + match &g.ty {
+                                    MirType::Bytes(n) => *n,
+                                    MirType::I32 | MirType::Bool => 4,
+                                    MirType::I64 => 8,
+                                    MirType::I128 => 16,
+                                    _ => 4,
+                                }
                         })
                         .unwrap_or(0);
                     self.module.globals.push(MirGlobal {
@@ -5035,8 +5115,14 @@ impl<'a> MirLowerer<'a> {
                 dest: None,
                 func: "cobolrt_string_append".to_string(),
                 args: vec![
-                    src_addr, v_src_len, dest_addr, v_dest_len, v_ptr_addr, v_ptr_len,
-                    v_delim, v_delim_len,
+                    src_addr,
+                    v_src_len,
+                    dest_addr,
+                    v_dest_len,
+                    v_ptr_addr,
+                    v_ptr_len,
+                    v_delim,
+                    v_delim_len,
                 ],
             });
         }
@@ -5528,12 +5614,18 @@ impl<'a> MirLowerer<'a> {
                 dest: None,
                 func: "cobolrt_unstring_field".to_string(),
                 args: vec![
-                    v_src_addr, v_src_len,
-                    v_tgt_addr, v_tgt_len,
-                    v_ptr, v_ptr_len,
-                    v_tally, v_tally_len,
-                    v_count, v_count_len,
-                    v_delim_in, v_delim_in_len,
+                    v_src_addr,
+                    v_src_len,
+                    v_tgt_addr,
+                    v_tgt_len,
+                    v_ptr,
+                    v_ptr_len,
+                    v_tally,
+                    v_tally_len,
+                    v_count,
+                    v_count_len,
+                    v_delim_in,
+                    v_delim_in_len,
                 ],
             });
         }
@@ -5989,7 +6081,169 @@ impl<'a> MirLowerer<'a> {
 
                 Some((result_addr, result_size))
             }
+            cobol_hir::HirExpr::FunctionCall { name, args } => {
+                self.emit_function_call(name, args, func, instructions)
+            }
             _ => None,
+        }
+    }
+
+    /// Emit MIR instructions for a COBOL intrinsic FUNCTION call.
+    /// Returns (addr, size) of a temporary holding the result.
+    fn emit_function_call(
+        &self,
+        name: &cobol_intern::Name,
+        args: &[cobol_hir::HirExpr],
+        func: &mut MirFunction,
+        instructions: &mut Vec<MirInst>,
+    ) -> Option<(Value, u32)> {
+        let func_name = self.interner.resolve(*name).to_string();
+
+        match func_name.as_str() {
+            "LENGTH" => {
+                // FUNCTION LENGTH(field) returns the byte size of the field.
+                // This is known at compile time from the data layout.
+                if let Some(arg) = args.first() {
+                    let size = match arg {
+                        cobol_hir::HirExpr::DataRef(dr) => {
+                            let arg_name = self.interner.resolve(dr.name).to_string();
+                            if let Some(info) = self.linkage_map.get(&arg_name) {
+                                info.byte_size
+                            } else if let Some((_gname, sz)) = self.resolve_data_ref(dr) {
+                                sz
+                            } else {
+                                0
+                            }
+                        }
+                        cobol_hir::HirExpr::Literal(cobol_hir::LiteralValue::String_(s)) => {
+                            s.len() as u32
+                        }
+                        _ => 0,
+                    };
+                    // Return the length as a display-format numeric string
+                    let s = format!("{}", size);
+                    let result_size = s.len().max(1) as u32;
+                    let str_val = func.new_value();
+                    instructions.push(MirInst::Const {
+                        dest: str_val,
+                        value: MirConst::Str(format!(
+                            "{:0>width$}",
+                            size,
+                            width = result_size as usize
+                        )),
+                    });
+                    Some((str_val, result_size))
+                } else {
+                    None
+                }
+            }
+            "UPPER-CASE" | "LOWER-CASE" | "REVERSE" | "TRIM" => {
+                // String functions: emit a runtime call.
+                // All take (src, src_len, dest, dest_len) and write to a temp buffer.
+                if let Some(arg) = args.first() {
+                    let (src_addr, src_size) = match arg {
+                        cobol_hir::HirExpr::DataRef(_) => {
+                            self.emit_expr_addr(arg, func, instructions)?
+                        }
+                        cobol_hir::HirExpr::Literal(cobol_hir::LiteralValue::String_(s)) => {
+                            let str_val = func.new_value();
+                            instructions.push(MirInst::Const {
+                                dest: str_val,
+                                value: MirConst::Str(s.clone()),
+                            });
+                            (str_val, s.len() as u32)
+                        }
+                        _ => return None,
+                    };
+
+                    let src_len_val = func.new_value();
+                    instructions.push(MirInst::Const {
+                        dest: src_len_val,
+                        value: MirConst::Int(src_size as i64),
+                    });
+
+                    // The result size: for TRIM it could be smaller, but we allocate
+                    // the same size and the runtime returns the actual length.
+                    let result_size = src_size;
+                    let result_len_val = func.new_value();
+                    instructions.push(MirInst::Const {
+                        dest: result_len_val,
+                        value: MirConst::Int(result_size as i64),
+                    });
+
+                    let rt_func = match func_name.as_str() {
+                        "UPPER-CASE" => "cobolrt_upper_case",
+                        "LOWER-CASE" => "cobolrt_lower_case",
+                        "REVERSE" => "cobolrt_reverse",
+                        "TRIM" => "cobolrt_trim",
+                        _ => unreachable!(),
+                    };
+
+                    let result_addr = func.new_value();
+                    instructions.push(MirInst::CallRuntime {
+                        dest: Some(result_addr),
+                        func: rt_func.to_string(),
+                        args: vec![src_addr, src_len_val, result_len_val],
+                    });
+
+                    Some((result_addr, result_size))
+                } else {
+                    None
+                }
+            }
+            "MAX" | "MIN" => {
+                // MAX/MIN take two or more numeric arguments.
+                // Evaluate each, then call the appropriate runtime function
+                // which compares display-format values.
+                if args.len() < 2 {
+                    // With a single arg, just return that arg
+                    if let Some(arg) = args.first() {
+                        return self.emit_arithmetic_expr(arg, func, instructions);
+                    }
+                    return None;
+                }
+                // Start with the first argument
+                let (mut best_addr, mut best_size) =
+                    self.emit_arithmetic_expr(&args[0], func, instructions)?;
+
+                let rt_func = match func_name.as_str() {
+                    "MAX" => "cobolrt_max_numeric",
+                    "MIN" => "cobolrt_min_numeric",
+                    _ => unreachable!(),
+                };
+
+                for arg in &args[1..] {
+                    let (arg_addr, arg_size) =
+                        self.emit_arithmetic_expr(arg, func, instructions)?;
+
+                    let best_len = func.new_value();
+                    instructions.push(MirInst::Const {
+                        dest: best_len,
+                        value: MirConst::Int(best_size as i64),
+                    });
+                    let arg_len = func.new_value();
+                    instructions.push(MirInst::Const {
+                        dest: arg_len,
+                        value: MirConst::Int(arg_size as i64),
+                    });
+
+                    let new_best = func.new_value();
+                    instructions.push(MirInst::CallRuntime {
+                        dest: Some(new_best),
+                        func: rt_func.to_string(),
+                        args: vec![best_addr, best_len, arg_addr, arg_len],
+                    });
+                    let new_size = best_size.max(arg_size);
+                    best_addr = new_best;
+                    best_size = new_size;
+                }
+
+                Some((best_addr, best_size))
+            }
+            _ => {
+                // Unknown function -- return None
+                None
+            }
         }
     }
 
@@ -6228,7 +6482,12 @@ impl<'a> MirLowerer<'a> {
                                     instructions.push(MirInst::CallRuntime {
                                         dest: Some(cmp_low),
                                         func: "cobolrt_compare_numeric".to_string(),
-                                        args: vec![pair_parent_addr, pair_parent_len, low_val, low_len],
+                                        args: vec![
+                                            pair_parent_addr,
+                                            pair_parent_len,
+                                            low_val,
+                                            low_len,
+                                        ],
                                     });
                                     let zero1 = func.new_value();
                                     instructions.push(MirInst::Const {
@@ -6309,7 +6568,12 @@ impl<'a> MirLowerer<'a> {
                                     instructions.push(MirInst::CallRuntime {
                                         dest: Some(cmp_result),
                                         func: "cobolrt_compare_numeric".to_string(),
-                                        args: vec![pair_parent_addr, pair_parent_len, cond_val, cond_len],
+                                        args: vec![
+                                            pair_parent_addr,
+                                            pair_parent_len,
+                                            cond_val,
+                                            cond_len,
+                                        ],
                                     });
 
                                     let zero_val = func.new_value();
@@ -6452,12 +6716,8 @@ impl<'a> MirLowerer<'a> {
                         let rt_func = match class {
                             cobol_hir::ClassType::Numeric => "cobolrt_is_numeric",
                             cobol_hir::ClassType::Alphabetic => "cobolrt_is_alphabetic",
-                            cobol_hir::ClassType::AlphabeticLower => {
-                                "cobolrt_is_alphabetic_lower"
-                            }
-                            cobol_hir::ClassType::AlphabeticUpper => {
-                                "cobolrt_is_alphabetic_upper"
-                            }
+                            cobol_hir::ClassType::AlphabeticLower => "cobolrt_is_alphabetic_lower",
+                            cobol_hir::ClassType::AlphabeticUpper => "cobolrt_is_alphabetic_upper",
                         };
 
                         let call_result = func.new_value();
@@ -6828,9 +7088,7 @@ impl<'a> MirLowerer<'a> {
 
         // Handle SET condition-name TO TRUE
         if matches!(action, cobol_hir::SetAction::ConditionTrue) {
-            if let Some((parent_id, ref value_pairs)) =
-                self.hir.condition_names.get(&target_name)
-            {
+            if let Some((parent_id, ref value_pairs)) = self.hir.condition_names.get(&target_name) {
                 let parent_item = &self.hir.data_items[parent_id.into_raw()];
                 let parent_name = parent_item
                     .name
@@ -6860,8 +7118,12 @@ impl<'a> MirLowerer<'a> {
                         Some(Some(cobol_hir::InitialValue::String_(s))) => {
                             format!("{:<width$}", s, width = parent_size as usize)
                         }
-                        Some(Some(cobol_hir::InitialValue::Zero)) => "0".repeat(parent_size as usize),
-                        Some(Some(cobol_hir::InitialValue::Space)) => " ".repeat(parent_size as usize),
+                        Some(Some(cobol_hir::InitialValue::Zero)) => {
+                            "0".repeat(parent_size as usize)
+                        }
+                        Some(Some(cobol_hir::InitialValue::Space)) => {
+                            " ".repeat(parent_size as usize)
+                        }
                         _ => "0".repeat(parent_size as usize),
                     };
 
@@ -7039,21 +7301,19 @@ impl<'a> MirLowerer<'a> {
             }
             cobol_hir::HirExpr::DataRef(dr) => {
                 let name = self.interner.resolve(dr.name).to_string();
-                if self.index_info.contains_key(&name) {
-                    if self.global_map.contains_key(&name) {
-                        let addr = func.new_value();
-                        instructions.push(MirInst::GlobalAddr {
-                            dest: addr,
-                            name: name.clone(),
-                        });
-                        let val = func.new_value();
-                        instructions.push(MirInst::Load {
-                            dest: val,
-                            addr,
-                            ty: MirType::I64,
-                        });
-                        return val;
-                    }
+                if self.index_info.contains_key(&name) && self.global_map.contains_key(&name) {
+                    let addr = func.new_value();
+                    instructions.push(MirInst::GlobalAddr {
+                        dest: addr,
+                        name: name.clone(),
+                    });
+                    let val = func.new_value();
+                    instructions.push(MirInst::Load {
+                        dest: val,
+                        addr,
+                        ty: MirType::I64,
+                    });
+                    return val;
                 }
                 if let Some(&g_idx) = self.global_map.get(&name) {
                     let size = match &self.module.globals[g_idx].ty {
@@ -8045,7 +8305,11 @@ impl<'a> MirLowerer<'a> {
         if let cobol_hir::HirExpr::Literal(cobol_hir::LiteralValue::Integer(n)) = from {
             let init_str = if *n < 0 {
                 // Format negative: "-" followed by zero-padded absolute value
-                let abs_str = format!("{:0>width$}", n.unsigned_abs(), width = (var_size as usize).saturating_sub(1));
+                let abs_str = format!(
+                    "{:0>width$}",
+                    n.unsigned_abs(),
+                    width = (var_size as usize).saturating_sub(1)
+                );
                 format!("-{}", abs_str)
             } else {
                 format!("{:0>width$}", n, width = var_size as usize)
@@ -8085,7 +8349,11 @@ impl<'a> MirLowerer<'a> {
         if let cobol_hir::HirExpr::Literal(cobol_hir::LiteralValue::Integer(by_val)) = by {
             let by_str = if *by_val < 0 {
                 // Format negative: "-" followed by zero-padded absolute value
-                let abs_str = format!("{:0>width$}", by_val.unsigned_abs(), width = (var_size as usize).saturating_sub(1));
+                let abs_str = format!(
+                    "{:0>width$}",
+                    by_val.unsigned_abs(),
+                    width = (var_size as usize).saturating_sub(1)
+                );
                 format!("-{}", abs_str)
             } else {
                 format!("{:0>width$}", by_val, width = var_size as usize)
@@ -8142,11 +8410,11 @@ impl<'a> MirLowerer<'a> {
     fn resolve_var_size(&self, name: &str) -> u32 {
         self.global_map
             .get(name)
-            .and_then(|&idx| {
+            .map(|&idx| {
                 let g = &self.module.globals[idx];
                 match &g.ty {
-                    MirType::Bytes(n) => Some(*n),
-                    _ => Some(1),
+                    MirType::Bytes(n) => *n,
+                    _ => 1,
                 }
             })
             .unwrap_or(1)
@@ -8284,8 +8552,7 @@ impl<'a> MirLowerer<'a> {
 
             // after_cond block: check AFTER UNTIL condition
             let mut after_cond_insts = Vec::new();
-            let after_cond_val =
-                self.eval_condition(&after.until, func, &mut after_cond_insts);
+            let after_cond_val = self.eval_condition(&after.until, func, &mut after_cond_insts);
             func.blocks.push(BasicBlock {
                 id: after_cond_id,
                 params: Vec::new(),

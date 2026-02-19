@@ -1,0 +1,2 @@
+       01 :INR:-VAL PIC X(8) VALUE :INR-LIT:.
+       01 :INR:-NUM PIC 9(4) VALUE :INR-NUM:.
