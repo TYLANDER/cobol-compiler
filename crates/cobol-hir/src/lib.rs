@@ -215,8 +215,8 @@ pub struct HirModule {
     pub sections: Vec<HirSection>,
     /// Diagnostics produced during lowering.
     pub diagnostics: Vec<HirDiagnostic>,
-    /// Maps 88-level condition names to (parent DataItemId, condition value).
-    pub condition_names: std::collections::HashMap<String, (DataItemId, Option<InitialValue>)>,
+    /// Maps 88-level condition names to (parent DataItemId, condition value, optional THRU value).
+    pub condition_names: std::collections::HashMap<String, (DataItemId, Option<InitialValue>, Option<InitialValue>)>,
 }
 
 /// A FILE SECTION FD entry.
@@ -322,6 +322,7 @@ pub enum HirStatement {
         remainder: Option<HirDataRef>,
         on_size_error: Option<Vec<HirStatement>>,
         rounded: bool,
+        is_into: bool,
     },
     Compute {
         targets: Vec<HirDataRef>,
@@ -335,7 +336,7 @@ pub enum HirStatement {
         else_branch: Option<Vec<HirStatement>>,
     },
     Evaluate {
-        subject: HirExpr,
+        subjects: Vec<HirExpr>,
         whens: Vec<WhenClause>,
     },
     Perform(PerformType),
@@ -423,6 +424,8 @@ pub enum SetAction {
     UpBy(HirExpr),
     /// SET target DOWN BY value
     DownBy(HirExpr),
+    /// SET condition-name TO TRUE (move condition value to parent)
+    ConditionTrue,
 }
 
 /// The different forms of the INSPECT statement.
@@ -903,8 +906,8 @@ struct HirLowerer<'a> {
     file_data_items: Vec<DataItemId>,
     /// File descriptors built from SELECT + FD.
     file_items: Vec<FileDescriptor>,
-    /// Maps 88-level condition names to (parent DataItemId, condition value).
-    condition_names: std::collections::HashMap<String, (DataItemId, Option<InitialValue>)>,
+    /// Maps 88-level condition names to (parent DataItemId, condition value, optional THRU value).
+    condition_names: std::collections::HashMap<String, (DataItemId, Option<InitialValue>, Option<InitialValue>)>,
     /// Tracks the last non-88 data item ID for parenting 88-level items.
     last_non_88_item: Option<DataItemId>,
 }
@@ -1416,7 +1419,9 @@ impl<'a> HirLowerer<'a> {
                 let name_str = self.interner.resolve(item_name).to_string();
                 let parent_id = self.find_last_non_88_item();
                 if let Some(parent_id) = parent_id {
-                    self.condition_names.insert(name_str, (parent_id, value));
+                    // Check for THRU/THROUGH in the VALUE clause
+                    let thru_value = self.extract_88_thru_value(item);
+                    self.condition_names.insert(name_str, (parent_id, value, thru_value));
                 }
             }
         }
@@ -1574,6 +1579,57 @@ impl<'a> HirLowerer<'a> {
                             "QUOTE" | "QUOTES" => return Some(InitialValue::Quote),
                             _ => {}
                         }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        None
+    }
+
+    /// Extract THRU value from an 88-level VALUE clause (e.g., VALUE 60 THRU 100).
+    fn extract_88_thru_value(&self, item: &cobol_ast::DataItem) -> Option<InitialValue> {
+        let vc = item.value_clause()?;
+        let mut found_thru = false;
+        let mut negate = false;
+        for el in vc.syntax().children_with_tokens() {
+            if let Some(tok) = el.into_token() {
+                let upper = tok.text().to_ascii_uppercase();
+                if upper == "THRU" || upper == "THROUGH" {
+                    found_thru = true;
+                    negate = false;
+                    continue;
+                }
+                if !found_thru {
+                    continue;
+                }
+                match tok.kind() {
+                    SyntaxKind::MINUS => { negate = true; }
+                    SyntaxKind::INTEGER_LITERAL => {
+                        if let Ok(n) = tok.text().parse::<i64>() {
+                            let value = if negate { -n } else { n };
+                            return Some(InitialValue::Numeric(value, 0));
+                        }
+                    }
+                    SyntaxKind::DECIMAL_LITERAL => {
+                        if let Some(dot_pos) = tok.text().find('.') {
+                            let scale = (tok.text().len() - dot_pos - 1) as i32;
+                            if let Ok(n) = tok.text().replace('.', "").parse::<i64>() {
+                                let value = if negate { -n } else { n };
+                                return Some(InitialValue::Numeric(value, scale));
+                            }
+                        }
+                    }
+                    SyntaxKind::STRING_LITERAL => {
+                        let text = tok.text().to_string();
+                        let inner = if (text.starts_with('"') && text.ends_with('"'))
+                            || (text.starts_with('\'') && text.ends_with('\''))
+                        {
+                            text[1..text.len() - 1].to_string()
+                        } else {
+                            text
+                        };
+                        return Some(InitialValue::String_(inner));
                     }
                     _ => {}
                 }
@@ -2614,13 +2670,15 @@ impl<'a> HirLowerer<'a> {
         let mut giving_targets = Vec::new();
         let mut remainder = None;
         let mut rounded = false;
+        let mut is_into = false;
         let mut phase = 0; // 0=operand1, 1=into/by, 2=giving, 3=remainder
 
         let mut i = 1; // Skip DIVIDE
         while i < tokens.len() {
             let upper = tokens[i].1.to_ascii_uppercase();
             match upper.as_str() {
-                "INTO" | "BY" => { phase = 1; i += 1; continue; }
+                "INTO" => { is_into = true; phase = 1; i += 1; continue; }
+                "BY" => { is_into = false; phase = 1; i += 1; continue; }
                 "GIVING" => { phase = 2; i += 1; continue; }
                 "REMAINDER" => { phase = 3; i += 1; continue; }
                 "ROUNDED" => { rounded = true; i += 1; continue; }
@@ -2660,6 +2718,7 @@ impl<'a> HirLowerer<'a> {
             remainder,
             on_size_error: None,
             rounded,
+            is_into,
         })
     }
 
@@ -3518,11 +3577,10 @@ impl<'a> HirLowerer<'a> {
 
     fn lower_evaluate_stmt(&mut self, node: &cobol_ast::SyntaxNode) -> Option<HirStatement> {
         // The parser creates EVALUATE_STMT with all children flattened:
-        //   EVALUATE <subject> WHEN <val> <stmt-nodes>... WHEN OTHER <stmt-nodes>... END-EVALUATE
-        //
-        // Walk child tokens/nodes to find the subject, then build WhenClauses.
+        //   EVALUATE <subject> [ALSO <subject2>...] WHEN <val> [ALSO <val2>...] <stmt-nodes>...
+        //   WHEN OTHER <stmt-nodes>... END-EVALUATE
 
-        // Phase 1: collect flat tokens to find subject and WHEN positions
+        // Phase 1: collect flat tokens to find subjects and WHEN positions
         let tokens = self.collect_all_tokens(node);
         if tokens.is_empty() {
             return None;
@@ -3534,27 +3592,39 @@ impl<'a> HirLowerer<'a> {
             idx += 1;
         }
 
-        // Collect subject tokens until "WHEN"
-        let mut subject_tokens = Vec::new();
+        // Collect subject tokens until "WHEN", split by ALSO
+        let mut subject_token_groups: Vec<Vec<(SyntaxKind, String)>> = vec![Vec::new()];
         while idx < tokens.len() {
             let upper = tokens[idx].1.to_ascii_uppercase();
             if upper == "WHEN" || upper == "END-EVALUATE" {
                 break;
             }
-            subject_tokens.push(tokens[idx].clone());
+            if upper == "ALSO" {
+                subject_token_groups.push(Vec::new());
+                idx += 1;
+                continue;
+            }
+            subject_token_groups.last_mut().unwrap().push(tokens[idx].clone());
             idx += 1;
         }
 
-        // Parse subject expression
-        let is_evaluate_true = subject_tokens.len() == 1
-            && subject_tokens[0].1.eq_ignore_ascii_case("TRUE");
-        let is_evaluate_false = subject_tokens.len() == 1
-            && subject_tokens[0].1.eq_ignore_ascii_case("FALSE");
-        let subject = if subject_tokens.len() >= 1 {
-            self.token_to_expr(subject_tokens[0].0, &subject_tokens[0].1)
-        } else {
+        // Parse subject expressions
+        let mut subjects: Vec<HirExpr> = Vec::new();
+        let mut is_evaluate_true = false;
+        let mut is_evaluate_false = false;
+        for (i, group) in subject_token_groups.iter().enumerate() {
+            if group.is_empty() { continue; }
+            if i == 0 && group.len() == 1 && group[0].1.eq_ignore_ascii_case("TRUE") {
+                is_evaluate_true = true;
+            }
+            if i == 0 && group.len() == 1 && group[0].1.eq_ignore_ascii_case("FALSE") {
+                is_evaluate_false = true;
+            }
+            subjects.push(self.token_to_expr(group[0].0, &group[0].1));
+        }
+        if subjects.is_empty() {
             return None;
-        };
+        }
 
         // Phase 2: walk CST children directly to build WHEN clauses with
         // proper statement bodies. We track state to know which WHEN we are in.
@@ -3565,7 +3635,8 @@ impl<'a> HirLowerer<'a> {
         let mut seen_evaluate = false;
         let mut past_subject = false;
         let mut need_condition_value = false;
-        let mut in_when_cond_tokens: Option<Vec<(SyntaxKind, String)>> = None;
+        // Buffer for collecting WHEN value/condition tokens (split by ALSO later)
+        let mut when_value_tokens: Option<Vec<(SyntaxKind, String)>> = None;
 
         for el in node.children_with_tokens() {
             if let Some(tok) = el.as_token() {
@@ -3585,25 +3656,10 @@ impl<'a> HirLowerer<'a> {
                     break;
                 }
                 if text_upper == "WHEN" {
-                    // Flush any pending EVALUATE TRUE/FALSE condition tokens
-                    if let Some(cond_toks) = in_when_cond_tokens.take() {
-                        if !cond_toks.is_empty() {
-                            if let Some(cond_expr) = self.parse_condition_tokens(&cond_toks) {
-                                let final_cond = if is_evaluate_false {
-                                    HirExpr::Condition(Box::new(HirCondition::Not(
-                                        Box::new(match cond_expr {
-                                            HirExpr::Condition(c) => *c,
-                                            _ => HirCondition::Comparison {
-                                                left: cond_expr, op: BinaryOp::Ne, right: HirExpr::Literal(LiteralValue::Integer(0)),
-                                            },
-                                        })
-                                    )))
-                                } else {
-                                    cond_expr
-                                };
-                                current_conditions.push(final_cond);
-                            }
-                        }
+                    // Flush any pending WHEN value tokens
+                    if let Some(val_toks) = when_value_tokens.take() {
+                        self.flush_evaluate_when_values(&val_toks, &subjects,
+                            is_evaluate_true, is_evaluate_false, &mut current_conditions);
                     }
                     // Save previous WHEN clause if any
                     if in_when {
@@ -3623,61 +3679,26 @@ impl<'a> HirLowerer<'a> {
                         // WHEN OTHER: empty conditions vector signals default
                         continue;
                     }
-                    if is_evaluate_true || is_evaluate_false {
-                        // EVALUATE TRUE/FALSE: collect all tokens until
-                        // the next statement node, then parse as condition.
-                        // We accumulate condition tokens into a buffer and
-                        // defer parsing until we see the first statement node.
-                        if !in_when_cond_tokens.is_some() {
-                            in_when_cond_tokens = Some(Vec::new());
-                        }
-                        if let Some(ref mut cond_toks) = in_when_cond_tokens {
-                            cond_toks.push((kind, tok.text().to_string()));
-                        }
-                        continue;
+                    // Collect all WHEN value/condition tokens into buffer
+                    // (handles both TRUE/FALSE condition tokens and regular values with ALSO)
+                    if when_value_tokens.is_none() {
+                        when_value_tokens = Some(Vec::new());
                     }
-                    need_condition_value = false;
-                    // This is the WHEN value — build an equality comparison
-                    let cond_expr = self.token_to_expr(kind, tok.text());
-                    current_conditions.push(HirExpr::Condition(Box::new(
-                        HirCondition::Comparison {
-                            left: subject.clone(),
-                            op: BinaryOp::Eq,
-                            right: cond_expr,
-                        },
-                    )));
+                    when_value_tokens.as_mut().unwrap().push((kind, tok.text().to_string()));
                     continue;
                 }
                 if !past_subject {
-                    // Subject tokens — skip
                     continue;
                 }
-                // Other tokens inside WHEN body — skip (statements are child nodes)
             } else if let Some(child) = el.as_node() {
                 if !past_subject {
-                    // Could be part of subject; skip
                     continue;
                 }
-                // Flush any pending EVALUATE TRUE/FALSE condition tokens
-                if let Some(cond_toks) = in_when_cond_tokens.take() {
-                    if !cond_toks.is_empty() {
-                        if let Some(cond_expr) = self.parse_condition_tokens(&cond_toks) {
-                            let final_cond = if is_evaluate_false {
-                                HirExpr::Condition(Box::new(HirCondition::Not(
-                                    Box::new(match cond_expr {
-                                        HirExpr::Condition(c) => *c,
-                                        _ => HirCondition::Comparison {
-                                            left: cond_expr, op: BinaryOp::Ne, right: HirExpr::Literal(LiteralValue::Integer(0)),
-                                        },
-                                    })
-                                )))
-                            } else {
-                                cond_expr
-                            };
-                            current_conditions.push(final_cond);
-                        }
-                        need_condition_value = false;
-                    }
+                // Flush any pending WHEN value tokens before processing statements
+                if let Some(val_toks) = when_value_tokens.take() {
+                    self.flush_evaluate_when_values(&val_toks, &subjects,
+                        is_evaluate_true, is_evaluate_false, &mut current_conditions);
+                    need_condition_value = false;
                 }
                 if in_when {
                     let mut child_stmts = Vec::new();
@@ -3687,25 +3708,10 @@ impl<'a> HirLowerer<'a> {
             }
         }
 
-        // Flush any pending EVALUATE TRUE/FALSE condition tokens
-        if let Some(cond_toks) = in_when_cond_tokens.take() {
-            if !cond_toks.is_empty() {
-                if let Some(cond_expr) = self.parse_condition_tokens(&cond_toks) {
-                    let final_cond = if is_evaluate_false {
-                        HirExpr::Condition(Box::new(HirCondition::Not(
-                            Box::new(match cond_expr {
-                                HirExpr::Condition(c) => *c,
-                                _ => HirCondition::Comparison {
-                                    left: cond_expr, op: BinaryOp::Ne, right: HirExpr::Literal(LiteralValue::Integer(0)),
-                                },
-                            })
-                        )))
-                    } else {
-                        cond_expr
-                    };
-                    current_conditions.push(final_cond);
-                }
-            }
+        // Flush any pending WHEN value tokens
+        if let Some(val_toks) = when_value_tokens.take() {
+            self.flush_evaluate_when_values(&val_toks, &subjects,
+                is_evaluate_true, is_evaluate_false, &mut current_conditions);
         }
         // Push the last WHEN clause
         if in_when {
@@ -3715,7 +3721,96 @@ impl<'a> HirLowerer<'a> {
             });
         }
 
-        Some(HirStatement::Evaluate { subject, whens })
+        Some(HirStatement::Evaluate { subjects, whens })
+    }
+
+    /// Flush collected WHEN value/condition tokens, splitting by ALSO.
+    /// Builds equality comparisons for each subject-value pair and AND-s them together.
+    fn flush_evaluate_when_values(
+        &mut self,
+        val_toks: &[(SyntaxKind, String)],
+        subjects: &[HirExpr],
+        is_evaluate_true: bool,
+        is_evaluate_false: bool,
+        conditions: &mut Vec<HirExpr>,
+    ) {
+        if val_toks.is_empty() {
+            return;
+        }
+
+        if is_evaluate_true || is_evaluate_false {
+            // For EVALUATE TRUE/FALSE, parse as condition expression
+            if let Some(cond_expr) = self.parse_condition_tokens(val_toks) {
+                let final_cond = if is_evaluate_false {
+                    HirExpr::Condition(Box::new(HirCondition::Not(
+                        Box::new(match cond_expr {
+                            HirExpr::Condition(c) => *c,
+                            _ => HirCondition::Comparison {
+                                left: cond_expr, op: BinaryOp::Ne,
+                                right: HirExpr::Literal(LiteralValue::Integer(0)),
+                            },
+                        })
+                    )))
+                } else {
+                    cond_expr
+                };
+                conditions.push(final_cond);
+            }
+            return;
+        }
+
+        // Split tokens by ALSO into groups, one per subject
+        let mut groups: Vec<Vec<(SyntaxKind, String)>> = vec![Vec::new()];
+        for tok in val_toks {
+            if tok.1.eq_ignore_ascii_case("ALSO") {
+                groups.push(Vec::new());
+            } else {
+                groups.last_mut().unwrap().push(tok.clone());
+            }
+        }
+
+        // Build equality comparisons for each subject-value pair
+        let mut all_conditions: Vec<HirExpr> = Vec::new();
+        for (i, group) in groups.iter().enumerate() {
+            if group.is_empty() || i >= subjects.len() {
+                continue;
+            }
+            let value_expr = self.token_to_expr(group[0].0, &group[0].1);
+            all_conditions.push(HirExpr::Condition(Box::new(
+                HirCondition::Comparison {
+                    left: subjects[i].clone(),
+                    op: BinaryOp::Eq,
+                    right: value_expr,
+                },
+            )));
+        }
+
+        // If multiple conditions (ALSO), AND them together
+        if all_conditions.len() == 1 {
+            conditions.push(all_conditions.pop().unwrap());
+        } else if all_conditions.len() > 1 {
+            // Build nested AND: cond1 AND cond2 AND cond3...
+            let mut combined = all_conditions.remove(0);
+            for cond in all_conditions {
+                combined = HirExpr::Condition(Box::new(HirCondition::And(
+                    Box::new(match combined {
+                        HirExpr::Condition(c) => *c,
+                        _ => HirCondition::Comparison {
+                            left: combined, op: BinaryOp::Ne,
+                            right: HirExpr::Literal(LiteralValue::Integer(0)),
+                        },
+                    }),
+                    Box::new(match cond {
+                        HirExpr::Condition(c) => *c,
+                        _ => HirCondition::Comparison {
+                            left: cond, op: BinaryOp::Ne,
+                            right: HirExpr::Literal(LiteralValue::Integer(0)),
+                        },
+                    }),
+                )));
+            }
+            conditions.push(combined);
+        }
     }
 
     fn lower_search_stmt(&mut self, node: &cobol_ast::SyntaxNode) -> Option<HirStatement> {
@@ -3875,11 +3970,20 @@ impl<'a> HirLowerer<'a> {
                 if idx >= tokens.len() {
                     return None;
                 }
-                let value = self.token_to_expr(tokens[idx].0, &tokens[idx].1);
-                Some(HirStatement::Set {
-                    target,
-                    action: SetAction::To(value),
-                })
+                let val_upper = tokens[idx].1.to_ascii_uppercase();
+                if val_upper == "TRUE" {
+                    // SET condition-name TO TRUE
+                    Some(HirStatement::Set {
+                        target,
+                        action: SetAction::ConditionTrue,
+                    })
+                } else {
+                    let value = self.token_to_expr(tokens[idx].0, &tokens[idx].1);
+                    Some(HirStatement::Set {
+                        target,
+                        action: SetAction::To(value),
+                    })
+                }
             }
             "UP" => {
                 idx += 1;

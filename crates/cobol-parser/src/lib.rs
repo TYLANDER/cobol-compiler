@@ -1304,6 +1304,23 @@ impl<'t> Parser<'t> {
             }
         }
 
+        // Handle THRU/THROUGH for range values (e.g., VALUE 60 THRU 100)
+        self.skip_ws();
+        if !self.at_end() && (self.at_word("THRU") || self.at_word("THROUGH")) {
+            self.bump(); // consume THRU/THROUGH
+            self.skip_ws();
+            if !self.at_end() && self.current_kind() != cobol_lexer::TokenKind::Period {
+                // Handle negative range end
+                if self.current_kind() == cobol_lexer::TokenKind::Minus {
+                    self.bump(); // consume '-'
+                    self.skip_ws();
+                }
+                if !self.at_end() && self.current_kind() != cobol_lexer::TokenKind::Period {
+                    self.bump(); // consume the range end value
+                }
+            }
+        }
+
         self.finish_node();
     }
 

@@ -1049,8 +1049,8 @@ impl<'a> MirLowerer<'a> {
             cobol_hir::HirStatement::Multiply { operand1, by, giving, .. } => {
                 self.lower_multiply(operand1, by, giving.as_deref(), func, instructions);
             }
-            cobol_hir::HirStatement::Divide { operand1, into_or_by, giving, rounded, .. } => {
-                self.lower_divide(operand1, into_or_by, giving.as_deref(), *rounded, func, instructions);
+            cobol_hir::HirStatement::Divide { operand1, into_or_by, giving, remainder, rounded, is_into, .. } => {
+                self.lower_divide(operand1, into_or_by, giving.as_deref(), remainder.as_ref(), *rounded, *is_into, func, instructions);
             }
             cobol_hir::HirStatement::If { condition, then_branch, else_branch } => {
                 self.lower_if(condition, then_branch, else_branch.as_deref(),
@@ -1090,8 +1090,8 @@ impl<'a> MirLowerer<'a> {
                 self.lower_file_read(*file, *into, at_end,
                     func, current_block_id, instructions);
             }
-            cobol_hir::HirStatement::Evaluate { subject, whens } => {
-                self.lower_evaluate(subject, whens, func, current_block_id, instructions);
+            cobol_hir::HirStatement::Evaluate { subjects, whens } => {
+                self.lower_evaluate(subjects, whens, func, current_block_id, instructions);
             }
             cobol_hir::HirStatement::GoTo { target } => {
                 let target_name = self.interner.resolve(*target).to_string();
@@ -2986,84 +2986,158 @@ impl<'a> MirLowerer<'a> {
         operand_a: &cobol_hir::HirExpr,
         by_operand: &cobol_hir::HirExpr,
         giving: Option<&[cobol_hir::HirDataRef]>,
+        remainder: Option<&cobol_hir::HirDataRef>,
         rounded: bool,
+        is_into: bool,
         func: &mut MirFunction,
         instructions: &mut Vec<MirInst>,
     ) {
-        // DIVIDE operand_a BY by_operand GIVING target [ROUNDED]
-        // We need addresses + sizes + scales for all three operands.
+        // COBOL DIVIDE semantics:
+        //   DIVIDE A INTO B       → B = B / A  (A is divisor, B is dividend & target)
+        //   DIVIDE A INTO B GIVING C → C = B / A
+        //   DIVIDE A BY B GIVING C   → C = A / B
+        //   + optional REMAINDER D
 
-        // Get dividend info
-        let (src1_addr, src1_size, src1_scale) = match operand_a {
-            cobol_hir::HirExpr::DataRef(dr) => {
-                if let Some((name, size, scale, _dot)) = self.resolve_data_ref_full(dr) {
-                    let addr = func.new_value();
-                    instructions.push(MirInst::GlobalAddr { dest: addr, name });
-                    (addr, size, scale)
-                } else { return; }
+        // Resolve both operands
+        let resolve_expr = |expr: &cobol_hir::HirExpr, f: &mut MirFunction, insts: &mut Vec<MirInst>| -> Option<(Value, u32, i32)> {
+            match expr {
+                cobol_hir::HirExpr::DataRef(dr) => {
+                    if let Some((name, size, scale, _dot)) = self.resolve_data_ref_full(dr) {
+                        let addr = f.new_value();
+                        insts.push(MirInst::GlobalAddr { dest: addr, name });
+                        Some((addr, size, scale))
+                    } else { None }
+                }
+                cobol_hir::HirExpr::Literal(cobol_hir::LiteralValue::Integer(n)) => {
+                    let lit_str = format!("{}", n.unsigned_abs());
+                    let temp_name = format!("__div_lit_{}", f.next_value);
+                    if !self.global_map.contains_key(&temp_name) {
+                        // Use a temporary constant — store literal as padded string
+                        let padded = format!("{:0>4}", lit_str);
+                        let const_val = f.new_value();
+                        insts.push(MirInst::Const { dest: const_val, value: MirConst::Str(padded.clone()) });
+                        let len_val = f.new_value();
+                        insts.push(MirInst::Const { dest: len_val, value: MirConst::Int(padded.len() as i64) });
+                        // For literal operands in divide, we emit a move to a temp buffer
+                        // using cobolrt_move_to_temp and get back a pointer
+                        let temp_addr = f.new_value();
+                        insts.push(MirInst::CallRuntime {
+                            dest: Some(temp_addr),
+                            func: "cobolrt_alloc_temp".to_string(),
+                            args: vec![const_val, len_val],
+                        });
+                        return Some((temp_addr, padded.len() as u32, 0));
+                    }
+                    None
+                }
+                _ => None,
             }
-            _ => return,
         };
 
-        // Get divisor info
-        let (src2_addr, src2_size, src2_scale) = match by_operand {
-            cobol_hir::HirExpr::DataRef(dr) => {
-                if let Some((name, size, scale, _dot)) = self.resolve_data_ref_full(dr) {
-                    let addr = func.new_value();
-                    instructions.push(MirInst::GlobalAddr { dest: addr, name });
-                    (addr, size, scale)
-                } else { return; }
+        let (op_a_addr, op_a_size, op_a_scale) = match resolve_expr(operand_a, func, instructions) {
+            Some(info) => info,
+            None => return,
+        };
+        let (op_b_addr, op_b_size, op_b_scale) = match resolve_expr(by_operand, func, instructions) {
+            Some(info) => info,
+            None => return,
+        };
+
+        // Determine dividend, divisor, and target based on INTO vs BY
+        let (dividend_addr, dividend_size, dividend_scale, divisor_addr, divisor_size, divisor_scale) = if is_into {
+            // DIVIDE A INTO B → dividend=B, divisor=A
+            (op_b_addr, op_b_size, op_b_scale, op_a_addr, op_a_size, op_a_scale)
+        } else {
+            // DIVIDE A BY B → dividend=A, divisor=B
+            (op_a_addr, op_a_size, op_a_scale, op_b_addr, op_b_size, op_b_scale)
+        };
+
+        // Determine target: GIVING target, or into_or_by (when no GIVING + INTO)
+        let (target_addr, target_size, target_scale, target_dot_pos) = if let Some(refs) = giving {
+            if let Some(target_ref) = refs.first() {
+                match self.resolve_data_ref_full(target_ref) {
+                    Some((name, size, scale, dot_pos)) => {
+                        let addr = func.new_value();
+                        instructions.push(MirInst::GlobalAddr { dest: addr, name });
+                        (addr, size, scale, dot_pos)
+                    }
+                    None => return,
+                }
+            } else { return; }
+        } else if is_into {
+            // DIVIDE A INTO B (no GIVING) → target = B (same as dividend)
+            // B is already resolved as op_b, but we need its full info for target
+            match by_operand {
+                cobol_hir::HirExpr::DataRef(dr) => {
+                    match self.resolve_data_ref_full(dr) {
+                        Some((name, size, scale, dot_pos)) => {
+                            // Re-resolve for target address (distinct from dividend addr used in call)
+                            let addr = func.new_value();
+                            instructions.push(MirInst::GlobalAddr { dest: addr, name });
+                            (addr, size, scale, dot_pos)
+                        }
+                        None => return,
+                    }
+                }
+                _ => return,
             }
-            _ => return,
+        } else {
+            return; // DIVIDE A BY B without GIVING is invalid
         };
 
-        // Get target info
-        let giving_refs = match giving {
-            Some(refs) if !refs.is_empty() => refs,
-            _ => return,
+        // Emit division call
+        let emit_divide_call = |f: &mut MirFunction, insts: &mut Vec<MirInst>,
+            dv_addr, dv_size: u32, dv_scale: i32, ds_addr, ds_size: u32, ds_scale: i32,
+            t_addr, t_size: u32, t_scale: i32, t_dot: i32, rnd: bool| {
+            let v1 = f.new_value(); insts.push(MirInst::Const { dest: v1, value: MirConst::Int(dv_size as i64) });
+            let v2 = f.new_value(); insts.push(MirInst::Const { dest: v2, value: MirConst::Int(dv_scale as i64) });
+            let v3 = f.new_value(); insts.push(MirInst::Const { dest: v3, value: MirConst::Int(ds_size as i64) });
+            let v4 = f.new_value(); insts.push(MirInst::Const { dest: v4, value: MirConst::Int(ds_scale as i64) });
+            let v5 = f.new_value(); insts.push(MirInst::Const { dest: v5, value: MirConst::Int(t_size as i64) });
+            let v6 = f.new_value(); insts.push(MirInst::Const { dest: v6, value: MirConst::Int(t_scale as i64) });
+            let v7 = f.new_value(); insts.push(MirInst::Const { dest: v7, value: MirConst::Int(t_dot as i64) });
+            let v8 = f.new_value(); insts.push(MirInst::Const { dest: v8, value: MirConst::Int(if rnd { 1 } else { 0 }) });
+            insts.push(MirInst::CallRuntime {
+                dest: None,
+                func: "cobolrt_divide_scaled".to_string(),
+                args: vec![dv_addr, v1, v2, ds_addr, v3, v4, t_addr, v5, v6, v7, v8],
+            });
         };
-        let target_ref = &giving_refs[0];
-        let (target_name, target_size, target_scale, target_dot_pos) =
-            match self.resolve_data_ref_full(target_ref) {
-                Some(info) => info,
-                None => return,
-            };
 
-        let target_addr = func.new_value();
-        instructions.push(MirInst::GlobalAddr { dest: target_addr, name: target_name });
+        emit_divide_call(func, instructions,
+            dividend_addr, dividend_size, dividend_scale,
+            divisor_addr, divisor_size, divisor_scale,
+            target_addr, target_size, target_scale, target_dot_pos, rounded);
 
-        // Emit all parameter values
-        let v_src1_len = func.new_value();
-        instructions.push(MirInst::Const { dest: v_src1_len, value: MirConst::Int(src1_size as i64) });
-        let v_src1_scale = func.new_value();
-        instructions.push(MirInst::Const { dest: v_src1_scale, value: MirConst::Int(src1_scale as i64) });
+        // Handle REMAINDER: quotient is already computed in target,
+        // now compute remainder = dividend - quotient * divisor
+        // For simplicity, call cobolrt_remainder_scaled
+        if let Some(rem_ref) = remainder {
+            if let Some((rem_name, rem_size, rem_scale, rem_dot_pos)) = self.resolve_data_ref_full(rem_ref) {
+                let rem_addr = func.new_value();
+                instructions.push(MirInst::GlobalAddr { dest: rem_addr, name: rem_name });
 
-        let v_src2_len = func.new_value();
-        instructions.push(MirInst::Const { dest: v_src2_len, value: MirConst::Int(src2_size as i64) });
-        let v_src2_scale = func.new_value();
-        instructions.push(MirInst::Const { dest: v_src2_scale, value: MirConst::Int(src2_scale as i64) });
-
-        let v_dest_len = func.new_value();
-        instructions.push(MirInst::Const { dest: v_dest_len, value: MirConst::Int(target_size as i64) });
-        let v_dest_scale = func.new_value();
-        instructions.push(MirInst::Const { dest: v_dest_scale, value: MirConst::Int(target_scale as i64) });
-
-        let v_dot_pos = func.new_value();
-        instructions.push(MirInst::Const { dest: v_dot_pos, value: MirConst::Int(target_dot_pos as i64) });
-
-        let v_rounded = func.new_value();
-        instructions.push(MirInst::Const { dest: v_rounded, value: MirConst::Int(if rounded { 1 } else { 0 }) });
-
-        instructions.push(MirInst::CallRuntime {
-            dest: None,
-            func: "cobolrt_divide_scaled".to_string(),
-            args: vec![
-                src1_addr, v_src1_len, v_src1_scale,
-                src2_addr, v_src2_len, v_src2_scale,
-                target_addr, v_dest_len, v_dest_scale,
-                v_dot_pos, v_rounded,
-            ],
-        });
+                let v1 = func.new_value(); instructions.push(MirInst::Const { dest: v1, value: MirConst::Int(dividend_size as i64) });
+                let v2 = func.new_value(); instructions.push(MirInst::Const { dest: v2, value: MirConst::Int(dividend_scale as i64) });
+                let v3 = func.new_value(); instructions.push(MirInst::Const { dest: v3, value: MirConst::Int(divisor_size as i64) });
+                let v4 = func.new_value(); instructions.push(MirInst::Const { dest: v4, value: MirConst::Int(divisor_scale as i64) });
+                let v5 = func.new_value(); instructions.push(MirInst::Const { dest: v5, value: MirConst::Int(target_size as i64) });
+                let v6 = func.new_value(); instructions.push(MirInst::Const { dest: v6, value: MirConst::Int(target_scale as i64) });
+                let v7 = func.new_value(); instructions.push(MirInst::Const { dest: v7, value: MirConst::Int(rem_size as i64) });
+                let v8 = func.new_value(); instructions.push(MirInst::Const { dest: v8, value: MirConst::Int(rem_scale as i64) });
+                let v9 = func.new_value(); instructions.push(MirInst::Const { dest: v9, value: MirConst::Int(rem_dot_pos as i64) });
+                instructions.push(MirInst::CallRuntime {
+                    dest: None,
+                    func: "cobolrt_remainder_scaled".to_string(),
+                    args: vec![
+                        dividend_addr, v1, v2,
+                        divisor_addr, v3, v4,
+                        target_addr, v5, v6,
+                        rem_addr, v7, v8, v9,
+                    ],
+                });
+            }
+        }
     }
 
     /// Lower STRING statement: for each source, call cobolrt_string_append
@@ -3916,7 +3990,7 @@ impl<'a> MirLowerer<'a> {
                 cobol_hir::HirCondition::ConditionName(data_ref) => {
                     // 88-level condition name: resolve to comparison against parent
                     let cond_name = self.interner.resolve(data_ref.name).to_string();
-                    if let Some((parent_id, ref cond_value)) = self.hir.condition_names.get(&cond_name) {
+                    if let Some((parent_id, ref cond_value, ref thru_value)) = self.hir.condition_names.get(&cond_name) {
                         let parent_item = &self.hir.data_items[parent_id.into_raw()];
                         let parent_name = parent_item.name
                             .map(|n| self.interner.resolve(n).to_string())
@@ -3924,6 +3998,22 @@ impl<'a> MirLowerer<'a> {
                         let parent_size = parent_item.storage.byte_size;
 
                         if self.global_map.contains_key(&parent_name) {
+                            let format_cond_val = |cv: &Option<cobol_hir::InitialValue>, psize: u32| -> String {
+                                match cv {
+                                    Some(cobol_hir::InitialValue::Numeric(n, _)) => {
+                                        format!("{:0>width$}", n.unsigned_abs(), width = psize as usize)
+                                    }
+                                    Some(cobol_hir::InitialValue::String_(s)) => s.clone(),
+                                    Some(cobol_hir::InitialValue::Zero) => {
+                                        "0".repeat(psize as usize)
+                                    }
+                                    Some(cobol_hir::InitialValue::Space) => {
+                                        " ".repeat(psize as usize)
+                                    }
+                                    _ => "0".repeat(psize as usize),
+                                }
+                            };
+
                             let parent_addr = func.new_value();
                             instructions.push(MirInst::GlobalAddr {
                                 dest: parent_addr,
@@ -3935,51 +4025,75 @@ impl<'a> MirLowerer<'a> {
                                 value: MirConst::Int(parent_size as i64),
                             });
 
-                            let cond_str = match cond_value {
-                                Some(cobol_hir::InitialValue::Numeric(n, _)) => {
-                                    format!("{:0>width$}", n.unsigned_abs(), width = parent_size as usize)
-                                }
-                                Some(cobol_hir::InitialValue::String_(s)) => s.clone(),
-                                Some(cobol_hir::InitialValue::Zero) => {
-                                    "0".repeat(parent_size as usize)
-                                }
-                                Some(cobol_hir::InitialValue::Space) => {
-                                    " ".repeat(parent_size as usize)
-                                }
-                                _ => "0".repeat(parent_size as usize),
-                            };
+                            if thru_value.is_some() {
+                                // THRU range: parent >= low_value AND parent <= high_value
+                                let low_str = format_cond_val(cond_value, parent_size);
+                                let high_str = format_cond_val(thru_value, parent_size);
 
-                            let cond_val = func.new_value();
-                            instructions.push(MirInst::Const {
-                                dest: cond_val,
-                                value: MirConst::Str(cond_str.clone()),
-                            });
-                            let cond_len = func.new_value();
-                            instructions.push(MirInst::Const {
-                                dest: cond_len,
-                                value: MirConst::Int(cond_str.len() as i64),
-                            });
+                                // Compare parent >= low
+                                let low_val = func.new_value();
+                                instructions.push(MirInst::Const { dest: low_val, value: MirConst::Str(low_str.clone()) });
+                                let low_len = func.new_value();
+                                instructions.push(MirInst::Const { dest: low_len, value: MirConst::Int(low_str.len() as i64) });
+                                let cmp_low = func.new_value();
+                                instructions.push(MirInst::CallRuntime {
+                                    dest: Some(cmp_low),
+                                    func: "cobolrt_compare_numeric".to_string(),
+                                    args: vec![parent_addr, parent_len, low_val, low_len],
+                                });
+                                let zero1 = func.new_value();
+                                instructions.push(MirInst::Const { dest: zero1, value: MirConst::Int(0) });
+                                let ge_result = func.new_value();
+                                instructions.push(MirInst::ICmpGe { dest: ge_result, left: cmp_low, right: zero1 });
 
-                            let cmp_result = func.new_value();
-                            instructions.push(MirInst::CallRuntime {
-                                dest: Some(cmp_result),
-                                func: "cobolrt_compare_numeric".to_string(),
-                                args: vec![parent_addr, parent_len, cond_val, cond_len],
-                            });
+                                // Need a new parent_addr for the second comparison
+                                let parent_addr2 = func.new_value();
+                                instructions.push(MirInst::GlobalAddr { dest: parent_addr2, name: parent_name.clone() });
+                                let parent_len2 = func.new_value();
+                                instructions.push(MirInst::Const { dest: parent_len2, value: MirConst::Int(parent_size as i64) });
 
-                            let zero_val = func.new_value();
-                            instructions.push(MirInst::Const {
-                                dest: zero_val,
-                                value: MirConst::Int(0),
-                            });
+                                // Compare parent <= high
+                                let high_val = func.new_value();
+                                instructions.push(MirInst::Const { dest: high_val, value: MirConst::Str(high_str.clone()) });
+                                let high_len = func.new_value();
+                                instructions.push(MirInst::Const { dest: high_len, value: MirConst::Int(high_str.len() as i64) });
+                                let cmp_high = func.new_value();
+                                instructions.push(MirInst::CallRuntime {
+                                    dest: Some(cmp_high),
+                                    func: "cobolrt_compare_numeric".to_string(),
+                                    args: vec![parent_addr2, parent_len2, high_val, high_len],
+                                });
+                                let zero2 = func.new_value();
+                                instructions.push(MirInst::Const { dest: zero2, value: MirConst::Int(0) });
+                                let le_result = func.new_value();
+                                instructions.push(MirInst::ICmpLe { dest: le_result, left: cmp_high, right: zero2 });
 
-                            let bool_result = func.new_value();
-                            instructions.push(MirInst::ICmpEq {
-                                dest: bool_result,
-                                left: cmp_result,
-                                right: zero_val,
-                            });
-                            bool_result
+                                // AND the two conditions (1*1=1, else 0)
+                                let and_result = func.new_value();
+                                instructions.push(MirInst::IMul { dest: and_result, left: ge_result, right: le_result });
+                                and_result
+                            } else {
+                                // Single value comparison
+                                let cond_str = format_cond_val(cond_value, parent_size);
+                                let cond_val = func.new_value();
+                                instructions.push(MirInst::Const { dest: cond_val, value: MirConst::Str(cond_str.clone()) });
+                                let cond_len = func.new_value();
+                                instructions.push(MirInst::Const { dest: cond_len, value: MirConst::Int(cond_str.len() as i64) });
+
+                                let cmp_result = func.new_value();
+                                instructions.push(MirInst::CallRuntime {
+                                    dest: Some(cmp_result),
+                                    func: "cobolrt_compare_numeric".to_string(),
+                                    args: vec![parent_addr, parent_len, cond_val, cond_len],
+                                });
+
+                                let zero_val = func.new_value();
+                                instructions.push(MirInst::Const { dest: zero_val, value: MirConst::Int(0) });
+
+                                let bool_result = func.new_value();
+                                instructions.push(MirInst::ICmpEq { dest: bool_result, left: cmp_result, right: zero_val });
+                                bool_result
+                            }
                         } else {
                             let v = func.new_value();
                             instructions.push(MirInst::Const {
@@ -4193,7 +4307,7 @@ impl<'a> MirLowerer<'a> {
     /// After any body block, jump to the merge block.
     fn lower_evaluate(
         &mut self,
-        _subject: &cobol_hir::HirExpr,
+        _subjects: &[cobol_hir::HirExpr],
         whens: &[cobol_hir::WhenClause],
         func: &mut MirFunction,
         current_block_id: &mut BlockId,
@@ -4302,6 +4416,49 @@ impl<'a> MirLowerer<'a> {
         instructions: &mut Vec<MirInst>,
     ) {
         let target_name = self.interner.resolve(target.name).to_string();
+
+        // Handle SET condition-name TO TRUE
+        if matches!(action, cobol_hir::SetAction::ConditionTrue) {
+            if let Some((parent_id, ref cond_value, _thru)) = self.hir.condition_names.get(&target_name) {
+                let parent_item = &self.hir.data_items[parent_id.into_raw()];
+                let parent_name = parent_item.name
+                    .map(|n| self.interner.resolve(n).to_string())
+                    .unwrap_or_default();
+                let parent_size = parent_item.storage.byte_size;
+
+                if self.global_map.contains_key(&parent_name) {
+                    let parent_addr = func.new_value();
+                    instructions.push(MirInst::GlobalAddr { dest: parent_addr, name: parent_name.clone() });
+
+                    // Format the condition value as a string and move it to the parent
+                    let val_str = match cond_value {
+                        Some(cobol_hir::InitialValue::Numeric(n, _)) => {
+                            format!("{:0>width$}", n.unsigned_abs(), width = parent_size as usize)
+                        }
+                        Some(cobol_hir::InitialValue::String_(s)) => {
+                            format!("{:<width$}", s, width = parent_size as usize)
+                        }
+                        Some(cobol_hir::InitialValue::Zero) => "0".repeat(parent_size as usize),
+                        Some(cobol_hir::InitialValue::Space) => " ".repeat(parent_size as usize),
+                        _ => "0".repeat(parent_size as usize),
+                    };
+
+                    let val = func.new_value();
+                    instructions.push(MirInst::Const { dest: val, value: MirConst::Str(val_str.clone()) });
+                    let val_len = func.new_value();
+                    instructions.push(MirInst::Const { dest: val_len, value: MirConst::Int(val_str.len() as i64) });
+                    let parent_len = func.new_value();
+                    instructions.push(MirInst::Const { dest: parent_len, value: MirConst::Int(parent_size as i64) });
+                    instructions.push(MirInst::CallRuntime {
+                        dest: None,
+                        func: "cobolrt_move_alphanumeric".to_string(),
+                        args: vec![val, val_len, parent_addr, parent_len],
+                    });
+                }
+            }
+            return;
+        }
+
         let is_index = self.index_info.contains_key(&target_name);
 
         if !self.global_map.contains_key(&target_name) {
@@ -4361,6 +4518,7 @@ impl<'a> MirLowerer<'a> {
                         value: result,
                     });
                 }
+                cobol_hir::SetAction::ConditionTrue => unreachable!(),
             }
         } else {
             let target_size = if let Some(&idx) = self.global_map.get(&target_name) {
@@ -4423,6 +4581,7 @@ impl<'a> MirLowerer<'a> {
                         args: vec![result, target_addr, size_val2],
                     });
                 }
+                cobol_hir::SetAction::ConditionTrue => unreachable!(),
             }
         }
     }

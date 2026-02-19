@@ -320,6 +320,58 @@ void cobolrt_divide_scaled(
     int_to_display_edited(result, dest, dest_len, dest_dot_pos);
 }
 
+/* DIVIDE REMAINDER: remainder = dividend - quotient * divisor
+ * All values are in display format. quotient_addr already has the integer quotient.
+ */
+void cobolrt_remainder_scaled(
+    const char *dividend, unsigned int dividend_len, int dividend_scale,
+    const char *divisor, unsigned int divisor_len, int divisor_scale,
+    const char *quotient, unsigned int quotient_len, int quotient_scale,
+    char *remainder, unsigned int remainder_len, int remainder_scale,
+    int remainder_dot_pos
+) {
+    long long dv = display_to_int_skip(dividend, dividend_len);
+    long long ds = display_to_int_skip(divisor, divisor_len);
+    long long q = display_to_int_skip(quotient, quotient_len);
+
+    /* Adjust for scales:
+     * actual_dividend = dv / 10^dividend_scale
+     * actual_divisor = ds / 10^divisor_scale
+     * actual_quotient = q / 10^quotient_scale
+     * remainder = actual_dividend - actual_quotient * actual_divisor
+     * We want remainder as integer * 10^remainder_scale
+     */
+
+    /* Scale everything to remainder_scale for computation */
+    long long scale_dv = dv;
+    int dv_adjust = remainder_scale - dividend_scale;
+    if (dv_adjust > 0) { for (int i=0; i<dv_adjust; i++) scale_dv *= 10; }
+    else if (dv_adjust < 0) { for (int i=0; i<-dv_adjust; i++) scale_dv /= 10; }
+
+    long long scale_q = q;
+    int q_ds_scale = quotient_scale + divisor_scale;
+    int qs_adjust = remainder_scale - q_ds_scale;
+    long long q_times_ds = scale_q * ds;
+    if (qs_adjust > 0) { for (int i=0; i<qs_adjust; i++) q_times_ds *= 10; }
+    else if (qs_adjust < 0) { for (int i=0; i<-qs_adjust; i++) q_times_ds /= 10; }
+
+    long long rem = scale_dv - q_times_ds;
+    if (rem < 0) rem = -rem;
+
+    int_to_display_edited(rem, remainder, remainder_len, remainder_dot_pos);
+}
+
+/* Allocate a temp buffer for literal operands in arithmetic.
+ * Copies src_str into a static buffer and returns a pointer.
+ */
+static char _alloc_temp_buf[64];
+char* cobolrt_alloc_temp(const char *src, unsigned int src_len) {
+    unsigned int copy_len = src_len < 63 ? src_len : 63;
+    for (unsigned int i = 0; i < copy_len; i++) _alloc_temp_buf[i] = src[i];
+    _alloc_temp_buf[copy_len] = '\0';
+    return _alloc_temp_buf;
+}
+
 int cobolrt_compare_alphanumeric(
     const char *src1, unsigned int src1_len,
     const char *src2, unsigned int src2_len

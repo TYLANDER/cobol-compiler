@@ -420,6 +420,28 @@ impl CraneliftCodegen {
                 sig.params.push(AbiParam::new(types::I32)); // dest_dot_pos
                 sig.params.push(AbiParam::new(types::I32)); // rounded
             }
+            "cobolrt_remainder_scaled" => {
+                // (dividend_ptr, dv_len, dv_scale, divisor_ptr, ds_len, ds_scale,
+                //  quotient_ptr, q_len, q_scale, remainder_ptr, rem_len, rem_scale, rem_dot_pos)
+                sig.params.push(AbiParam::new(ptr));        // dividend
+                sig.params.push(AbiParam::new(types::I32)); // dividend_len
+                sig.params.push(AbiParam::new(types::I32)); // dividend_scale
+                sig.params.push(AbiParam::new(ptr));        // divisor
+                sig.params.push(AbiParam::new(types::I32)); // divisor_len
+                sig.params.push(AbiParam::new(types::I32)); // divisor_scale
+                sig.params.push(AbiParam::new(ptr));        // quotient
+                sig.params.push(AbiParam::new(types::I32)); // quotient_len
+                sig.params.push(AbiParam::new(types::I32)); // quotient_scale
+                sig.params.push(AbiParam::new(ptr));        // remainder
+                sig.params.push(AbiParam::new(types::I32)); // remainder_len
+                sig.params.push(AbiParam::new(types::I32)); // remainder_scale
+                sig.params.push(AbiParam::new(types::I32)); // remainder_dot_pos
+            }
+            "cobolrt_alloc_temp" => {
+                sig.params.push(AbiParam::new(ptr));        // src string
+                sig.params.push(AbiParam::new(types::I32)); // src_len
+                sig.returns.push(AbiParam::new(ptr));       // result ptr
+            }
             "cobolrt_decimal_add" | "cobolrt_decimal_sub" | "cobolrt_decimal_mul"
             | "cobolrt_decimal_div" | "cobolrt_decimal_pow" => {
                 // Display-format: (left_ptr, left_len, right_ptr, right_len, result_len) -> ptr

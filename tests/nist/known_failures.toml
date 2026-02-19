@@ -12,6 +12,7 @@
 
 # Tests expected to fail during compilation
 compile_fail = [
+    "NC130A",
 ]
 
 # Tests expected to fail at runtime (wrong output)
@@ -24,5 +25,6 @@ skip = [
 
 # Optional: reasons for known failures
 [reasons]
+# NC130A: Requires qualified names (OF phrase) and MOVE/ADD CORRESPONDING
 # NC127A-TEST-2 fails: INITIALIZE with REPLACING NUMERIC DATA BY not yet implemented
 # (only the sub-test fails; the rest of NC127A passes)
