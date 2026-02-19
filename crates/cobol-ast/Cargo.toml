@@ -1,0 +1,11 @@
+[package]
+name = "cobol-ast"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Typed AST view over the COBOL CST (zero-cost wrappers)"
+
+[dependencies]
+cobol-parser = { workspace = true }
+cobol-span = { workspace = true }
+rowan = { workspace = true }

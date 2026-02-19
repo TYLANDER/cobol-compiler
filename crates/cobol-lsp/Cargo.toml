@@ -1,0 +1,11 @@
+[package]
+name = "cobol-lsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Language Server Protocol implementation for COBOL"
+
+[dependencies]
+cobol-db = { workspace = true }
+cobol-span = { workspace = true }
+cobol-diag = { workspace = true }

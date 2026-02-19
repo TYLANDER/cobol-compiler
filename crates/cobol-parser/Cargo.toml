@@ -1,0 +1,12 @@
+[package]
+name = "cobol-parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Error-tolerant COBOL parser producing a lossless CST via rowan"
+
+[dependencies]
+cobol-lexer = { workspace = true }
+cobol-span = { workspace = true }
+rowan = { workspace = true }
+smol_str = { workspace = true }

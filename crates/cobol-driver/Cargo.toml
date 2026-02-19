@@ -1,0 +1,27 @@
+[package]
+name = "cobol-driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The cobolc CLI - the world's best open-source COBOL compiler"
+
+[[bin]]
+name = "cobolc"
+path = "src/main.rs"
+
+[dependencies]
+cobol-intern = { workspace = true }
+cobol-span = { workspace = true }
+cobol-vfs = { workspace = true }
+cobol-pp = { workspace = true }
+cobol-lexer = { workspace = true }
+cobol-parser = { workspace = true }
+cobol-ast = { workspace = true }
+cobol-hir = { workspace = true }
+cobol-mir = { workspace = true }
+cobol-codegen-llvm = { workspace = true }
+cobol-codegen-cranelift = { workspace = true }
+cobol-runtime = { workspace = true }
+cobol-diag = { workspace = true }
+cobol-db = { workspace = true }
+clap = { workspace = true }

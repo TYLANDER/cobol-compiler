@@ -1,0 +1,9 @@
+[package]
+name = "cobol-vfs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Virtual filesystem for the cobolc compiler (CLI + LSP)"
+
+[dependencies]
+cobol-span = { workspace = true }

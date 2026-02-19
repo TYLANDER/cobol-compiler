@@ -1,0 +1,17 @@
+[package]
+name = "cobol-codegen-cranelift"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Cranelift codegen backend for fast debug builds"
+
+[dependencies]
+cobol-mir = { workspace = true }
+cobol-codegen-llvm = { workspace = true }
+cobol-span = { workspace = true }
+cranelift-codegen = { workspace = true }
+cranelift-frontend = { workspace = true }
+cranelift-module = { workspace = true }
+cranelift-object = { workspace = true }
+cranelift-native = { workspace = true }
+target-lexicon = { workspace = true }

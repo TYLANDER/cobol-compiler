@@ -1,0 +1,18 @@
+[package]
+name = "cobol-db"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Incremental computation database for the cobolc compiler"
+
+[dependencies]
+cobol-intern = { workspace = true }
+cobol-span = { workspace = true }
+cobol-vfs = { workspace = true }
+cobol-pp = { workspace = true }
+cobol-lexer = { workspace = true }
+cobol-parser = { workspace = true }
+cobol-ast = { workspace = true }
+cobol-hir = { workspace = true }
+cobol-mir = { workspace = true }
+cobol-diag = { workspace = true }

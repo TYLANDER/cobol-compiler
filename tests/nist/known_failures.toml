@@ -1,0 +1,26 @@
+# Known failures for NIST CCVS test suite
+#
+# Tests listed here are expected to fail and will not count as regressions.
+# As compiler support improves, tests should be removed from these lists.
+#
+# Categories:
+#   compile_fail  - Tests that fail during compilation
+#   runtime_fail  - Tests that compile but produce wrong output or crash
+#   skip          - Tests to skip entirely (e.g., require features not yet planned)
+#
+# Optional: [reasons] section maps test name -> explanation
+
+# Tests expected to fail during compilation
+compile_fail = [
+]
+
+# Tests expected to fail at runtime (wrong output)
+runtime_fail = [
+]
+
+# Tests to skip entirely
+skip = [
+]
+
+# Optional: reasons for known failures
+[reasons]

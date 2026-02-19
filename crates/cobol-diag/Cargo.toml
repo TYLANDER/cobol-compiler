@@ -1,0 +1,10 @@
+[package]
+name = "cobol-diag"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rich diagnostics engine for the cobolc compiler"
+
+[dependencies]
+cobol-span = { workspace = true }
+codespan-reporting = { workspace = true }

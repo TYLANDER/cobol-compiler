@@ -1,0 +1,10 @@
+[package]
+name = "cobol-codegen-llvm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "LLVM codegen backend for the cobolc compiler"
+
+[dependencies]
+cobol-mir = { workspace = true }
+cobol-span = { workspace = true }

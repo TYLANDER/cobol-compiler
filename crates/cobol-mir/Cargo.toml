@@ -1,0 +1,12 @@
+[package]
+name = "cobol-mir"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SSA-based mid-level IR with COBOL-specific operations"
+
+[dependencies]
+cobol-intern = { workspace = true }
+cobol-span = { workspace = true }
+cobol-hir = { workspace = true }
+la-arena = { workspace = true }

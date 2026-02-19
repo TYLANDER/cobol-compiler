@@ -1,0 +1,9 @@
+[package]
+name = "cobol-intern"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Case-insensitive string interning for the cobolc compiler"
+
+[dependencies]
+smol_str = { workspace = true }

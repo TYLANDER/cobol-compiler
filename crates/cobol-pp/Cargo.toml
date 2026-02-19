@@ -1,0 +1,10 @@
+[package]
+name = "cobol-pp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "COBOL COPY/REPLACE preprocessor"
+
+[dependencies]
+cobol-span = { workspace = true }
+cobol-vfs = { workspace = true }

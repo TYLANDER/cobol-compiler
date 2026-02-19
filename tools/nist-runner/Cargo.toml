@@ -1,0 +1,12 @@
+[package]
+name = "nist-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NIST CCVS test runner for the cobolc compiler"
+
+[dependencies]
+clap = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
