@@ -1,0 +1,16 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. SMOKE-DIVIDE.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 WS-A PIC 9(4) VALUE 17.
+       01 WS-B PIC 9(4) VALUE 5.
+       01 WS-Q PIC 9(4).
+       01 WS-R PIC 9(4).
+       01 WS-X PIC 9(4) VALUE 100.
+       PROCEDURE DIVISION.
+           DIVIDE WS-A BY WS-B GIVING WS-Q REMAINDER WS-R.
+           DISPLAY WS-Q.
+           DISPLAY WS-R.
+           DIVIDE 2 INTO WS-X.
+           DISPLAY WS-X.
+           STOP RUN.

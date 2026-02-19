@@ -1,31 +1,45 @@
 use std::io::Write;
 
 /// Display a null-terminated string to stdout (DISPLAY ... UPON CONSOLE)
+///
+/// # Safety
+///
+/// - `data` must point to at least `len` readable bytes, or be null.
 #[no_mangle]
-pub extern "C" fn cobolrt_display(data: *const u8, len: u32) {
+pub unsafe extern "C" fn cobolrt_display(data: *const u8, len: u32) {
     if data.is_null() {
         return;
     }
-    let slice = unsafe { std::slice::from_raw_parts(data, len as usize) };
+    // SAFETY: Caller guarantees `data` points to `len` readable bytes.
+    let slice = std::slice::from_raw_parts(data, len as usize);
     let _ = std::io::stdout().write_all(slice);
 }
 
 /// Display a string followed by a newline
+///
+/// # Safety
+///
+/// - `data` must point to at least `len` readable bytes, or be null.
 #[no_mangle]
-pub extern "C" fn cobolrt_display_line(data: *const u8, len: u32) {
+pub unsafe extern "C" fn cobolrt_display_line(data: *const u8, len: u32) {
     if data.is_null() {
         println!();
         return;
     }
-    let slice = unsafe { std::slice::from_raw_parts(data, len as usize) };
+    // SAFETY: Caller guarantees `data` points to `len` readable bytes.
+    let slice = std::slice::from_raw_parts(data, len as usize);
     let _ = std::io::stdout().write_all(slice);
     let _ = std::io::stdout().write_all(b"\n");
     let _ = std::io::stdout().flush();
 }
 
 /// Display a numeric value formatted according to PIC
+///
+/// # Safety
+///
+/// - `data` must point to at least `len` readable bytes, or be null.
 #[no_mangle]
-pub extern "C" fn cobolrt_display_numeric(
+pub unsafe extern "C" fn cobolrt_display_numeric(
     data: *const u8,
     len: u32,
     pic_digits: u16,
@@ -36,8 +50,12 @@ pub extern "C" fn cobolrt_display_numeric(
 }
 
 /// ACCEPT FROM CONSOLE - read a line from stdin
+///
+/// # Safety
+///
+/// - `buffer` must point to at least `buffer_len` writable bytes, or be null.
 #[no_mangle]
-pub extern "C" fn cobolrt_accept(buffer: *mut u8, buffer_len: u32) -> u32 {
+pub unsafe extern "C" fn cobolrt_accept(buffer: *mut u8, buffer_len: u32) -> u32 {
     if buffer.is_null() {
         return 0;
     }
@@ -47,16 +65,15 @@ pub extern "C" fn cobolrt_accept(buffer: *mut u8, buffer_len: u32) -> u32 {
             let input = input.trim_end_matches('\n').trim_end_matches('\r');
             let bytes = input.as_bytes();
             let copy_len = std::cmp::min(bytes.len(), buffer_len as usize);
-            unsafe {
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer, copy_len);
-                // Pad with spaces (COBOL standard)
-                if copy_len < buffer_len as usize {
-                    std::ptr::write_bytes(
-                        buffer.add(copy_len),
-                        b' ',
-                        buffer_len as usize - copy_len,
-                    );
-                }
+            // SAFETY: Caller guarantees `buffer` points to `buffer_len` writable bytes.
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer, copy_len);
+            // Pad with spaces (COBOL standard)
+            if copy_len < buffer_len as usize {
+                std::ptr::write_bytes(
+                    buffer.add(copy_len),
+                    b' ',
+                    buffer_len as usize - copy_len,
+                );
             }
             copy_len as u32
         }
@@ -111,8 +128,12 @@ pub(crate) fn day_of_year(year: i64, month: u32, day: u32) -> u32 {
 fn day_of_week_from_days(days: i64) -> u32 {
     // 1970-01-01 was a Thursday (ISO day 4).
     let dow = ((days % 7) + 4) % 7; // 0=Sun, 1=Mon, ..., 6=Sat (intermediate)
-    // Convert to ISO: 1=Mon .. 7=Sun
-    if dow == 0 { 7 } else { dow as u32 }
+                                    // Convert to ISO: 1=Mon .. 7=Sun
+    if dow == 0 {
+        7
+    } else {
+        dow as u32
+    }
 }
 
 /// Get current Unix timestamp components: (total_seconds, subsec_millis).
@@ -127,14 +148,17 @@ pub(crate) fn unix_now() -> (i64, u32) {
 /// Write `formatted` bytes into the dest buffer.
 /// If dest_len < formatted.len(), truncate.
 /// If dest_len > formatted.len(), right-pad with spaces.
-fn write_to_dest(dest: *mut u8, dest_len: u32, formatted: &[u8]) {
+///
+/// # Safety
+///
+/// - `dest` must point to at least `dest_len` writable bytes.
+unsafe fn write_to_dest(dest: *mut u8, dest_len: u32, formatted: &[u8]) {
     let dest_len = dest_len as usize;
     let copy_len = std::cmp::min(formatted.len(), dest_len);
-    unsafe {
-        std::ptr::copy_nonoverlapping(formatted.as_ptr(), dest, copy_len);
-        if copy_len < dest_len {
-            std::ptr::write_bytes(dest.add(copy_len), b' ', dest_len - copy_len);
-        }
+    // SAFETY: Caller guarantees `dest` points to `dest_len` writable bytes.
+    std::ptr::copy_nonoverlapping(formatted.as_ptr(), dest, copy_len);
+    if copy_len < dest_len {
+        std::ptr::write_bytes(dest.add(copy_len), b' ', dest_len - copy_len);
     }
 }
 
@@ -143,8 +167,12 @@ fn write_to_dest(dest: *mut u8, dest_len: u32, formatted: &[u8]) {
 // ---------------------------------------------------------------------------
 
 /// ACCEPT identifier FROM DATE — writes YYMMDD (6 ASCII digits).
+///
+/// # Safety
+///
+/// - `dest` must point to at least `dest_len` writable bytes, or be null.
 #[no_mangle]
-pub extern "C" fn cobolrt_accept_date(dest: *mut u8, dest_len: u32) {
+pub unsafe extern "C" fn cobolrt_accept_date(dest: *mut u8, dest_len: u32) {
     if dest.is_null() {
         return;
     }
@@ -164,8 +192,12 @@ pub extern "C" fn cobolrt_accept_date(dest: *mut u8, dest_len: u32) {
 }
 
 /// ACCEPT identifier FROM DAY — writes YYDDD (Julian day, 5 ASCII digits).
+///
+/// # Safety
+///
+/// - `dest` must point to at least `dest_len` writable bytes, or be null.
 #[no_mangle]
-pub extern "C" fn cobolrt_accept_day(dest: *mut u8, dest_len: u32) {
+pub unsafe extern "C" fn cobolrt_accept_day(dest: *mut u8, dest_len: u32) {
     if dest.is_null() {
         return;
     }
@@ -185,8 +217,12 @@ pub extern "C" fn cobolrt_accept_day(dest: *mut u8, dest_len: u32) {
 }
 
 /// ACCEPT identifier FROM TIME — writes HHMMSSss (8 ASCII digits, ss = hundredths).
+///
+/// # Safety
+///
+/// - `dest` must point to at least `dest_len` writable bytes, or be null.
 #[no_mangle]
-pub extern "C" fn cobolrt_accept_time(dest: *mut u8, dest_len: u32) {
+pub unsafe extern "C" fn cobolrt_accept_time(dest: *mut u8, dest_len: u32) {
     if dest.is_null() {
         return;
     }
@@ -210,8 +246,12 @@ pub extern "C" fn cobolrt_accept_time(dest: *mut u8, dest_len: u32) {
 }
 
 /// ACCEPT identifier FROM DAY-OF-WEEK — writes a single ASCII digit (1=Mon .. 7=Sun).
+///
+/// # Safety
+///
+/// - `dest` must point to at least `dest_len` writable bytes, or be null.
 #[no_mangle]
-pub extern "C" fn cobolrt_accept_day_of_week(dest: *mut u8, dest_len: u32) {
+pub unsafe extern "C" fn cobolrt_accept_day_of_week(dest: *mut u8, dest_len: u32) {
     if dest.is_null() {
         return;
     }
@@ -291,21 +331,24 @@ mod tests {
     #[test]
     fn test_write_to_dest_exact() {
         let mut buf = [0u8; 6];
-        write_to_dest(buf.as_mut_ptr(), 6, b"260218");
+        // SAFETY: buf is valid for 6 writable bytes.
+        unsafe { write_to_dest(buf.as_mut_ptr(), 6, b"260218") };
         assert_eq!(&buf, b"260218");
     }
 
     #[test]
     fn test_write_to_dest_truncate() {
         let mut buf = [0u8; 4];
-        write_to_dest(buf.as_mut_ptr(), 4, b"260218");
+        // SAFETY: buf is valid for 4 writable bytes.
+        unsafe { write_to_dest(buf.as_mut_ptr(), 4, b"260218") };
         assert_eq!(&buf, b"2602");
     }
 
     #[test]
     fn test_write_to_dest_pad() {
         let mut buf = [0u8; 10];
-        write_to_dest(buf.as_mut_ptr(), 10, b"260218");
+        // SAFETY: buf is valid for 10 writable bytes.
+        unsafe { write_to_dest(buf.as_mut_ptr(), 10, b"260218") };
         assert_eq!(&buf, b"260218    ");
     }
 
@@ -314,10 +357,11 @@ mod tests {
     #[test]
     fn test_accept_date_format() {
         let mut buf = [0u8; 6];
-        cobolrt_accept_date(buf.as_mut_ptr(), 6);
+        // SAFETY: buf is valid for 6 writable bytes.
+        unsafe { cobolrt_accept_date(buf.as_mut_ptr(), 6) };
         // All 6 bytes should be ASCII digits
         for &b in &buf {
-            assert!(b >= b'0' && b <= b'9', "non-digit byte: {}", b);
+            assert!(b.is_ascii_digit(), "non-digit byte: {}", b);
         }
         // Month should be 01..12
         let mm = (buf[2] - b'0') * 10 + (buf[3] - b'0');
@@ -330,20 +374,22 @@ mod tests {
     #[test]
     fn test_accept_date_truncation() {
         let mut buf = [0u8; 4];
-        cobolrt_accept_date(buf.as_mut_ptr(), 4);
+        // SAFETY: buf is valid for 4 writable bytes.
+        unsafe { cobolrt_accept_date(buf.as_mut_ptr(), 4) };
         // Should get first 4 digits (YYMM)
         for &b in &buf {
-            assert!(b >= b'0' && b <= b'9', "non-digit byte: {}", b);
+            assert!(b.is_ascii_digit(), "non-digit byte: {}", b);
         }
     }
 
     #[test]
     fn test_accept_date_padding() {
         let mut buf = [0u8; 10];
-        cobolrt_accept_date(buf.as_mut_ptr(), 10);
+        // SAFETY: buf is valid for 10 writable bytes.
+        unsafe { cobolrt_accept_date(buf.as_mut_ptr(), 10) };
         // First 6 bytes: digits. Last 4: spaces.
         for &b in &buf[..6] {
-            assert!(b >= b'0' && b <= b'9', "non-digit byte: {}", b);
+            assert!(b.is_ascii_digit(), "non-digit byte: {}", b);
         }
         for &b in &buf[6..] {
             assert_eq!(b, b' ', "expected space padding");
@@ -352,36 +398,43 @@ mod tests {
 
     #[test]
     fn test_accept_date_null() {
-        cobolrt_accept_date(std::ptr::null_mut(), 6); // should not panic
+        // SAFETY: Null pointer is handled gracefully by the function.
+        unsafe { cobolrt_accept_date(std::ptr::null_mut(), 6) }; // should not panic
     }
 
     #[test]
     fn test_accept_day_format() {
         let mut buf = [0u8; 5];
-        cobolrt_accept_day(buf.as_mut_ptr(), 5);
+        // SAFETY: buf is valid for 5 writable bytes.
+        unsafe { cobolrt_accept_day(buf.as_mut_ptr(), 5) };
         // All 5 bytes should be ASCII digits
         for &b in &buf {
-            assert!(b >= b'0' && b <= b'9', "non-digit byte: {}", b);
+            assert!(b.is_ascii_digit(), "non-digit byte: {}", b);
         }
         // Day-of-year should be 001..366
-        let ddd = (buf[2] - b'0') as u32 * 100
-            + (buf[3] - b'0') as u32 * 10
-            + (buf[4] - b'0') as u32;
-        assert!((1..=366).contains(&ddd), "day-of-year out of range: {}", ddd);
+        let ddd =
+            (buf[2] - b'0') as u32 * 100 + (buf[3] - b'0') as u32 * 10 + (buf[4] - b'0') as u32;
+        assert!(
+            (1..=366).contains(&ddd),
+            "day-of-year out of range: {}",
+            ddd
+        );
     }
 
     #[test]
     fn test_accept_day_null() {
-        cobolrt_accept_day(std::ptr::null_mut(), 5); // should not panic
+        // SAFETY: Null pointer is handled gracefully by the function.
+        unsafe { cobolrt_accept_day(std::ptr::null_mut(), 5) }; // should not panic
     }
 
     #[test]
     fn test_accept_time_format() {
         let mut buf = [0u8; 8];
-        cobolrt_accept_time(buf.as_mut_ptr(), 8);
+        // SAFETY: buf is valid for 8 writable bytes.
+        unsafe { cobolrt_accept_time(buf.as_mut_ptr(), 8) };
         // All 8 bytes should be ASCII digits
         for &b in &buf {
-            assert!(b >= b'0' && b <= b'9', "non-digit byte: {}", b);
+            assert!(b.is_ascii_digit(), "non-digit byte: {}", b);
         }
         // Hours should be 00..23
         let hh = (buf[0] - b'0') * 10 + (buf[1] - b'0');
@@ -399,23 +452,30 @@ mod tests {
 
     #[test]
     fn test_accept_time_null() {
-        cobolrt_accept_time(std::ptr::null_mut(), 8); // should not panic
+        // SAFETY: Null pointer is handled gracefully by the function.
+        unsafe { cobolrt_accept_time(std::ptr::null_mut(), 8) }; // should not panic
     }
 
     #[test]
     fn test_accept_day_of_week_format() {
         let mut buf = [0u8; 1];
-        cobolrt_accept_day_of_week(buf.as_mut_ptr(), 1);
+        // SAFETY: buf is valid for 1 writable byte.
+        unsafe { cobolrt_accept_day_of_week(buf.as_mut_ptr(), 1) };
         // Should be '1'..'7'
-        assert!(buf[0] >= b'1' && buf[0] <= b'7', "day-of-week out of range: {}", buf[0]);
+        assert!(
+            (b'1'..=b'7').contains(&buf[0]),
+            "day-of-week out of range: {}",
+            buf[0]
+        );
     }
 
     #[test]
     fn test_accept_day_of_week_padding() {
         let mut buf = [0u8; 5];
-        cobolrt_accept_day_of_week(buf.as_mut_ptr(), 5);
+        // SAFETY: buf is valid for 5 writable bytes.
+        unsafe { cobolrt_accept_day_of_week(buf.as_mut_ptr(), 5) };
         // First byte: digit 1-7. Rest: spaces.
-        assert!(buf[0] >= b'1' && buf[0] <= b'7');
+        assert!((b'1'..=b'7').contains(&buf[0]));
         for &b in &buf[1..] {
             assert_eq!(b, b' ', "expected space padding");
         }
@@ -423,6 +483,7 @@ mod tests {
 
     #[test]
     fn test_accept_day_of_week_null() {
-        cobolrt_accept_day_of_week(std::ptr::null_mut(), 1); // should not panic
+        // SAFETY: Null pointer is handled gracefully by the function.
+        unsafe { cobolrt_accept_day_of_week(std::ptr::null_mut(), 1) }; // should not panic
     }
 }

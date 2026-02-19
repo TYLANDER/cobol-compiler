@@ -124,7 +124,10 @@ fn main() {
     let known_failures = match &cli.known_failures {
         Some(path) => {
             let content = fs::read_to_string(path).unwrap_or_else(|e| {
-                eprintln!("Warning: Could not read known_failures file {:?}: {}", path, e);
+                eprintln!(
+                    "Warning: Could not read known_failures file {:?}: {}",
+                    path, e
+                );
                 String::new()
             });
             if content.is_empty() {
@@ -143,7 +146,10 @@ fn main() {
     let test_files = discover_tests(&cli.suite_dir, &cli.module, cli.filter.as_deref());
 
     if test_files.is_empty() {
-        eprintln!("No test files found in {:?} for module '{}'", cli.suite_dir, cli.module);
+        eprintln!(
+            "No test files found in {:?} for module '{}'",
+            cli.suite_dir, cli.module
+        );
         std::process::exit(1);
     }
 
@@ -240,7 +246,10 @@ fn discover_tests(suite_dir: &Path, module: &str, filter: Option<&str>) -> Vec<P
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().map_or(false, |ext| ext == "cob" || ext == "CBL" || ext == "cbl") {
+        if path
+            .extension()
+            .map_or(false, |ext| ext == "cob" || ext == "CBL" || ext == "cbl")
+        {
             let name = path
                 .file_stem()
                 .unwrap_or_default()
@@ -249,11 +258,7 @@ fn discover_tests(suite_dir: &Path, module: &str, filter: Option<&str>) -> Vec<P
 
             // Filter by module prefix (first 2 characters, e.g., "NC", "SM")
             if module != "all" {
-                let prefix = if name.len() >= 2 {
-                    &name[..2]
-                } else {
-                    &name
-                };
+                let prefix = if name.len() >= 2 { &name[..2] } else { &name };
                 if !prefix.eq_ignore_ascii_case(&module) {
                     continue;
                 }
@@ -531,7 +536,7 @@ fn parse_nist_output(stdout: &str) -> (u32, u32) {
 
 fn print_result(result: &TestResult) {
     let color = match result.outcome {
-        TestOutcome::Pass => "\x1b[32m",          // green
+        TestOutcome::Pass => "\x1b[32m",           // green
         TestOutcome::Fail => "\x1b[31m",           // red
         TestOutcome::ExpectedFail => "\x1b[33m",   // yellow
         TestOutcome::UnexpectedPass => "\x1b[35m", // magenta
@@ -562,7 +567,10 @@ fn print_result(result: &TestResult) {
 
 fn build_summary(results: Vec<TestResult>) -> Summary {
     let total = results.len();
-    let pass = results.iter().filter(|r| r.outcome == TestOutcome::Pass).count();
+    let pass = results
+        .iter()
+        .filter(|r| r.outcome == TestOutcome::Pass)
+        .count();
     let fail = results
         .iter()
         .filter(|r| r.outcome == TestOutcome::Fail)

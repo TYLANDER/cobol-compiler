@@ -211,8 +211,14 @@ fn write_to_thread_local(value: i128, scale: u32, result_len: u32) -> *mut u8 {
 /// Add two display-format numeric values, store result in dest.
 ///
 /// Display format means ASCII digit strings like "00123" or "12.50".
+///
+/// # Safety
+///
+/// - `left` must point to at least `left_len` readable bytes, or be null.
+/// - `right` must point to at least `right_len` readable bytes, or be null.
+/// - `dest` must point to at least `dest_len` writable bytes, or be null.
 #[no_mangle]
-pub extern "C" fn cobolrt_add_numeric(
+pub unsafe extern "C" fn cobolrt_add_numeric(
     left: *const u8,
     left_len: u32,
     right: *const u8,
@@ -223,9 +229,12 @@ pub extern "C" fn cobolrt_add_numeric(
     if left.is_null() || right.is_null() || dest.is_null() {
         return;
     }
-    let l_slice = unsafe { std::slice::from_raw_parts(left, left_len as usize) };
-    let r_slice = unsafe { std::slice::from_raw_parts(right, right_len as usize) };
-    let d_slice = unsafe { std::slice::from_raw_parts_mut(dest, dest_len as usize) };
+    // SAFETY: Caller guarantees `left` points to `left_len` readable bytes.
+    let l_slice = std::slice::from_raw_parts(left, left_len as usize);
+    // SAFETY: Caller guarantees `right` points to `right_len` readable bytes.
+    let r_slice = std::slice::from_raw_parts(right, right_len as usize);
+    // SAFETY: Caller guarantees `dest` points to `dest_len` writable bytes.
+    let d_slice = std::slice::from_raw_parts_mut(dest, dest_len as usize);
 
     let l = parse_display(l_slice);
     let r = parse_display(r_slice);
@@ -237,8 +246,14 @@ pub extern "C" fn cobolrt_add_numeric(
 }
 
 /// Subtract right from left, store result in dest.
+///
+/// # Safety
+///
+/// - `left` must point to at least `left_len` readable bytes, or be null.
+/// - `right` must point to at least `right_len` readable bytes, or be null.
+/// - `dest` must point to at least `dest_len` writable bytes, or be null.
 #[no_mangle]
-pub extern "C" fn cobolrt_subtract_numeric(
+pub unsafe extern "C" fn cobolrt_subtract_numeric(
     left: *const u8,
     left_len: u32,
     right: *const u8,
@@ -249,9 +264,12 @@ pub extern "C" fn cobolrt_subtract_numeric(
     if left.is_null() || right.is_null() || dest.is_null() {
         return;
     }
-    let l_slice = unsafe { std::slice::from_raw_parts(left, left_len as usize) };
-    let r_slice = unsafe { std::slice::from_raw_parts(right, right_len as usize) };
-    let d_slice = unsafe { std::slice::from_raw_parts_mut(dest, dest_len as usize) };
+    // SAFETY: Caller guarantees `left` points to `left_len` readable bytes.
+    let l_slice = std::slice::from_raw_parts(left, left_len as usize);
+    // SAFETY: Caller guarantees `right` points to `right_len` readable bytes.
+    let r_slice = std::slice::from_raw_parts(right, right_len as usize);
+    // SAFETY: Caller guarantees `dest` points to `dest_len` writable bytes.
+    let d_slice = std::slice::from_raw_parts_mut(dest, dest_len as usize);
 
     let l = parse_display(l_slice);
     let r = parse_display(r_slice);
@@ -263,8 +281,14 @@ pub extern "C" fn cobolrt_subtract_numeric(
 }
 
 /// Multiply left by right, store result in dest.
+///
+/// # Safety
+///
+/// - `left` must point to at least `left_len` readable bytes, or be null.
+/// - `right` must point to at least `right_len` readable bytes, or be null.
+/// - `dest` must point to at least `dest_len` writable bytes, or be null.
 #[no_mangle]
-pub extern "C" fn cobolrt_multiply_numeric(
+pub unsafe extern "C" fn cobolrt_multiply_numeric(
     left: *const u8,
     left_len: u32,
     right: *const u8,
@@ -275,9 +299,12 @@ pub extern "C" fn cobolrt_multiply_numeric(
     if left.is_null() || right.is_null() || dest.is_null() {
         return;
     }
-    let l_slice = unsafe { std::slice::from_raw_parts(left, left_len as usize) };
-    let r_slice = unsafe { std::slice::from_raw_parts(right, right_len as usize) };
-    let d_slice = unsafe { std::slice::from_raw_parts_mut(dest, dest_len as usize) };
+    // SAFETY: Caller guarantees `left` points to `left_len` readable bytes.
+    let l_slice = std::slice::from_raw_parts(left, left_len as usize);
+    // SAFETY: Caller guarantees `right` points to `right_len` readable bytes.
+    let r_slice = std::slice::from_raw_parts(right, right_len as usize);
+    // SAFETY: Caller guarantees `dest` points to `dest_len` writable bytes.
+    let d_slice = std::slice::from_raw_parts_mut(dest, dest_len as usize);
 
     let l = parse_display(l_slice);
     let r = parse_display(r_slice);
@@ -302,8 +329,14 @@ pub extern "C" fn cobolrt_multiply_numeric(
 /// The signature matches the Cranelift codegen declaration:
 ///   (src1, src1_len, src1_scale, src2, src2_len, src2_scale,
 ///    dest, dest_len, dest_scale, dest_dot_pos, rounded)
+///
+/// # Safety
+///
+/// - `src1` must point to at least `src1_len` readable bytes, or be null.
+/// - `src2` must point to at least `src2_len` readable bytes, or be null.
+/// - `dest` must point to at least `dest_len` writable bytes, or be null.
 #[no_mangle]
-pub extern "C" fn cobolrt_divide_scaled(
+pub unsafe extern "C" fn cobolrt_divide_scaled(
     src1: *const u8,
     src1_len: u32,
     src1_scale: i32,
@@ -319,9 +352,12 @@ pub extern "C" fn cobolrt_divide_scaled(
     if src1.is_null() || src2.is_null() || dest.is_null() {
         return;
     }
-    let s1 = unsafe { std::slice::from_raw_parts(src1, src1_len as usize) };
-    let s2 = unsafe { std::slice::from_raw_parts(src2, src2_len as usize) };
-    let d = unsafe { std::slice::from_raw_parts_mut(dest, dest_len as usize) };
+    // SAFETY: Caller guarantees `src1` points to `src1_len` readable bytes.
+    let s1 = std::slice::from_raw_parts(src1, src1_len as usize);
+    // SAFETY: Caller guarantees `src2` points to `src2_len` readable bytes.
+    let s2 = std::slice::from_raw_parts(src2, src2_len as usize);
+    // SAFETY: Caller guarantees `dest` points to `dest_len` writable bytes.
+    let d = std::slice::from_raw_parts_mut(dest, dest_len as usize);
 
     // Read raw digit values (skipping '.' and other non-digit chars).
     let dividend = parse_display_skip_dot(s1);
@@ -420,12 +456,19 @@ fn write_display_edited(value: i128, dest: &mut [u8], dot_pos: i32) {
 
 /// Return a pointer to a negated copy of the display-format number.
 /// Uses a thread-local buffer.
+///
+/// # Safety
+///
+/// - `src` must point to at least `src_len` readable bytes, or be null.
+/// - The returned pointer is only valid until the next call to this function
+///   on the same thread.
 #[no_mangle]
-pub extern "C" fn cobolrt_negate_numeric(src: *const u8, src_len: u32) -> *mut u8 {
+pub unsafe extern "C" fn cobolrt_negate_numeric(src: *const u8, src_len: u32) -> *mut u8 {
     if src.is_null() {
         return std::ptr::null_mut();
     }
-    let slice = unsafe { std::slice::from_raw_parts(src, src_len as usize) };
+    // SAFETY: Caller guarantees `src` points to `src_len` readable bytes.
+    let slice = std::slice::from_raw_parts(src, src_len as usize);
 
     let parsed = parse_display(slice);
 
@@ -510,12 +553,17 @@ pub extern "C" fn cobolrt_negate_numeric(src: *const u8, src_len: u32) -> *mut u
 
 /// Parse a display-format number to a 64-bit integer.
 /// Skips decimal points and non-digit characters.
+///
+/// # Safety
+///
+/// - `src` must point to at least `src_len` readable bytes, or be null.
 #[no_mangle]
-pub extern "C" fn cobolrt_display_to_int(src: *const u8, src_len: u32) -> i64 {
+pub unsafe extern "C" fn cobolrt_display_to_int(src: *const u8, src_len: u32) -> i64 {
     if src.is_null() {
         return 0;
     }
-    let slice = unsafe { std::slice::from_raw_parts(src, src_len as usize) };
+    // SAFETY: Caller guarantees `src` points to `src_len` readable bytes.
+    let slice = std::slice::from_raw_parts(src, src_len as usize);
 
     let mut negative = false;
     let mut result: i64 = 0;
@@ -542,8 +590,14 @@ pub extern "C" fn cobolrt_display_to_int(src: *const u8, src_len: u32) -> i64 {
 /// the pointer variable. The pointer is a display-format numeric field
 /// containing a 1-based position. After appending, the pointer is
 /// updated to reflect the new position.
+///
+/// # Safety
+///
+/// - `src` must point to at least `src_len` readable bytes, or be null.
+/// - `dest` must point to at least `dest_len` writable bytes, or be null.
+/// - `ptr` must point to at least `ptr_len` writable bytes, or be null.
 #[no_mangle]
-pub extern "C" fn cobolrt_string_append(
+pub unsafe extern "C" fn cobolrt_string_append(
     src: *const u8,
     src_len: u32,
     dest: *mut u8,
@@ -554,9 +608,12 @@ pub extern "C" fn cobolrt_string_append(
     if src.is_null() || dest.is_null() || ptr.is_null() {
         return;
     }
-    let src_slice = unsafe { std::slice::from_raw_parts(src, src_len as usize) };
-    let dest_slice = unsafe { std::slice::from_raw_parts_mut(dest, dest_len as usize) };
-    let ptr_slice = unsafe { std::slice::from_raw_parts_mut(ptr, ptr_len as usize) };
+    // SAFETY: Caller guarantees `src` points to `src_len` readable bytes.
+    let src_slice = std::slice::from_raw_parts(src, src_len as usize);
+    // SAFETY: Caller guarantees `dest` points to `dest_len` writable bytes.
+    let dest_slice = std::slice::from_raw_parts_mut(dest, dest_len as usize);
+    // SAFETY: Caller guarantees `ptr` points to `ptr_len` writable bytes.
+    let ptr_slice = std::slice::from_raw_parts_mut(ptr, ptr_len as usize);
 
     // Read current pointer value (1-based, display-format numeric).
     let pos = cobolrt_display_to_int(ptr_slice.as_ptr(), ptr_len);
@@ -616,8 +673,15 @@ fn int_to_display(value: i64, dest: &mut [u8]) {
 
 /// Perform addition on two display-format values and return a pointer to
 /// a thread-local result buffer.
+///
+/// # Safety
+///
+/// - `left` must point to at least `left_len` readable bytes, or be null.
+/// - `right` must point to at least `right_len` readable bytes, or be null.
+/// - The returned pointer is only valid until the next call to a
+///   `cobolrt_decimal_*_display` function on the same thread.
 #[no_mangle]
-pub extern "C" fn cobolrt_decimal_add_display(
+pub unsafe extern "C" fn cobolrt_decimal_add_display(
     left: *const u8,
     left_len: u32,
     right: *const u8,
@@ -627,8 +691,10 @@ pub extern "C" fn cobolrt_decimal_add_display(
     if left.is_null() || right.is_null() {
         return std::ptr::null_mut();
     }
-    let l_slice = unsafe { std::slice::from_raw_parts(left, left_len as usize) };
-    let r_slice = unsafe { std::slice::from_raw_parts(right, right_len as usize) };
+    // SAFETY: Caller guarantees `left` points to `left_len` readable bytes.
+    let l_slice = std::slice::from_raw_parts(left, left_len as usize);
+    // SAFETY: Caller guarantees `right` points to `right_len` readable bytes.
+    let r_slice = std::slice::from_raw_parts(right, right_len as usize);
 
     let l = parse_display(l_slice);
     let r = parse_display(r_slice);
@@ -639,8 +705,15 @@ pub extern "C" fn cobolrt_decimal_add_display(
 }
 
 /// Subtraction variant returning pointer to thread-local buffer.
+///
+/// # Safety
+///
+/// - `left` must point to at least `left_len` readable bytes, or be null.
+/// - `right` must point to at least `right_len` readable bytes, or be null.
+/// - The returned pointer is only valid until the next call to a
+///   `cobolrt_decimal_*_display` function on the same thread.
 #[no_mangle]
-pub extern "C" fn cobolrt_decimal_sub_display(
+pub unsafe extern "C" fn cobolrt_decimal_sub_display(
     left: *const u8,
     left_len: u32,
     right: *const u8,
@@ -650,8 +723,10 @@ pub extern "C" fn cobolrt_decimal_sub_display(
     if left.is_null() || right.is_null() {
         return std::ptr::null_mut();
     }
-    let l_slice = unsafe { std::slice::from_raw_parts(left, left_len as usize) };
-    let r_slice = unsafe { std::slice::from_raw_parts(right, right_len as usize) };
+    // SAFETY: Caller guarantees `left` points to `left_len` readable bytes.
+    let l_slice = std::slice::from_raw_parts(left, left_len as usize);
+    // SAFETY: Caller guarantees `right` points to `right_len` readable bytes.
+    let r_slice = std::slice::from_raw_parts(right, right_len as usize);
 
     let l = parse_display(l_slice);
     let r = parse_display(r_slice);
@@ -662,8 +737,15 @@ pub extern "C" fn cobolrt_decimal_sub_display(
 }
 
 /// Multiplication variant returning pointer to thread-local buffer.
+///
+/// # Safety
+///
+/// - `left` must point to at least `left_len` readable bytes, or be null.
+/// - `right` must point to at least `right_len` readable bytes, or be null.
+/// - The returned pointer is only valid until the next call to a
+///   `cobolrt_decimal_*_display` function on the same thread.
 #[no_mangle]
-pub extern "C" fn cobolrt_decimal_mul_display(
+pub unsafe extern "C" fn cobolrt_decimal_mul_display(
     left: *const u8,
     left_len: u32,
     right: *const u8,
@@ -673,8 +755,10 @@ pub extern "C" fn cobolrt_decimal_mul_display(
     if left.is_null() || right.is_null() {
         return std::ptr::null_mut();
     }
-    let l_slice = unsafe { std::slice::from_raw_parts(left, left_len as usize) };
-    let r_slice = unsafe { std::slice::from_raw_parts(right, right_len as usize) };
+    // SAFETY: Caller guarantees `left` points to `left_len` readable bytes.
+    let l_slice = std::slice::from_raw_parts(left, left_len as usize);
+    // SAFETY: Caller guarantees `right` points to `right_len` readable bytes.
+    let r_slice = std::slice::from_raw_parts(right, right_len as usize);
 
     let l = parse_display(l_slice);
     let r = parse_display(r_slice);
@@ -694,8 +778,15 @@ pub extern "C" fn cobolrt_decimal_mul_display(
 }
 
 /// Division variant returning pointer to thread-local buffer.
+///
+/// # Safety
+///
+/// - `left` must point to at least `left_len` readable bytes, or be null.
+/// - `right` must point to at least `right_len` readable bytes, or be null.
+/// - The returned pointer is only valid until the next call to a
+///   `cobolrt_decimal_*_display` function on the same thread.
 #[no_mangle]
-pub extern "C" fn cobolrt_decimal_div_display(
+pub unsafe extern "C" fn cobolrt_decimal_div_display(
     left: *const u8,
     left_len: u32,
     right: *const u8,
@@ -705,8 +796,10 @@ pub extern "C" fn cobolrt_decimal_div_display(
     if left.is_null() || right.is_null() {
         return std::ptr::null_mut();
     }
-    let l_slice = unsafe { std::slice::from_raw_parts(left, left_len as usize) };
-    let r_slice = unsafe { std::slice::from_raw_parts(right, right_len as usize) };
+    // SAFETY: Caller guarantees `left` points to `left_len` readable bytes.
+    let l_slice = std::slice::from_raw_parts(left, left_len as usize);
+    // SAFETY: Caller guarantees `right` points to `right_len` readable bytes.
+    let r_slice = std::slice::from_raw_parts(right, right_len as usize);
 
     let l = parse_display(l_slice);
     let r = parse_display(r_slice);
@@ -732,8 +825,15 @@ pub extern "C" fn cobolrt_decimal_div_display(
 }
 
 /// Exponentiation: base ** exp, returning pointer to thread-local buffer.
+///
+/// # Safety
+///
+/// - `base` must point to at least `base_len` readable bytes, or be null.
+/// - `exp` must point to at least `exp_len` readable bytes, or be null.
+/// - The returned pointer is only valid until the next call to a
+///   `cobolrt_decimal_*_display` function on the same thread.
 #[no_mangle]
-pub extern "C" fn cobolrt_decimal_pow(
+pub unsafe extern "C" fn cobolrt_decimal_pow(
     base: *const u8,
     base_len: u32,
     exp: *const u8,
@@ -743,8 +843,10 @@ pub extern "C" fn cobolrt_decimal_pow(
     if base.is_null() || exp.is_null() {
         return std::ptr::null_mut();
     }
-    let b_slice = unsafe { std::slice::from_raw_parts(base, base_len as usize) };
-    let e_slice = unsafe { std::slice::from_raw_parts(exp, exp_len as usize) };
+    // SAFETY: Caller guarantees `base` points to `base_len` readable bytes.
+    let b_slice = std::slice::from_raw_parts(base, base_len as usize);
+    // SAFETY: Caller guarantees `exp` points to `exp_len` readable bytes.
+    let e_slice = std::slice::from_raw_parts(exp, exp_len as usize);
 
     let b = parse_display(b_slice);
     let e = parse_display(e_slice);
@@ -793,40 +895,49 @@ mod tests {
 
     fn add(a: &[u8], b: &[u8], dest_len: usize) -> Vec<u8> {
         let mut dest = vec![b'0'; dest_len];
-        cobolrt_add_numeric(
-            a.as_ptr(),
-            a.len() as u32,
-            b.as_ptr(),
-            b.len() as u32,
-            dest.as_mut_ptr(),
-            dest_len as u32,
-        );
+        // SAFETY: Test slices are valid for the given lengths.
+        unsafe {
+            cobolrt_add_numeric(
+                a.as_ptr(),
+                a.len() as u32,
+                b.as_ptr(),
+                b.len() as u32,
+                dest.as_mut_ptr(),
+                dest_len as u32,
+            );
+        }
         dest
     }
 
     fn sub(a: &[u8], b: &[u8], dest_len: usize) -> Vec<u8> {
         let mut dest = vec![b'0'; dest_len];
-        cobolrt_subtract_numeric(
-            a.as_ptr(),
-            a.len() as u32,
-            b.as_ptr(),
-            b.len() as u32,
-            dest.as_mut_ptr(),
-            dest_len as u32,
-        );
+        // SAFETY: Test slices are valid for the given lengths.
+        unsafe {
+            cobolrt_subtract_numeric(
+                a.as_ptr(),
+                a.len() as u32,
+                b.as_ptr(),
+                b.len() as u32,
+                dest.as_mut_ptr(),
+                dest_len as u32,
+            );
+        }
         dest
     }
 
     fn mul(a: &[u8], b: &[u8], dest_len: usize) -> Vec<u8> {
         let mut dest = vec![b'0'; dest_len];
-        cobolrt_multiply_numeric(
-            a.as_ptr(),
-            a.len() as u32,
-            b.as_ptr(),
-            b.len() as u32,
-            dest.as_mut_ptr(),
-            dest_len as u32,
-        );
+        // SAFETY: Test slices are valid for the given lengths.
+        unsafe {
+            cobolrt_multiply_numeric(
+                a.as_ptr(),
+                a.len() as u32,
+                b.as_ptr(),
+                b.len() as u32,
+                dest.as_mut_ptr(),
+                dest_len as u32,
+            );
+        }
         dest
     }
 
@@ -856,14 +967,10 @@ mod tests {
     #[test]
     fn add_null_safety() {
         let mut dest = vec![b'0'; 5];
-        cobolrt_add_numeric(
-            std::ptr::null(),
-            0,
-            b"1".as_ptr(),
-            1,
-            dest.as_mut_ptr(),
-            5,
-        );
+        // SAFETY: Null pointer is handled gracefully by the function.
+        unsafe {
+            cobolrt_add_numeric(std::ptr::null(), 0, b"1".as_ptr(), 1, dest.as_mut_ptr(), 5);
+        }
         // dest should be unchanged
         assert_eq!(dest, b"00000");
     }
@@ -906,32 +1013,27 @@ mod tests {
 
     #[test]
     fn display_to_int_simple() {
-        assert_eq!(
-            cobolrt_display_to_int(b"00042".as_ptr(), 5),
-            42
-        );
+        // SAFETY: Byte literal is valid for 5 bytes.
+        assert_eq!(unsafe { cobolrt_display_to_int(b"00042".as_ptr(), 5) }, 42);
     }
 
     #[test]
     fn display_to_int_with_sign() {
-        assert_eq!(
-            cobolrt_display_to_int(b"-0123".as_ptr(), 5),
-            -123
-        );
+        // SAFETY: Byte literal is valid for 5 bytes.
+        assert_eq!(unsafe { cobolrt_display_to_int(b"-0123".as_ptr(), 5) }, -123);
     }
 
     #[test]
     fn display_to_int_null() {
-        assert_eq!(cobolrt_display_to_int(std::ptr::null(), 0), 0);
+        // SAFETY: Null pointer is handled gracefully by the function.
+        assert_eq!(unsafe { cobolrt_display_to_int(std::ptr::null(), 0) }, 0);
     }
 
     #[test]
     fn display_to_int_with_decimal() {
         // Decimal point is skipped; digits are concatenated.
-        assert_eq!(
-            cobolrt_display_to_int(b"12.50".as_ptr(), 5),
-            1250
-        );
+        // SAFETY: Byte literal is valid for 5 bytes.
+        assert_eq!(unsafe { cobolrt_display_to_int(b"12.50".as_ptr(), 5) }, 1250);
     }
 
     // -- string_append tests --
@@ -942,14 +1044,10 @@ mod tests {
         let mut dest = *b"HELLO     ";
         let mut ptr = *b"06"; // 1-based position 6
 
-        cobolrt_string_append(
-            src.as_ptr(),
-            5,
-            dest.as_mut_ptr(),
-            10,
-            ptr.as_mut_ptr(),
-            2,
-        );
+        // SAFETY: All pointers are valid for their respective lengths.
+        unsafe {
+            cobolrt_string_append(src.as_ptr(), 5, dest.as_mut_ptr(), 10, ptr.as_mut_ptr(), 2);
+        }
 
         assert_eq!(&dest, b"HELLOWORLD");
         assert_eq!(&ptr, b"11"); // pointer advanced to 11
@@ -961,14 +1059,10 @@ mod tests {
         let mut dest = *b"XX   ";
         let mut ptr = *b"03"; // position 3 (1-based)
 
-        cobolrt_string_append(
-            src.as_ptr(),
-            5,
-            dest.as_mut_ptr(),
-            5,
-            ptr.as_mut_ptr(),
-            2,
-        );
+        // SAFETY: All pointers are valid for their respective lengths.
+        unsafe {
+            cobolrt_string_append(src.as_ptr(), 5, dest.as_mut_ptr(), 5, ptr.as_mut_ptr(), 2);
+        }
 
         // Only 3 chars fit (positions 3, 4, 5)
         assert_eq!(&dest, b"XXABC");
@@ -984,13 +1078,22 @@ mod tests {
         let src2 = b"002";
         let mut dest = [b'0'; 5];
 
-        cobolrt_divide_scaled(
-            src1.as_ptr(), 3, 0, // src1, len=3, scale=0
-            src2.as_ptr(), 3, 0, // src2, len=3, scale=0
-            dest.as_mut_ptr(), 5, 0, // dest, len=5, scale=0
-            -1, // no dot
-            0,  // not rounded
-        );
+        // SAFETY: All pointers are valid for their respective lengths.
+        unsafe {
+            cobolrt_divide_scaled(
+                src1.as_ptr(),
+                3,
+                0, // src1, len=3, scale=0
+                src2.as_ptr(),
+                3,
+                0, // src2, len=3, scale=0
+                dest.as_mut_ptr(),
+                5,
+                0,  // dest, len=5, scale=0
+                -1, // no dot
+                0,  // not rounded
+            );
+        }
 
         assert_eq!(&dest, b"00005");
     }
@@ -1001,12 +1104,22 @@ mod tests {
         let src2 = b"000";
         let mut dest = [b'0'; 5];
 
-        cobolrt_divide_scaled(
-            src1.as_ptr(), 3, 0,
-            src2.as_ptr(), 3, 0,
-            dest.as_mut_ptr(), 5, 0,
-            -1, 0,
-        );
+        // SAFETY: All pointers are valid for their respective lengths.
+        unsafe {
+            cobolrt_divide_scaled(
+                src1.as_ptr(),
+                3,
+                0,
+                src2.as_ptr(),
+                3,
+                0,
+                dest.as_mut_ptr(),
+                5,
+                0,
+                -1,
+                0,
+            );
+        }
 
         assert_eq!(&dest, b"00000");
     }
@@ -1018,13 +1131,22 @@ mod tests {
         let src2 = b"003";
         let mut dest = *b"000.00";
 
-        cobolrt_divide_scaled(
-            src1.as_ptr(), 3, 0,
-            src2.as_ptr(), 3, 0,
-            dest.as_mut_ptr(), 6, 2,
-            3,  // dot at position 3
-            0,  // not rounded
-        );
+        // SAFETY: All pointers are valid for their respective lengths.
+        unsafe {
+            cobolrt_divide_scaled(
+                src1.as_ptr(),
+                3,
+                0,
+                src2.as_ptr(),
+                3,
+                0,
+                dest.as_mut_ptr(),
+                6,
+                2,
+                3, // dot at position 3
+                0, // not rounded
+            );
+        }
 
         assert_eq!(&dest, b"033.33");
     }
@@ -1036,13 +1158,22 @@ mod tests {
         let src2 = b"003";
         let mut dest = *b"000.00";
 
-        cobolrt_divide_scaled(
-            src1.as_ptr(), 3, 0,
-            src2.as_ptr(), 3, 0,
-            dest.as_mut_ptr(), 6, 2,
-            3,  // dot at position 3
-            1,  // rounded
-        );
+        // SAFETY: All pointers are valid for their respective lengths.
+        unsafe {
+            cobolrt_divide_scaled(
+                src1.as_ptr(),
+                3,
+                0,
+                src2.as_ptr(),
+                3,
+                0,
+                dest.as_mut_ptr(),
+                6,
+                2,
+                3, // dot at position 3
+                1, // rounded
+            );
+        }
 
         assert_eq!(&dest, b"033.33");
     }
@@ -1052,7 +1183,8 @@ mod tests {
     #[test]
     fn negate_positive() {
         let src = b"00042";
-        let ptr = cobolrt_negate_numeric(src.as_ptr(), 5);
+        // SAFETY: `src` is valid for 5 bytes.
+        let ptr = unsafe { cobolrt_negate_numeric(src.as_ptr(), 5) };
         assert!(!ptr.is_null());
         // Result has one extra byte for sign.
         let result = unsafe { std::slice::from_raw_parts(ptr, 6) };
@@ -1064,7 +1196,8 @@ mod tests {
 
     #[test]
     fn negate_null() {
-        let ptr = cobolrt_negate_numeric(std::ptr::null(), 0);
+        // SAFETY: Null pointer is handled gracefully by the function.
+        let ptr = unsafe { cobolrt_negate_numeric(std::ptr::null(), 0) };
         assert!(ptr.is_null());
     }
 
@@ -1074,7 +1207,8 @@ mod tests {
     fn decimal_add_display_simple() {
         let a = b"00005";
         let b = b"00003";
-        let ptr = cobolrt_decimal_add_display(a.as_ptr(), 5, b.as_ptr(), 5, 5);
+        // SAFETY: Both pointers are valid for 5 bytes.
+        let ptr = unsafe { cobolrt_decimal_add_display(a.as_ptr(), 5, b.as_ptr(), 5, 5) };
         assert!(!ptr.is_null());
         let result = unsafe { std::slice::from_raw_parts(ptr, 5) };
         assert_eq!(result, b"00008");
@@ -1084,7 +1218,8 @@ mod tests {
     fn decimal_sub_display_simple() {
         let a = b"00010";
         let b = b"00003";
-        let ptr = cobolrt_decimal_sub_display(a.as_ptr(), 5, b.as_ptr(), 5, 5);
+        // SAFETY: Both pointers are valid for 5 bytes.
+        let ptr = unsafe { cobolrt_decimal_sub_display(a.as_ptr(), 5, b.as_ptr(), 5, 5) };
         assert!(!ptr.is_null());
         let result = unsafe { std::slice::from_raw_parts(ptr, 5) };
         assert_eq!(result, b"00007");
@@ -1094,7 +1229,8 @@ mod tests {
     fn decimal_mul_display_simple() {
         let a = b"004";
         let b = b"005";
-        let ptr = cobolrt_decimal_mul_display(a.as_ptr(), 3, b.as_ptr(), 3, 5);
+        // SAFETY: Both pointers are valid for 3 bytes.
+        let ptr = unsafe { cobolrt_decimal_mul_display(a.as_ptr(), 3, b.as_ptr(), 3, 5) };
         assert!(!ptr.is_null());
         let result = unsafe { std::slice::from_raw_parts(ptr, 5) };
         assert_eq!(result, b"00020");
@@ -1104,7 +1240,8 @@ mod tests {
     fn decimal_div_display_simple() {
         let a = b"020";
         let b = b"004";
-        let ptr = cobolrt_decimal_div_display(a.as_ptr(), 3, b.as_ptr(), 3, 5);
+        // SAFETY: Both pointers are valid for 3 bytes.
+        let ptr = unsafe { cobolrt_decimal_div_display(a.as_ptr(), 3, b.as_ptr(), 3, 5) };
         assert!(!ptr.is_null());
         let result = unsafe { std::slice::from_raw_parts(ptr, 5) };
         assert_eq!(result, b"00005");
@@ -1114,7 +1251,8 @@ mod tests {
     fn decimal_div_display_by_zero() {
         let a = b"020";
         let b = b"000";
-        let ptr = cobolrt_decimal_div_display(a.as_ptr(), 3, b.as_ptr(), 3, 5);
+        // SAFETY: Both pointers are valid for 3 bytes.
+        let ptr = unsafe { cobolrt_decimal_div_display(a.as_ptr(), 3, b.as_ptr(), 3, 5) };
         assert!(!ptr.is_null());
         let result = unsafe { std::slice::from_raw_parts(ptr, 5) };
         assert_eq!(result, b"00000");
@@ -1124,7 +1262,8 @@ mod tests {
     fn decimal_pow_simple() {
         let base = b"003";
         let exp = b"004";
-        let ptr = cobolrt_decimal_pow(base.as_ptr(), 3, exp.as_ptr(), 3, 5);
+        // SAFETY: Both pointers are valid for 3 bytes.
+        let ptr = unsafe { cobolrt_decimal_pow(base.as_ptr(), 3, exp.as_ptr(), 3, 5) };
         assert!(!ptr.is_null());
         let result = unsafe { std::slice::from_raw_parts(ptr, 5) };
         // 3^4 = 81
@@ -1135,7 +1274,8 @@ mod tests {
     fn decimal_pow_zero_exponent() {
         let base = b"005";
         let exp = b"000";
-        let ptr = cobolrt_decimal_pow(base.as_ptr(), 3, exp.as_ptr(), 3, 5);
+        // SAFETY: Both pointers are valid for 3 bytes.
+        let ptr = unsafe { cobolrt_decimal_pow(base.as_ptr(), 3, exp.as_ptr(), 3, 5) };
         assert!(!ptr.is_null());
         let result = unsafe { std::slice::from_raw_parts(ptr, 5) };
         // 5^0 = 1
@@ -1146,7 +1286,8 @@ mod tests {
     fn decimal_pow_one_exponent() {
         let base = b"042";
         let exp = b"001";
-        let ptr = cobolrt_decimal_pow(base.as_ptr(), 3, exp.as_ptr(), 3, 5);
+        // SAFETY: Both pointers are valid for 3 bytes.
+        let ptr = unsafe { cobolrt_decimal_pow(base.as_ptr(), 3, exp.as_ptr(), 3, 5) };
         assert!(!ptr.is_null());
         let result = unsafe { std::slice::from_raw_parts(ptr, 5) };
         // 42^1 = 42
@@ -1183,8 +1324,16 @@ mod tests {
 
     #[test]
     fn align_scales_same() {
-        let l = ParsedNumeric { digits: 100, scale: 2, negative: false };
-        let r = ParsedNumeric { digits: 200, scale: 2, negative: false };
+        let l = ParsedNumeric {
+            digits: 100,
+            scale: 2,
+            negative: false,
+        };
+        let r = ParsedNumeric {
+            digits: 200,
+            scale: 2,
+            negative: false,
+        };
         let (lv, rv, s) = align_scales(&l, &r);
         assert_eq!(lv, 100);
         assert_eq!(rv, 200);
@@ -1194,8 +1343,16 @@ mod tests {
     #[test]
     fn align_scales_different() {
         // 1.5 (digits=15, scale=1) and 2.50 (digits=250, scale=2)
-        let l = ParsedNumeric { digits: 15, scale: 1, negative: false };
-        let r = ParsedNumeric { digits: 250, scale: 2, negative: false };
+        let l = ParsedNumeric {
+            digits: 15,
+            scale: 1,
+            negative: false,
+        };
+        let r = ParsedNumeric {
+            digits: 250,
+            scale: 2,
+            negative: false,
+        };
         let (lv, rv, s) = align_scales(&l, &r);
         assert_eq!(lv, 150); // 15 * 10
         assert_eq!(rv, 250);

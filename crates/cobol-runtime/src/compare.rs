@@ -1,8 +1,13 @@
 /// Compare two display-format numeric values.
 /// Returns: -1 if left < right, 0 if equal, 1 if left > right.
 /// Both buffers contain ASCII digit characters (optionally with '.' or leading sign).
+///
+/// # Safety
+///
+/// - `left` must point to at least `left_len` readable bytes, or be null.
+/// - `right` must point to at least `right_len` readable bytes, or be null.
 #[no_mangle]
-pub extern "C" fn cobolrt_compare_numeric(
+pub unsafe extern "C" fn cobolrt_compare_numeric(
     left: *const u8,
     left_len: u32,
     right: *const u8,
@@ -11,8 +16,10 @@ pub extern "C" fn cobolrt_compare_numeric(
     if left.is_null() || right.is_null() {
         return 0;
     }
-    let l_slice = unsafe { std::slice::from_raw_parts(left, left_len as usize) };
-    let r_slice = unsafe { std::slice::from_raw_parts(right, right_len as usize) };
+    // SAFETY: Caller guarantees `left` points to `left_len` readable bytes.
+    let l_slice = std::slice::from_raw_parts(left, left_len as usize);
+    // SAFETY: Caller guarantees `right` points to `right_len` readable bytes.
+    let r_slice = std::slice::from_raw_parts(right, right_len as usize);
 
     // Parse both as numeric values: extract integer and fractional parts
     let l_val = parse_display_numeric(l_slice);
@@ -31,8 +38,13 @@ pub extern "C" fn cobolrt_compare_numeric(
 /// Compare two alphanumeric values character by character.
 /// Shorter string is padded with spaces on the right.
 /// Returns: -1 if left < right, 0 if equal, 1 if left > right.
+///
+/// # Safety
+///
+/// - `left` must point to at least `left_len` readable bytes, or be null.
+/// - `right` must point to at least `right_len` readable bytes, or be null.
 #[no_mangle]
-pub extern "C" fn cobolrt_compare_alphanumeric(
+pub unsafe extern "C" fn cobolrt_compare_alphanumeric(
     left: *const u8,
     left_len: u32,
     right: *const u8,
@@ -41,8 +53,10 @@ pub extern "C" fn cobolrt_compare_alphanumeric(
     if left.is_null() || right.is_null() {
         return 0;
     }
-    let l_slice = unsafe { std::slice::from_raw_parts(left, left_len as usize) };
-    let r_slice = unsafe { std::slice::from_raw_parts(right, right_len as usize) };
+    // SAFETY: Caller guarantees `left` points to `left_len` readable bytes.
+    let l_slice = std::slice::from_raw_parts(left, left_len as usize);
+    // SAFETY: Caller guarantees `right` points to `right_len` readable bytes.
+    let r_slice = std::slice::from_raw_parts(right, right_len as usize);
 
     let max_len = std::cmp::max(l_slice.len(), r_slice.len());
     for i in 0..max_len {
@@ -120,50 +134,40 @@ mod tests {
     fn compare_equal_single_digit() {
         let a = b"3";
         let b = b"3";
-        assert_eq!(
-            cobolrt_compare_numeric(a.as_ptr(), 1, b.as_ptr(), 1),
-            0
-        );
+        // SAFETY: Both pointers are valid for 1 byte.
+        assert_eq!(unsafe { cobolrt_compare_numeric(a.as_ptr(), 1, b.as_ptr(), 1) }, 0);
     }
 
     #[test]
     fn compare_less() {
         let a = b"3";
         let b = b"5";
-        assert_eq!(
-            cobolrt_compare_numeric(a.as_ptr(), 1, b.as_ptr(), 1),
-            -1
-        );
+        // SAFETY: Both pointers are valid for 1 byte.
+        assert_eq!(unsafe { cobolrt_compare_numeric(a.as_ptr(), 1, b.as_ptr(), 1) }, -1);
     }
 
     #[test]
     fn compare_greater() {
         let a = b"9";
         let b = b"3";
-        assert_eq!(
-            cobolrt_compare_numeric(a.as_ptr(), 1, b.as_ptr(), 1),
-            1
-        );
+        // SAFETY: Both pointers are valid for 1 byte.
+        assert_eq!(unsafe { cobolrt_compare_numeric(a.as_ptr(), 1, b.as_ptr(), 1) }, 1);
     }
 
     #[test]
     fn compare_different_lengths() {
         let a = b"03";
         let b = b"3";
-        assert_eq!(
-            cobolrt_compare_numeric(a.as_ptr(), 2, b.as_ptr(), 1),
-            0
-        );
+        // SAFETY: Both pointers are valid for their respective lengths.
+        assert_eq!(unsafe { cobolrt_compare_numeric(a.as_ptr(), 2, b.as_ptr(), 1) }, 0);
     }
 
     #[test]
     fn compare_with_decimal() {
         let a = b"12.50";
         let b = b"12.50";
-        assert_eq!(
-            cobolrt_compare_numeric(a.as_ptr(), 5, b.as_ptr(), 5),
-            0
-        );
+        // SAFETY: Both pointers are valid for 5 bytes.
+        assert_eq!(unsafe { cobolrt_compare_numeric(a.as_ptr(), 5, b.as_ptr(), 5) }, 0);
     }
 
     #[test]
@@ -171,7 +175,8 @@ mod tests {
         let a = b"HELLO";
         let b = b"HELLO";
         assert_eq!(
-            cobolrt_compare_alphanumeric(a.as_ptr(), 5, b.as_ptr(), 5),
+            // SAFETY: Both pointers are valid for 5 bytes.
+            unsafe { cobolrt_compare_alphanumeric(a.as_ptr(), 5, b.as_ptr(), 5) },
             0
         );
     }
@@ -181,7 +186,8 @@ mod tests {
         let a = b"HI";
         let b = b"HI   ";
         assert_eq!(
-            cobolrt_compare_alphanumeric(a.as_ptr(), 2, b.as_ptr(), 5),
+            // SAFETY: Both pointers are valid for their respective lengths.
+            unsafe { cobolrt_compare_alphanumeric(a.as_ptr(), 2, b.as_ptr(), 5) },
             0
         );
     }
@@ -191,7 +197,8 @@ mod tests {
         let a = b"ABC";
         let b = b"ABD";
         assert_eq!(
-            cobolrt_compare_alphanumeric(a.as_ptr(), 3, b.as_ptr(), 3),
+            // SAFETY: Both pointers are valid for 3 bytes.
+            unsafe { cobolrt_compare_alphanumeric(a.as_ptr(), 3, b.as_ptr(), 3) },
             -1
         );
     }

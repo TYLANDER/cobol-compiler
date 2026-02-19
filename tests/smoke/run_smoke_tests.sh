@@ -112,6 +112,8 @@ run_test "SMOKE-INIT"
 run_test "SMOKE-NUMEDIT"
 run_test "SMOKE-SEARCH"
 run_test "SMOKE-FIGCONST"
+run_test "SMOKE-DIVIDE"
+run_test "SMOKE-SET"
 
 echo ""
 echo "=== Results ==="

@@ -1,43 +1,63 @@
 /// FUNCTION LENGTH
+///
+/// # Safety
+///
+/// - `data` must point to at least `len` readable bytes, or be null.
 #[no_mangle]
-pub extern "C" fn cobolrt_intrinsic_length(data: *const u8, len: u32) -> i64 {
+pub unsafe extern "C" fn cobolrt_intrinsic_length(data: *const u8, len: u32) -> i64 {
     let _ = data;
     len as i64
 }
 
 /// FUNCTION REVERSE
+///
+/// # Safety
+///
+/// - `input` must point to at least `len` readable bytes, or be null.
+/// - `output` must point to at least `len` writable bytes, or be null.
+/// - `input` and `output` must not overlap.
 #[no_mangle]
-pub extern "C" fn cobolrt_intrinsic_reverse(input: *const u8, len: u32, output: *mut u8) {
+pub unsafe extern "C" fn cobolrt_intrinsic_reverse(input: *const u8, len: u32, output: *mut u8) {
     if input.is_null() || output.is_null() {
         return;
     }
-    let slice = unsafe { std::slice::from_raw_parts(input, len as usize) };
+    // SAFETY: Caller guarantees `input` points to `len` readable bytes.
+    let slice = std::slice::from_raw_parts(input, len as usize);
     for (i, &byte) in slice.iter().rev().enumerate() {
-        unsafe {
-            *output.add(i) = byte;
-        }
+        // SAFETY: Caller guarantees `output` points to `len` writable bytes.
+        *output.add(i) = byte;
     }
 }
 
 /// FUNCTION UPPER-CASE
+///
+/// # Safety
+///
+/// - `data` must point to at least `len` writable bytes, or be null.
 #[no_mangle]
-pub extern "C" fn cobolrt_intrinsic_upper_case(data: *mut u8, len: u32) {
+pub unsafe extern "C" fn cobolrt_intrinsic_upper_case(data: *mut u8, len: u32) {
     if data.is_null() {
         return;
     }
-    let slice = unsafe { std::slice::from_raw_parts_mut(data, len as usize) };
+    // SAFETY: Caller guarantees `data` points to `len` writable bytes.
+    let slice = std::slice::from_raw_parts_mut(data, len as usize);
     for byte in slice.iter_mut() {
         *byte = byte.to_ascii_uppercase();
     }
 }
 
 /// FUNCTION LOWER-CASE
+///
+/// # Safety
+///
+/// - `data` must point to at least `len` writable bytes, or be null.
 #[no_mangle]
-pub extern "C" fn cobolrt_intrinsic_lower_case(data: *mut u8, len: u32) {
+pub unsafe extern "C" fn cobolrt_intrinsic_lower_case(data: *mut u8, len: u32) {
     if data.is_null() {
         return;
     }
-    let slice = unsafe { std::slice::from_raw_parts_mut(data, len as usize) };
+    // SAFETY: Caller guarantees `data` points to `len` writable bytes.
+    let slice = std::slice::from_raw_parts_mut(data, len as usize);
     for byte in slice.iter_mut() {
         *byte = byte.to_ascii_lowercase();
     }
@@ -59,8 +79,12 @@ pub extern "C" fn cobolrt_intrinsic_lower_case(data: *mut u8, len: u32) {
 /// Note: UTC offset is reported as +0000 (UTC) since determining local
 /// timezone offset without libc/chrono is non-trivial. The date/time
 /// components are UTC.
+///
+/// # Safety
+///
+/// - `output` must point to at least 21 writable bytes, or be null.
 #[no_mangle]
-pub extern "C" fn cobolrt_intrinsic_current_date(output: *mut u8) {
+pub unsafe extern "C" fn cobolrt_intrinsic_current_date(output: *mut u8) {
     if output.is_null() {
         return;
     }
@@ -105,34 +129,44 @@ pub extern "C" fn cobolrt_intrinsic_current_date(output: *mut u8) {
     buf[19] = b'0';
     buf[20] = b'0';
 
-    unsafe {
-        std::ptr::copy_nonoverlapping(buf.as_ptr(), output, 21);
-    }
+    // SAFETY: Caller guarantees `output` points to at least 21 writable bytes.
+    std::ptr::copy_nonoverlapping(buf.as_ptr(), output, 21);
 }
 
 /// FUNCTION WHEN-COMPILED - returns compilation timestamp
+///
+/// # Safety
+///
+/// - `output` must point to at least 21 writable bytes, or be null.
 #[no_mangle]
-pub extern "C" fn cobolrt_intrinsic_when_compiled(output: *mut u8) {
+pub unsafe extern "C" fn cobolrt_intrinsic_when_compiled(output: *mut u8) {
     if output.is_null() {
         return;
     }
     let placeholder = b"00000000000000000+0000";
-    unsafe {
-        std::ptr::copy_nonoverlapping(placeholder.as_ptr(), output, 21);
-    }
+    // SAFETY: Caller guarantees `output` points to at least 21 writable bytes.
+    std::ptr::copy_nonoverlapping(placeholder.as_ptr(), output, 21);
 }
 
 /// FUNCTION NUMVAL - convert alphanumeric to numeric
+///
+/// # Safety
+///
+/// - `data` must point to at least `len` readable bytes, or be null.
 #[no_mangle]
-pub extern "C" fn cobolrt_intrinsic_numval(data: *const u8, len: u32) -> f64 {
+pub unsafe extern "C" fn cobolrt_intrinsic_numval(data: *const u8, len: u32) -> f64 {
     let _ = (data, len);
     // TODO: implement
     0.0
 }
 
 /// FUNCTION NUMVAL-C - convert alphanumeric with currency to numeric
+///
+/// # Safety
+///
+/// - `data` must point to at least `len` readable bytes, or be null.
 #[no_mangle]
-pub extern "C" fn cobolrt_intrinsic_numval_c(data: *const u8, len: u32, currency: u8) -> f64 {
+pub unsafe extern "C" fn cobolrt_intrinsic_numval_c(data: *const u8, len: u32, currency: u8) -> f64 {
     let _ = (data, len, currency);
     0.0
 }

@@ -387,11 +387,7 @@ fn parse_physical_line(line: &str, line_start_offset: u32) -> PhysicalLine<'_> {
     let len = line_bytes.len();
 
     // Column 7 is at byte index 6 (0-based).
-    let indicator = if len > 6 {
-        line_bytes[6] as char
-    } else {
-        ' '
-    };
+    let indicator = if len > 6 { line_bytes[6] as char } else { ' ' };
 
     // Columns 8-72 are at byte indices 7..72 (0-based).
     let content_start = 7.min(len);
@@ -1237,10 +1233,7 @@ mod tests {
             .filter(|t| t.kind == TokenKind::Word)
             .map(|t| t.text.as_str())
             .collect();
-        assert!(
-            words.contains(&"DISPLAY"),
-            "should contain DISPLAY"
-        );
+        assert!(words.contains(&"DISPLAY"), "should contain DISPLAY");
 
         // We should have at least one string literal.
         let strings: Vec<&str> = tokens
@@ -1501,11 +1494,7 @@ mod tests {
 
     #[test]
     fn test_lex_newlines_between_lines() {
-        let source = [
-            fixed_line(' ', "MOVE A"),
-            fixed_line(' ', "TO B."),
-        ]
-        .join("\n");
+        let source = [fixed_line(' ', "MOVE A"), fixed_line(' ', "TO B.")].join("\n");
 
         let all_tokens = lex(&source, FileId::new(0), SourceFormat::Fixed);
         let newlines = all_tokens
@@ -1513,7 +1502,11 @@ mod tests {
             .filter(|t| t.kind == TokenKind::Newline)
             .count();
         // Each logical line gets a trailing Newline token.
-        assert!(newlines >= 2, "should have at least 2 newline tokens, got: {}", newlines);
+        assert!(
+            newlines >= 2,
+            "should have at least 2 newline tokens, got: {}",
+            newlines
+        );
     }
 
     #[test]

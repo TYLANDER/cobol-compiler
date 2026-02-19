@@ -34,17 +34,20 @@ void cobolrt_stop_run(int status) {
 
 void cobolrt_accept(char *buffer, unsigned int buffer_len) {
     if (buffer && buffer_len > 0) {
+        /* Pre-fill with COBOL spaces */
         memset(buffer, ' ', buffer_len);
-        if (fgets(buffer, buffer_len + 1, stdin) != NULL) {
-            /* Remove trailing newline */
-            size_t len = strlen(buffer);
-            if (len > 0 && buffer[len-1] == '\n') {
-                buffer[len-1] = ' ';
+        /* Read into a separate temp buffer to avoid overflow */
+        char temp[4096];
+        if (fgets(temp, sizeof(temp), stdin) != NULL) {
+            size_t len = strlen(temp);
+            /* Strip trailing newline */
+            if (len > 0 && temp[len-1] == '\n') {
+                len--;
             }
-            /* Pad with spaces up to buffer_len */
-            for (size_t i = strlen(buffer); i < buffer_len; i++) {
-                buffer[i] = ' ';
-            }
+            /* Copy at most buffer_len bytes into the target */
+            size_t copy_len = len < buffer_len ? len : buffer_len;
+            memcpy(buffer, temp, copy_len);
+            /* Remaining bytes stay as spaces from memset above */
         }
     }
 }
@@ -114,6 +117,65 @@ void cobolrt_move_alphanumeric(
     }
 }
 
+void cobolrt_move_alphanumeric_justified(
+    const char *src, unsigned int src_len,
+    char *dest, unsigned int dest_len
+) {
+    /* JUSTIFIED RIGHT: right-align the data, pad with spaces on left */
+    if (src_len >= dest_len) {
+        /* Take rightmost dest_len chars from src */
+        memcpy(dest, src + src_len - dest_len, dest_len);
+    } else {
+        /* Pad on left with spaces, then copy src to right portion */
+        memset(dest, ' ', dest_len - src_len);
+        memcpy(dest + dest_len - src_len, src, src_len);
+    }
+}
+
+void cobolrt_justify_right(char *data, unsigned int len) {
+    /* Right-justify alphanumeric data in place: find actual content length,
+       shift to right, pad left with spaces */
+    unsigned int content_end = len;
+    while (content_end > 0 && data[content_end - 1] == ' ') {
+        content_end--;
+    }
+    if (content_end < len && content_end > 0) {
+        unsigned int shift = len - content_end;
+        memmove(data + shift, data, content_end);
+        memset(data, ' ', shift);
+    }
+}
+
+void cobolrt_blank_when_zero(char *data, unsigned int len) {
+    /* Check if entire field is zero (all '0' chars or spaces) */
+    int all_zero = 1;
+    for (unsigned int i = 0; i < len; i++) {
+        if (data[i] != '0' && data[i] != ' ' && data[i] != '.' && data[i] != ',') {
+            all_zero = 0;
+            break;
+        }
+    }
+    if (all_zero) {
+        memset(data, ' ', len);
+    }
+}
+
+void cobolrt_sign_fixup(char *data, unsigned int len, int is_leading, int is_negative) {
+    /* For SIGN IS LEADING/TRAILING SEPARATE CHARACTER:
+       Insert '+' or '-' at the appropriate position.
+       is_leading=1: sign goes at position 0, digits shift right
+       is_leading=0: sign goes at last position */
+    char sign_char = is_negative ? '-' : '+';
+    if (is_leading) {
+        /* Shift digits right by 1, put sign at position 0 */
+        memmove(data + 1, data, len - 1);
+        data[0] = sign_char;
+    } else {
+        /* Sign at last position */
+        data[len - 1] = sign_char;
+    }
+}
+
 void cobolrt_initialize_alphanumeric(char *data, unsigned int len) {
     memset(data, ' ', len);
 }
@@ -134,6 +196,11 @@ static long long display_to_int(const char *data, unsigned int len) {
         unsigned char c = (unsigned char)data[i];
         if (c >= '0' && c <= '9') {
             result = result * 10 + (c - '0');
+        } else if (c == '-') {
+            /* Leading minus sign */
+            negative = 1;
+        } else if (c == '+' || c == ' ') {
+            /* Leading plus or space — skip */
         } else if (c >= 'p' && c <= 'y') {
             /* Trailing overpunch: negative sign, digit = c - 0x40 */
             result = result * 10 + (c - 'p');
@@ -149,11 +216,45 @@ static long long display_to_int(const char *data, unsigned int len) {
     return negative ? -result : result;
 }
 
+/* Global flag: set to 1 when an arithmetic operation overflows the
+ * destination field.  Cleared on next arithmetic operation.  Read by
+ * cobolrt_last_size_error(). */
+static int _cobol_size_error_flag = 0;
+
+int cobolrt_last_size_error(void) {
+    int r = _cobol_size_error_flag;
+    _cobol_size_error_flag = 0;
+    return r;
+}
+
+void cobolrt_clear_size_error(void) {
+    _cobol_size_error_flag = 0;
+}
+
+void cobolrt_set_size_error(int flag) {
+    if (flag) {
+        _cobol_size_error_flag = 1;
+    }
+}
+
 /* Write a 64-bit integer into display format (ASCII digits, right-justified, zero-padded).
- * Negative values are encoded using trailing overpunch: last digit + 0x40. */
-static void int_to_display(long long value, char *data, unsigned int len) {
+ * Negative values are encoded using trailing overpunch: last digit + 0x40.
+ * Sets _cobol_size_error_flag if the value cannot fit in len digits,
+ * or if the value is negative and the destination is unsigned (dest_is_signed==0). */
+static void int_to_display_ex(long long value, char *data, unsigned int len, int dest_is_signed) {
     int negative = (value < 0);
+    if (negative && !dest_is_signed) {
+        /* Negative result into an unsigned field is always a size error */
+        _cobol_size_error_flag = 1;
+    }
     if (value < 0) value = -value;
+    /* Check if the value fits in len digits */
+    long long temp = value;
+    unsigned int digits = 0;
+    do { digits++; temp /= 10; } while (temp > 0);
+    if (digits > len) {
+        _cobol_size_error_flag = 1;
+    }
     memset(data, '0', len);
     for (int i = (int)len - 1; i >= 0 && value > 0; i--) {
         data[i] = '0' + (char)(value % 10);
@@ -165,48 +266,62 @@ static void int_to_display(long long value, char *data, unsigned int len) {
     }
 }
 
+/* Backward-compatible wrapper: assumes signed destination (no unsigned overflow check). */
+static void int_to_display(long long value, char *data, unsigned int len) {
+    int_to_display_ex(value, data, len, 1);
+}
+
 void cobolrt_add_numeric(
     const char *src1, unsigned int src1_len,
     const char *src2, unsigned int src2_len,
-    char *dest, unsigned int dest_len
+    char *dest, unsigned int dest_len,
+    int dest_is_signed
 ) {
     long long a = display_to_int(src1, src1_len);
     long long b = display_to_int(src2, src2_len);
     long long result = a + b;
-    int_to_display(result, dest, dest_len);
+    int_to_display_ex(result, dest, dest_len, dest_is_signed);
 }
 
 void cobolrt_subtract_numeric(
     const char *src1, unsigned int src1_len,
     const char *src2, unsigned int src2_len,
-    char *dest, unsigned int dest_len
+    char *dest, unsigned int dest_len,
+    int dest_is_signed
 ) {
     long long a = display_to_int(src1, src1_len);
     long long b = display_to_int(src2, src2_len);
     long long result = a - b;
-    int_to_display(result, dest, dest_len);
+    int_to_display_ex(result, dest, dest_len, dest_is_signed);
 }
 
 void cobolrt_multiply_numeric(
     const char *src1, unsigned int src1_len,
     const char *src2, unsigned int src2_len,
-    char *dest, unsigned int dest_len
+    char *dest, unsigned int dest_len,
+    int dest_is_signed
 ) {
     long long a = display_to_int(src1, src1_len);
     long long b = display_to_int(src2, src2_len);
     long long result = a * b;
-    int_to_display(result, dest, dest_len);
+    int_to_display_ex(result, dest, dest_len, dest_is_signed);
 }
 
 void cobolrt_divide_numeric(
     const char *src1, unsigned int src1_len,
     const char *src2, unsigned int src2_len,
-    char *dest, unsigned int dest_len
+    char *dest, unsigned int dest_len,
+    int dest_is_signed
 ) {
     long long a = display_to_int(src1, src1_len);
     long long b = display_to_int(src2, src2_len);
-    long long result = (b != 0) ? (a / b) : 0;
-    int_to_display(result, dest, dest_len);
+    if (b == 0) {
+        _cobol_size_error_flag = 1;
+        /* On divide by zero, leave dest unchanged per COBOL standard */
+        return;
+    }
+    long long result = a / b;
+    int_to_display_ex(result, dest, dest_len, dest_is_signed);
 }
 
 int cobolrt_compare_numeric(
@@ -281,8 +396,8 @@ void cobolrt_divide_scaled(
     long long divisor = display_to_int_skip(src2, src2_len);
 
     if (divisor == 0) {
-        /* Division by zero: fill result with zeros */
-        int_to_display_edited(0, dest, dest_len, dest_dot_pos);
+        /* Division by zero: set size error flag, leave dest unchanged */
+        _cobol_size_error_flag = 1;
         return;
     }
 
@@ -481,24 +596,64 @@ int cobolrt_file_read_line(int handle, char *buffer, unsigned int buffer_len) {
 void cobolrt_string_append(
     const char *src, unsigned int src_len,
     char *dest, unsigned int dest_len,
-    char *ptr, unsigned int ptr_len
+    char *ptr, unsigned int ptr_len,
+    const char *delim, unsigned int delim_len
 ) {
+    /* If a previous source already triggered overflow, skip this source */
+    if (_cobol_size_error_flag) {
+        return;
+    }
+
     /* Read the pointer value (1-based, display-format numeric) */
     long long pos = display_to_int(ptr, ptr_len);
+
+    /* COBOL STRING: pointer < 1 or > dest_len+1 is an overflow */
+    if (pos < 1 || pos > (long long)dest_len + 1) {
+        _cobol_size_error_flag = 1;
+        return;
+    }
 
     /* COBOL STRING uses 1-based positioning */
     unsigned int dest_pos = (unsigned int)(pos - 1);
 
+    /* Determine effective source length based on delimiter */
+    unsigned int effective_len = src_len;
+    if (delim && delim_len > 0) {
+        /* DELIMITED BY <value> — scan for delimiter in source */
+        for (unsigned int i = 0; i + delim_len <= src_len; i++) {
+            if (memcmp(src + i, delim, delim_len) == 0) {
+                effective_len = i;
+                break;
+            }
+        }
+    }
+    /* If delim is NULL/0, DELIMITED BY SIZE — use full src_len */
+
+    /* If pointer is already past destination end and there are bytes to
+     * write, that's an overflow */
+    if (dest_pos >= dest_len && effective_len > 0) {
+        _cobol_size_error_flag = 1;
+        return;
+    }
+
     /* Copy source bytes into destination starting at dest_pos */
     unsigned int copied = 0;
-    for (unsigned int i = 0; i < src_len && dest_pos + copied < dest_len; i++) {
+    for (unsigned int i = 0; i < effective_len && dest_pos + copied < dest_len; i++) {
         dest[dest_pos + copied] = src[i];
         copied++;
     }
 
-    /* Update the pointer value */
+    /* Update the pointer value (save/restore overflow flag since
+     * int_to_display clears it) */
+    int saved_flag = _cobol_size_error_flag;
     long long new_pos = pos + (long long)copied;
     int_to_display(new_pos, ptr, ptr_len);
+    _cobol_size_error_flag = saved_flag;
+
+    /* If not all effective bytes fit, that's an overflow */
+    if (copied < effective_len) {
+        _cobol_size_error_flag = 1;
+    }
 }
 
 /* ---- MOVE type conversion functions ---- */
@@ -709,6 +864,19 @@ void cobolrt_inspect_tallying(
                 break;
             }
         }
+    } else if (mode == 3) {
+        /* TRAILING */
+        if (!search || search_len == 0) return;
+        /* Scan backwards from end_pos */
+        unsigned int i = end_pos;
+        while (i >= start_pos + search_len) {
+            if (memcmp(data + i - search_len, search, search_len) == 0) {
+                count++;
+                i -= search_len;
+            } else {
+                break;
+            }
+        }
     }
 
     tally_val += count;
@@ -789,6 +957,23 @@ void cobolrt_inspect_replacing(
                 memset(data + abs_pos + replacement_len, ' ', search_len - replacement_len);
             }
         }
+    } else if (mode == 4) {
+        /* TRAILING */
+        if (!search || search_len == 0) return;
+        unsigned int i = end_pos;
+        while (i >= start_pos + search_len) {
+            if (memcmp(data + i - search_len, search, search_len) == 0) {
+                unsigned int abs_pos = i - search_len;
+                unsigned int copy_len = search_len < replacement_len ? search_len : replacement_len;
+                memcpy(data + abs_pos, replacement, copy_len);
+                if (replacement_len < search_len) {
+                    memset(data + abs_pos + replacement_len, ' ', search_len - replacement_len);
+                }
+                i -= search_len;
+            } else {
+                break;
+            }
+        }
     }
 }
 
@@ -824,15 +1009,40 @@ void cobolrt_inspect_converting(
     }
 }
 
+/* ---- UNSTRING multi-delimiter support ---- */
+/* Delimiters are pre-registered via cobolrt_unstring_begin/add_delim,
+   then cobolrt_unstring_field uses the registered set. */
+static struct {
+    const char* ptr;
+    unsigned int len;
+    unsigned int all;
+} __unstring_delims[16];
+static unsigned int __unstring_num_delims = 0;
+
+void cobolrt_unstring_begin(unsigned int num_delimiters) {
+    __unstring_num_delims = 0;
+    (void)num_delimiters;
+}
+
+void cobolrt_unstring_add_delim(const char* delim, unsigned int delim_len,
+                                unsigned int all_flag) {
+    if (__unstring_num_delims < 16) {
+        __unstring_delims[__unstring_num_delims].ptr = delim;
+        __unstring_delims[__unstring_num_delims].len = delim_len;
+        __unstring_delims[__unstring_num_delims].all = all_flag;
+        __unstring_num_delims++;
+    }
+}
+
 /* ---- UNSTRING per-field runtime function ---- */
 
 void cobolrt_unstring_field(
     const char *source, unsigned int source_len,
-    const char *delimiter, unsigned int delimiter_len,
-    unsigned int all_delim,
     char *target, unsigned int target_len,
     char *pointer, unsigned int pointer_len,
-    char *tally, unsigned int tally_len
+    char *tally, unsigned int tally_len,
+    char *count_in, unsigned int count_in_len,
+    char *delim_in, unsigned int delim_in_len
 ) {
     if (!source || !target) return;
 
@@ -850,24 +1060,35 @@ void cobolrt_unstring_field(
         return;
     }
 
-    /* Find delimiter in remaining source */
+    /* Find the earliest-matching delimiter among all registered ones.
+       For UNSTRING with OR: try every delimiter, pick the one that
+       matches at the earliest position in the remaining source. */
     unsigned int field_end = source_len;
     unsigned int delim_skip = 0;
+    int matched_delim_idx = -1;
 
-    if (delimiter && delimiter_len > 0) {
-        int pos = find_substr(source + start_pos, source_len - start_pos,
-                              delimiter, delimiter_len);
+    for (unsigned int d = 0; d < __unstring_num_delims; d++) {
+        const char *dp = __unstring_delims[d].ptr;
+        unsigned int dl = __unstring_delims[d].len;
+        if (!dp || dl == 0) continue;
+
+        int pos = find_substr(source + start_pos, source_len - start_pos, dp, dl);
         if (pos >= 0) {
-            field_end = start_pos + (unsigned int)pos;
-            delim_skip = delimiter_len;
+            unsigned int abs_pos = start_pos + (unsigned int)pos;
+            if (abs_pos < field_end) {
+                field_end = abs_pos;
+                delim_skip = dl;
+                matched_delim_idx = (int)d;
 
-            /* If ALL, skip consecutive delimiters */
-            if (all_delim) {
-                unsigned int next = field_end + delimiter_len;
-                while (next + delimiter_len <= source_len &&
-                       memcmp(source + next, delimiter, delimiter_len) == 0) {
-                    next += delimiter_len;
-                    delim_skip += delimiter_len;
+                /* If ALL, skip consecutive delimiters */
+                if (__unstring_delims[d].all) {
+                    unsigned int next = field_end + dl;
+                    delim_skip = dl;
+                    while (next + dl <= source_len &&
+                           memcmp(source + next, dp, dl) == 0) {
+                        next += dl;
+                        delim_skip += dl;
+                    }
                 }
             }
         }
@@ -890,6 +1111,22 @@ void cobolrt_unstring_field(
         long long t = display_to_int(tally, tally_len);
         t++;
         int_to_display(t, tally, tally_len);
+    }
+
+    /* Update COUNT IN */
+    if (count_in && count_in_len > 0) {
+        int_to_display((long long)field_len, count_in, count_in_len);
+    }
+
+    /* Update DELIMITER IN: store the actual delimiter that was found */
+    if (delim_in && delim_in_len > 0) {
+        memset(delim_in, ' ', delim_in_len);
+        if (matched_delim_idx >= 0 && field_end < source_len) {
+            const char *mp = __unstring_delims[matched_delim_idx].ptr;
+            unsigned int ml = __unstring_delims[matched_delim_idx].len;
+            unsigned int dl = ml < delim_in_len ? ml : delim_in_len;
+            memcpy(delim_in, mp, dl);
+        }
     }
 }
 
@@ -1294,6 +1531,109 @@ void cobolrt_format_numeric_edited(
         }
     }
 }
+
+/* ---- Class condition runtime functions ---- */
+
+/* IS NUMERIC: returns 1 if every byte is '0'-'9' (0x30-0x39). */
+int cobolrt_is_numeric(const char *data, int len) {
+    if (!data || len <= 0) return 0;
+    for (int i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)data[i];
+        if (c < '0' || c > '9') return 0;
+    }
+    return 1;
+}
+
+/* IS ALPHABETIC: returns 1 if every byte is 'A'-'Z', 'a'-'z', or space. */
+int cobolrt_is_alphabetic(const char *data, int len) {
+    if (!data || len <= 0) return 0;
+    for (int i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)data[i];
+        if (c == ' ') continue;
+        if (c >= 'A' && c <= 'Z') continue;
+        if (c >= 'a' && c <= 'z') continue;
+        return 0;
+    }
+    return 1;
+}
+
+/* IS ALPHABETIC-LOWER: returns 1 if every byte is 'a'-'z' or space. */
+int cobolrt_is_alphabetic_lower(const char *data, int len) {
+    if (!data || len <= 0) return 0;
+    for (int i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)data[i];
+        if (c == ' ') continue;
+        if (c >= 'a' && c <= 'z') continue;
+        return 0;
+    }
+    return 1;
+}
+
+/* IS ALPHABETIC-UPPER: returns 1 if every byte is 'A'-'Z' or space. */
+int cobolrt_is_alphabetic_upper(const char *data, int len) {
+    if (!data || len <= 0) return 0;
+    for (int i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)data[i];
+        if (c == ' ') continue;
+        if (c >= 'A' && c <= 'Z') continue;
+        return 0;
+    }
+    return 1;
+}
+
+/* IS POSITIVE / IS NEGATIVE / IS ZERO sign check.
+   Parses a DISPLAY numeric field (ASCII digits, possibly with sign/decimal)
+   and checks the sign condition.
+   mode: 0 = POSITIVE (value > 0)
+         1 = NEGATIVE (value < 0)
+         2 = ZERO     (value == 0)
+   Returns 1 if condition is true, 0 otherwise. */
+int cobolrt_sign_check(const char *data, int len, int scale, int mode) {
+    if (!data || len <= 0) return (mode == 2) ? 1 : 0;
+
+    int is_negative = 0;
+    long long integer_value = 0;
+
+    for (int i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)data[i];
+        if (c >= '0' && c <= '9') {
+            integer_value = integer_value * 10 + (c - '0');
+        } else if (c == '-') {
+            is_negative = 1;
+        } else if (c == '+' || c == '.' || c == ' ') {
+            /* skip sign, decimal point, spaces */
+        } else if (c >= 0x70 && c <= 0x79) {
+            /* Negative overpunch: p-y represent 0-9 with negative sign */
+            integer_value = integer_value * 10 + (c - 0x70);
+            is_negative = 1;
+        } else if (c >= 0x7B && c <= 0x7B) {
+            /* { = negative zero in some EBCDIC-like overpunch */
+            is_negative = 1;
+        } else if (c == '{') {
+            /* positive overpunch for 0 */
+            integer_value = integer_value * 10 + 0;
+        } else if (c >= 'A' && c <= 'I') {
+            /* positive overpunch: A-I = 1-9 */
+            integer_value = integer_value * 10 + (c - 'A' + 1);
+        } else if (c >= 'J' && c <= 'R') {
+            /* negative overpunch: J-R = 1-9 */
+            integer_value = integer_value * 10 + (c - 'J' + 1);
+            is_negative = 1;
+        }
+    }
+
+    /* Determine the effective sign */
+    /* A value of 0 is neither positive nor negative */
+    if (integer_value == 0) {
+        return (mode == 2) ? 1 : 0;
+    }
+    if (is_negative) {
+        /* value < 0 */
+        return (mode == 1) ? 1 : 0;
+    }
+    /* value > 0 */
+    return (mode == 0) ? 1 : 0;
+}
 "#;
 
 /// cobolc -- The World's Best Open-Source COBOL Compiler
@@ -1360,6 +1700,22 @@ fn main() {
         db.vfs_mut().add_copybook_dir(dir.clone());
     }
 
+    // Auto-add source file directories and their copybooks/ subdirectories
+    for input_path in &cli.input {
+        if let Some(parent) = std::path::Path::new(input_path).parent() {
+            let parent = if parent.as_os_str().is_empty() {
+                std::path::PathBuf::from(".")
+            } else {
+                parent.to_path_buf()
+            };
+            db.vfs_mut().add_copybook_dir(parent.clone());
+            let copybooks_dir = parent.join("copybooks");
+            if copybooks_dir.is_dir() {
+                db.vfs_mut().add_copybook_dir(copybooks_dir);
+            }
+        }
+    }
+
     // Determine source format
     let source_format = match cli.format.as_str() {
         "free" => cobol_lexer::SourceFormat::Free,
@@ -1371,7 +1727,7 @@ fn main() {
     let mut obj_files: Vec<PathBuf> = Vec::new();
 
     // Process each input file
-    for input_path in &cli.input {
+    for (input_idx, input_path) in cli.input.iter().enumerate() {
         // Load the source file
         let file_id = match db.vfs_mut().load_file(input_path) {
             Ok(id) => id,
@@ -1436,8 +1792,8 @@ fn main() {
                     eprintln!("parse error: {}", err);
                 }
                 let syntax = parse_result.syntax();
-                let ast = cobol_ast::SourceFile::cast(syntax)
-                    .expect("root node should be SOURCE_FILE");
+                let ast =
+                    cobol_ast::SourceFile::cast(syntax).expect("root node should be SOURCE_FILE");
                 let mut interner = cobol_intern::Interner::new();
                 let hir = cobol_hir::lower(&ast, &mut interner);
                 if cli.dump {
@@ -1454,16 +1810,20 @@ fn main() {
                     eprintln!("parse error: {}", err);
                 }
                 let syntax = parse_result.syntax();
-                let ast = cobol_ast::SourceFile::cast(syntax)
-                    .expect("root node should be SOURCE_FILE");
+                let ast =
+                    cobol_ast::SourceFile::cast(syntax).expect("root node should be SOURCE_FILE");
                 let mut interner = cobol_intern::Interner::new();
                 let hir = cobol_hir::lower(&ast, &mut interner);
                 let mir = cobol_mir::lower(&hir, &interner);
                 if cli.dump {
                     println!("{:#?}", mir);
                 } else {
-                    println!("MIR module: {} ({} functions, {} globals)",
-                        mir.name, mir.functions.len(), mir.globals.len());
+                    println!(
+                        "MIR module: {} ({} functions, {} globals)",
+                        mir.name,
+                        mir.functions.len(),
+                        mir.globals.len()
+                    );
                 }
             }
             "obj" | "exe" => {
@@ -1473,13 +1833,15 @@ fn main() {
                     eprintln!("parse error: {}", err);
                 }
                 if !parse_result.errors.is_empty() && !cli.verbose {
-                    eprintln!("warning: {} parse error(s); continuing anyway",
-                        parse_result.errors.len());
+                    eprintln!(
+                        "warning: {} parse error(s); continuing anyway",
+                        parse_result.errors.len()
+                    );
                 }
 
                 let syntax = parse_result.syntax();
-                let ast = cobol_ast::SourceFile::cast(syntax)
-                    .expect("root node should be SOURCE_FILE");
+                let ast =
+                    cobol_ast::SourceFile::cast(syntax).expect("root node should be SOURCE_FILE");
 
                 let mut interner = cobol_intern::Interner::new();
                 let hir = cobol_hir::lower(&ast, &mut interner);
@@ -1489,24 +1851,30 @@ fn main() {
                     }
                 }
 
-                let mir = cobol_mir::lower(&hir, &interner);
+                // First input file is the main program; subsequent files are subprograms
+                let is_main = input_idx == 0;
+                let mir = cobol_mir::lower_with_options(&hir, &interner, is_main);
 
                 if cli.verbose {
-                    eprintln!("MIR: {} functions, {} globals",
-                        mir.functions.len(), mir.globals.len());
+                    eprintln!(
+                        "MIR: {} functions, {} globals",
+                        mir.functions.len(),
+                        mir.globals.len()
+                    );
                 }
 
                 // Determine object file path
-                let stem = input_path.file_stem()
+                let stem = input_path
+                    .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("output");
                 let obj_path = if cli.emit == "obj" && cli.input.len() == 1 {
-                    cli.output.clone().unwrap_or_else(|| {
-                        input_path.with_extension("o")
-                    })
+                    cli.output
+                        .clone()
+                        .unwrap_or_else(|| input_path.with_extension("o"))
                 } else {
                     // For exe or multi-file obj, use temp .o files
-                    std::env::temp_dir().join(format!("{}.o", stem))
+                    std::env::temp_dir().join(format!("{}_{}.o", stem, std::process::id()))
                 };
 
                 // Codegen
@@ -1514,7 +1882,9 @@ fn main() {
                 let backend: Box<dyn CodegenBackend> = match cli.backend.as_str() {
                     "cranelift" => Box::new(cobol_codegen_cranelift::CraneliftBackend::new()),
                     _ => {
-                        eprintln!("error: LLVM backend not yet implemented, use --backend=cranelift");
+                        eprintln!(
+                            "error: LLVM backend not yet implemented, use --backend=cranelift"
+                        );
                         std::process::exit(1);
                     }
                 };
@@ -1556,7 +1926,7 @@ fn main() {
         });
 
         // Write the C runtime shim to a temp file
-        let runtime_c = std::env::temp_dir().join("cobolrt_shim.c");
+        let runtime_c = std::env::temp_dir().join(format!("cobolrt_shim_{}.c", std::process::id()));
         std::fs::write(&runtime_c, RUNTIME_SHIM_C).unwrap_or_else(|e| {
             eprintln!("error: failed to write runtime shim: {}", e);
             std::process::exit(1);
@@ -1567,10 +1937,7 @@ fn main() {
         for obj in &obj_files {
             cmd.arg(obj);
         }
-        cmd.arg(&runtime_c)
-            .arg("-o")
-            .arg(&exe_path)
-            .arg("-lc");
+        cmd.arg(&runtime_c).arg("-o").arg(&exe_path).arg("-lc");
 
         let status = cmd.status();
 

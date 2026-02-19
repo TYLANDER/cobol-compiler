@@ -12,7 +12,6 @@
 
 # Tests expected to fail during compilation
 compile_fail = [
-    "NC130A",
 ]
 
 # Tests expected to fail at runtime (wrong output)

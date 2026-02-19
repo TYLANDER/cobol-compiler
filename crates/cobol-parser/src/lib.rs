@@ -73,6 +73,9 @@ pub enum SyntaxKind {
     VALUE_CLAUSE,
     OCCURS_CLAUSE,
     REDEFINES_CLAUSE,
+    SIGN_CLAUSE,
+    JUSTIFIED_CLAUSE,
+    BLANK_CLAUSE,
     PARAGRAPH,
     SECTION,
     SENTENCE,
@@ -145,7 +148,10 @@ impl SyntaxKind {
     /// implementations. The caller must ensure `raw` is a valid discriminant.
     #[inline]
     pub fn from_raw(raw: u16) -> Self {
-        assert!(raw <= SyntaxKind::TOMBSTONE as u16, "invalid SyntaxKind raw value: {raw}");
+        assert!(
+            raw <= SyntaxKind::TOMBSTONE as u16,
+            "invalid SyntaxKind raw value: {raw}"
+        );
         unsafe { std::mem::transmute(raw) }
     }
 
@@ -327,8 +333,7 @@ impl<'t> Parser<'t> {
         if self.at_end() {
             return false;
         }
-        self.current().text.eq_ignore_ascii_case(text)
-            && self.current_is_word_like()
+        self.current().text.eq_ignore_ascii_case(text) && self.current_is_word_like()
     }
 
     /// Returns true if the current token is word-like (an identifier or a
@@ -573,8 +578,7 @@ impl<'t> Parser<'t> {
     // ------------------------------------------------------------------
 
     fn start_node(&mut self, kind: SyntaxKind) {
-        self.builder
-            .start_node(CobolLanguage::kind_to_raw(kind));
+        self.builder.start_node(CobolLanguage::kind_to_raw(kind));
     }
 
     fn finish_node(&mut self) {
@@ -598,8 +602,16 @@ impl<'t> Parser<'t> {
             return false;
         }
         // Data division sections
-        if self.at_any_word(&["WORKING-STORAGE", "LINKAGE", "FILE", "LOCAL-STORAGE",
-            "SCREEN", "REPORT", "COMMUNICATION"]) && self.peek_word_at(1, "SECTION") {
+        if self.at_any_word(&[
+            "WORKING-STORAGE",
+            "LINKAGE",
+            "FILE",
+            "LOCAL-STORAGE",
+            "SCREEN",
+            "REPORT",
+            "COMMUNICATION",
+        ]) && self.peek_word_at(1, "SECTION")
+        {
             return true;
         }
         // Environment division sections
@@ -686,13 +698,43 @@ impl<'t> Parser<'t> {
             let t = self.current_text_upper();
             matches!(
                 t.as_str(),
-                "ACCEPT" | "ADD" | "ALTER" | "CALL" | "CANCEL" | "CLOSE"
-                    | "COMPUTE" | "CONTINUE" | "DELETE" | "DISPLAY" | "DIVIDE"
-                    | "ENTER" | "EVALUATE" | "EXIT" | "GO" | "GOBACK" | "IF"
-                    | "INITIALIZE" | "INSPECT" | "MERGE" | "MOVE" | "MULTIPLY"
-                    | "OPEN" | "PERFORM" | "READ" | "RELEASE" | "RETURN"
-                    | "REWRITE" | "SEARCH" | "SET" | "SORT" | "START" | "STOP"
-                    | "STRING" | "SUBTRACT" | "UNSTRING" | "WRITE"
+                "ACCEPT"
+                    | "ADD"
+                    | "ALTER"
+                    | "CALL"
+                    | "CANCEL"
+                    | "CLOSE"
+                    | "COMPUTE"
+                    | "CONTINUE"
+                    | "DELETE"
+                    | "DISPLAY"
+                    | "DIVIDE"
+                    | "ENTER"
+                    | "EVALUATE"
+                    | "EXIT"
+                    | "GO"
+                    | "GOBACK"
+                    | "IF"
+                    | "INITIALIZE"
+                    | "INSPECT"
+                    | "MERGE"
+                    | "MOVE"
+                    | "MULTIPLY"
+                    | "OPEN"
+                    | "PERFORM"
+                    | "READ"
+                    | "RELEASE"
+                    | "RETURN"
+                    | "REWRITE"
+                    | "SEARCH"
+                    | "SET"
+                    | "SORT"
+                    | "START"
+                    | "STOP"
+                    | "STRING"
+                    | "SUBTRACT"
+                    | "UNSTRING"
+                    | "WRITE"
             )
         })
     }
@@ -721,17 +763,31 @@ impl<'t> Parser<'t> {
                 | TokenKind::EndWrite
                 | TokenKind::EndDelete
                 | TokenKind::When
+                | TokenKind::Else
         ) || (self.current_is_word_like() && {
             let t = self.current_text_upper();
             matches!(
                 t.as_str(),
-                "END-IF" | "END-PERFORM" | "END-ADD" | "END-SUBTRACT"
-                    | "END-MULTIPLY" | "END-DIVIDE" | "END-COMPUTE"
-                    | "END-CALL" | "END-EVALUATE" | "END-READ"
-                    | "END-RETURN" | "END-REWRITE" | "END-SEARCH"
-                    | "END-START" | "END-STRING" | "END-UNSTRING"
-                    | "END-WRITE" | "END-DELETE"
+                "END-IF"
+                    | "END-PERFORM"
+                    | "END-ADD"
+                    | "END-SUBTRACT"
+                    | "END-MULTIPLY"
+                    | "END-DIVIDE"
+                    | "END-COMPUTE"
+                    | "END-CALL"
+                    | "END-EVALUATE"
+                    | "END-READ"
+                    | "END-RETURN"
+                    | "END-REWRITE"
+                    | "END-SEARCH"
+                    | "END-START"
+                    | "END-STRING"
+                    | "END-UNSTRING"
+                    | "END-WRITE"
+                    | "END-DELETE"
                     | "WHEN"
+                    | "ELSE"
             )
         })
     }
@@ -751,7 +807,10 @@ impl<'t> Parser<'t> {
         self.skip_ws();
 
         // IDENTIFICATION DIVISION
-        if !self.at_end() && self.at_any_word(&["IDENTIFICATION", "ID"]) && self.peek_word_at(1, "DIVISION") {
+        if !self.at_end()
+            && self.at_any_word(&["IDENTIFICATION", "ID"])
+            && self.peek_word_at(1, "DIVISION")
+        {
             self.parse_identification_division();
         }
 
@@ -796,10 +855,8 @@ impl<'t> Parser<'t> {
 
         // If there were no tokens at all, insert a synthetic EOF.
         if self.tokens.is_empty() {
-            self.builder.token(
-                CobolLanguage::kind_to_raw(SyntaxKind::EOF),
-                "",
-            );
+            self.builder
+                .token(CobolLanguage::kind_to_raw(SyntaxKind::EOF), "");
         }
 
         self.finish_node();
@@ -815,7 +872,7 @@ impl<'t> Parser<'t> {
         // "IDENTIFICATION" or "ID"
         self.skip_ws();
         self.bump(); // IDENTIFICATION / ID
-        // "DIVISION"
+                     // "DIVISION"
         self.skip_ws();
         self.expect_word("DIVISION");
         // Period
@@ -906,7 +963,10 @@ impl<'t> Parser<'t> {
             }
 
             // FILE-CONTROL paragraph
-            if self.at_word("FILE-CONTROL") || self.at_kind(cobol_lexer::TokenKind::Word) && self.current_text_upper() == "FILE-CONTROL" {
+            if self.at_word("FILE-CONTROL")
+                || self.at_kind(cobol_lexer::TokenKind::Word)
+                    && self.current_text_upper() == "FILE-CONTROL"
+            {
                 self.bump(); // FILE-CONTROL
                 self.skip_ws();
                 if !self.at_end() && self.current_kind() == cobol_lexer::TokenKind::Period {
@@ -914,7 +974,9 @@ impl<'t> Parser<'t> {
                 }
                 self.skip_ws();
                 // Parse SELECT entries
-                while !self.at_end() && !self.at_division() && !self.at_section_header()
+                while !self.at_end()
+                    && !self.at_division()
+                    && !self.at_section_header()
                     && !self.at_word("I-O-CONTROL")
                 {
                     self.skip_ws();
@@ -1128,9 +1190,7 @@ impl<'t> Parser<'t> {
         }
         use cobol_lexer::TokenKind;
         match self.current_kind() {
-            TokenKind::Level | TokenKind::Level66 | TokenKind::Level77 | TokenKind::Level88 => {
-                true
-            }
+            TokenKind::Level | TokenKind::Level66 | TokenKind::Level77 | TokenKind::Level88 => true,
             TokenKind::IntegerLiteral => {
                 // Check if text is a valid level number
                 let text = self.current().text.trim();
@@ -1171,11 +1231,13 @@ impl<'t> Parser<'t> {
                 break;
             }
 
-            if self.at_any_word(&["PIC", "PICTURE"]) || self.at_kind(cobol_lexer::TokenKind::Pic)
+            if self.at_any_word(&["PIC", "PICTURE"])
+                || self.at_kind(cobol_lexer::TokenKind::Pic)
                 || self.at_kind(cobol_lexer::TokenKind::Picture)
             {
                 self.parse_pic_clause();
-            } else if self.at_word("VALUE") || self.at_word("VALUES")
+            } else if self.at_word("VALUE")
+                || self.at_word("VALUES")
                 || self.at_kind(cobol_lexer::TokenKind::Value)
                 || self.at_kind(cobol_lexer::TokenKind::Values)
             {
@@ -1184,9 +1246,17 @@ impl<'t> Parser<'t> {
                 self.parse_usage_clause();
             } else if self.at_word("OCCURS") || self.at_kind(cobol_lexer::TokenKind::Occurs) {
                 self.parse_occurs_clause();
-            } else if self.at_word("REDEFINES") || self.at_kind(cobol_lexer::TokenKind::Redefines)
-            {
+            } else if self.at_word("REDEFINES") || self.at_kind(cobol_lexer::TokenKind::Redefines) {
                 self.parse_redefines_clause();
+            } else if self.at_word("SIGN") || self.at_kind(cobol_lexer::TokenKind::Sign_) {
+                self.parse_sign_clause();
+            } else if self.at_word("JUSTIFIED") || self.at_word("JUST")
+                || self.at_kind(cobol_lexer::TokenKind::Justified)
+                || self.at_kind(cobol_lexer::TokenKind::Just)
+            {
+                self.parse_justified_clause();
+            } else if self.at_word("BLANK") || self.at_kind(cobol_lexer::TokenKind::Blank) {
+                self.parse_blank_clause();
             } else {
                 // Unknown clause content, consume the token
                 self.bump();
@@ -1225,9 +1295,21 @@ impl<'t> Parser<'t> {
                 | TokenKind::Global
                 | TokenKind::External
         ) || self.at_any_word(&[
-            "PIC", "PICTURE", "USAGE", "VALUE", "VALUES", "OCCURS",
-            "REDEFINES", "BLANK", "JUSTIFIED", "JUST", "SIGN", "SYNC",
-            "SYNCHRONIZED", "GLOBAL", "EXTERNAL",
+            "PIC",
+            "PICTURE",
+            "USAGE",
+            "VALUE",
+            "VALUES",
+            "OCCURS",
+            "REDEFINES",
+            "BLANK",
+            "JUSTIFIED",
+            "JUST",
+            "SIGN",
+            "SYNC",
+            "SYNCHRONIZED",
+            "GLOBAL",
+            "EXTERNAL",
         ])
     }
 
@@ -1282,41 +1364,65 @@ impl<'t> Parser<'t> {
             self.bump();
         }
 
-        // The value literal(s)
-        self.skip_ws();
-        if !self.at_end() && self.current_kind() != cobol_lexer::TokenKind::Period {
-            // Handle negative numeric literals: VALUE -5 or VALUE -123
-            if self.current_kind() == cobol_lexer::TokenKind::Minus {
-                self.bump(); // consume '-'
-                self.skip_ws();
-                if !self.at_end() && self.current_kind() != cobol_lexer::TokenKind::Period {
-                    self.bump(); // consume the number after '-'
+        // The value literal(s) -- loop to handle multiple discrete values
+        // (e.g., VALUE 1 2 3 4 5) and THRU ranges (e.g., VALUE 1 THRU 5 10 THRU 20)
+        loop {
+            self.skip_ws();
+            if self.at_end() || self.current_kind() == cobol_lexer::TokenKind::Period {
+                break;
+            }
+
+            // Check if this token could be a value (literal, sign, or figurative constant word)
+            let is_value_start = match self.current_kind() {
+                cobol_lexer::TokenKind::IntegerLiteral
+                | cobol_lexer::TokenKind::DecimalLiteral
+                | cobol_lexer::TokenKind::StringLiteral
+                | cobol_lexer::TokenKind::HexLiteral
+                | cobol_lexer::TokenKind::Minus
+                | cobol_lexer::TokenKind::Plus => true,
+                _ if self.current_is_word_like() => {
+                    let upper = self.current_text_upper();
+                    matches!(
+                        upper.as_str(),
+                        "ZERO" | "ZEROS" | "ZEROES" | "SPACE" | "SPACES"
+                            | "HIGH-VALUE" | "HIGH-VALUES" | "LOW-VALUE" | "LOW-VALUES"
+                            | "QUOTE" | "QUOTES" | "ALL"
+                    )
                 }
-            } else if self.current_kind() == cobol_lexer::TokenKind::Plus {
-                self.bump(); // consume '+'
+                _ => false,
+            };
+
+            if !is_value_start {
+                break;
+            }
+
+            // Consume one value (possibly with a leading sign)
+            if self.current_kind() == cobol_lexer::TokenKind::Minus
+                || self.current_kind() == cobol_lexer::TokenKind::Plus
+            {
+                self.bump(); // consume sign
                 self.skip_ws();
                 if !self.at_end() && self.current_kind() != cobol_lexer::TokenKind::Period {
-                    self.bump(); // consume the number after '+'
+                    self.bump(); // consume the number after the sign
                 }
             } else {
-                // Consume the value expression (could be literal, figurative, identifier)
-                self.bump();
+                self.bump(); // consume the value token
             }
-        }
 
-        // Handle THRU/THROUGH for range values (e.g., VALUE 60 THRU 100)
-        self.skip_ws();
-        if !self.at_end() && (self.at_word("THRU") || self.at_word("THROUGH")) {
-            self.bump(); // consume THRU/THROUGH
+            // Handle THRU/THROUGH for range values (e.g., VALUE 60 THRU 100)
             self.skip_ws();
-            if !self.at_end() && self.current_kind() != cobol_lexer::TokenKind::Period {
-                // Handle negative range end
-                if self.current_kind() == cobol_lexer::TokenKind::Minus {
-                    self.bump(); // consume '-'
-                    self.skip_ws();
-                }
+            if !self.at_end() && (self.at_word("THRU") || self.at_word("THROUGH")) {
+                self.bump(); // consume THRU/THROUGH
+                self.skip_ws();
                 if !self.at_end() && self.current_kind() != cobol_lexer::TokenKind::Period {
-                    self.bump(); // consume the range end value
+                    // Handle negative range end
+                    if self.current_kind() == cobol_lexer::TokenKind::Minus {
+                        self.bump(); // consume '-'
+                        self.skip_ws();
+                    }
+                    if !self.at_end() && self.current_kind() != cobol_lexer::TokenKind::Period {
+                        self.bump(); // consume the range end value
+                    }
                 }
             }
         }
@@ -1394,6 +1500,83 @@ impl<'t> Parser<'t> {
         self.finish_node();
     }
 
+    /// Parse: SIGN IS LEADING|TRAILING [SEPARATE CHARACTER]
+    fn parse_sign_clause(&mut self) {
+        self.start_node(SyntaxKind::SIGN_CLAUSE);
+
+        // SIGN keyword
+        self.skip_ws();
+        self.bump();
+
+        // Optional IS
+        self.skip_ws();
+        if !self.at_end() && self.at_word("IS") {
+            self.bump();
+        }
+
+        // LEADING or TRAILING
+        self.skip_ws();
+        if !self.at_end()
+            && (self.at_word("LEADING") || self.at_word("TRAILING"))
+        {
+            self.bump();
+        }
+
+        // Optional SEPARATE [CHARACTER]
+        self.skip_ws();
+        if !self.at_end() && self.at_word("SEPARATE") {
+            self.bump();
+            self.skip_ws();
+            if !self.at_end() && self.at_word("CHARACTER") {
+                self.bump();
+            }
+        }
+
+        self.finish_node();
+    }
+
+    /// Parse: JUSTIFIED|JUST [RIGHT]
+    fn parse_justified_clause(&mut self) {
+        self.start_node(SyntaxKind::JUSTIFIED_CLAUSE);
+
+        // JUSTIFIED or JUST keyword
+        self.skip_ws();
+        self.bump();
+
+        // Optional RIGHT
+        self.skip_ws();
+        if !self.at_end() && self.at_word("RIGHT") {
+            self.bump();
+        }
+
+        self.finish_node();
+    }
+
+    /// Parse: BLANK WHEN ZERO|ZEROES|ZEROS
+    fn parse_blank_clause(&mut self) {
+        self.start_node(SyntaxKind::BLANK_CLAUSE);
+
+        // BLANK keyword
+        self.skip_ws();
+        self.bump();
+
+        // WHEN
+        self.skip_ws();
+        if !self.at_end() && self.at_word("WHEN") {
+            self.bump();
+        }
+
+        // ZERO|ZEROES|ZEROS
+        self.skip_ws();
+        if !self.at_end()
+            && (self.at_word("ZERO") || self.at_word("ZEROES") || self.at_word("ZEROS"))
+        {
+            self.bump();
+        }
+
+        self.finish_node();
+    }
+
     // ------------------------------------------------------------------
     // PROCEDURE DIVISION
     // ------------------------------------------------------------------
@@ -1410,7 +1593,8 @@ impl<'t> Parser<'t> {
 
         // Optional USING clause
         self.skip_ws();
-        if !self.at_end() && (self.at_word("USING") || self.at_kind(cobol_lexer::TokenKind::Using)) {
+        if !self.at_end() && (self.at_word("USING") || self.at_kind(cobol_lexer::TokenKind::Using))
+        {
             self.bump(); // USING
             self.skip_ws();
             // Consume parameter list until period
@@ -1421,7 +1605,9 @@ impl<'t> Parser<'t> {
 
         // Optional RETURNING clause
         self.skip_ws();
-        if !self.at_end() && (self.at_word("RETURNING") || self.at_kind(cobol_lexer::TokenKind::Returning)) {
+        if !self.at_end()
+            && (self.at_word("RETURNING") || self.at_kind(cobol_lexer::TokenKind::Returning))
+        {
             self.bump(); // RETURNING
             self.skip_ws();
             if !self.at_end() && self.current_kind() != cobol_lexer::TokenKind::Period {
@@ -1611,7 +1797,7 @@ impl<'t> Parser<'t> {
             TokenKind::Merge => self.parse_generic_stmt(SyntaxKind::MERGE_STMT),
             TokenKind::Search => self.parse_generic_stmt(SyntaxKind::SEARCH_STMT),
             TokenKind::Inspect => self.parse_inspect_stmt(),
-            TokenKind::String_ => self.parse_generic_stmt(SyntaxKind::STRING_STMT),
+            TokenKind::String_ => self.parse_string_stmt(),
             TokenKind::Unstring => self.parse_unstring_stmt(),
             TokenKind::Start => self.parse_generic_stmt(SyntaxKind::START_STMT),
             TokenKind::Alter => self.parse_generic_stmt(SyntaxKind::ALTER_STMT),
@@ -1642,7 +1828,7 @@ impl<'t> Parser<'t> {
                     "CLOSE" => self.parse_close_stmt(),
                     "READ" => self.parse_read_stmt(),
                     "WRITE" => self.parse_write_stmt(),
-                    "STRING" => self.parse_generic_stmt(SyntaxKind::STRING_STMT),
+                    "STRING" => self.parse_string_stmt(),
                     "UNSTRING" => self.parse_unstring_stmt(),
                     "INSPECT" => self.parse_inspect_stmt(),
                     "SEARCH" => self.parse_search_stmt(),
@@ -1671,6 +1857,111 @@ impl<'t> Parser<'t> {
             && !self.at_scope_terminator()
             && !self.at_else()
             && !self.at_division()
+        {
+            self.bump();
+        }
+
+        self.finish_node();
+    }
+
+    // ------------------------------------------------------------------
+    // STRING statement
+    // ------------------------------------------------------------------
+
+    fn parse_string_stmt(&mut self) {
+        self.start_node(SyntaxKind::STRING_STMT);
+        self.bump(); // STRING
+        self.skip_ws();
+
+        // Consume tokens, handling ON OVERFLOW / NOT ON OVERFLOW sub-statements
+        while !self.at_end()
+            && self.current_kind() != cobol_lexer::TokenKind::Period
+            && !self.at_word("END-STRING")
+            && !self.at_kind(cobol_lexer::TokenKind::EndString)
+            && !self.at_division()
+        {
+            // Handle ON OVERFLOW
+            if self.at_word("ON") && self.peek_word_at(1, "OVERFLOW") {
+                self.bump(); // ON
+                self.skip_ws();
+                self.bump(); // OVERFLOW
+                self.skip_ws();
+                // Parse imperative statements in the ON OVERFLOW handler
+                while !self.at_end()
+                    && self.current_kind() != cobol_lexer::TokenKind::Period
+                    && !self.at_word("END-STRING")
+                    && !self.at_kind(cobol_lexer::TokenKind::EndString)
+                    && !self.at_word("NOT")
+                    && !self.at_division()
+                {
+                    if self.at_statement_start() {
+                        self.parse_statement();
+                    } else {
+                        self.bump();
+                    }
+                    self.skip_ws();
+                }
+                continue;
+            }
+
+            // Handle NOT ON OVERFLOW
+            if self.at_word("NOT") && self.peek_word_at(1, "ON") {
+                self.bump(); // NOT
+                self.skip_ws();
+                self.bump(); // ON
+                self.skip_ws();
+                if !self.at_end() && self.at_word("OVERFLOW") {
+                    self.bump(); // OVERFLOW
+                }
+                self.skip_ws();
+                while !self.at_end()
+                    && self.current_kind() != cobol_lexer::TokenKind::Period
+                    && !self.at_word("END-STRING")
+                    && !self.at_kind(cobol_lexer::TokenKind::EndString)
+                    && !self.at_division()
+                {
+                    if self.at_statement_start() {
+                        self.parse_statement();
+                    } else {
+                        self.bump();
+                    }
+                    self.skip_ws();
+                }
+                continue;
+            }
+
+            // Handle OVERFLOW without ON prefix
+            if self.at_word("OVERFLOW") {
+                self.bump(); // OVERFLOW
+                self.skip_ws();
+                while !self.at_end()
+                    && self.current_kind() != cobol_lexer::TokenKind::Period
+                    && !self.at_word("END-STRING")
+                    && !self.at_kind(cobol_lexer::TokenKind::EndString)
+                    && !self.at_word("NOT")
+                    && !self.at_division()
+                {
+                    if self.at_statement_start() {
+                        self.parse_statement();
+                    } else {
+                        self.bump();
+                    }
+                    self.skip_ws();
+                }
+                continue;
+            }
+
+            if self.at_statement_start() {
+                break;
+            }
+
+            self.bump();
+        }
+
+        // Optional END-STRING
+        self.skip_ws();
+        if !self.at_end()
+            && (self.at_word("END-STRING") || self.at_kind(cobol_lexer::TokenKind::EndString))
         {
             self.bump();
         }
@@ -1775,8 +2066,7 @@ impl<'t> Parser<'t> {
         // Optional END-UNSTRING
         self.skip_ws();
         if !self.at_end()
-            && (self.at_word("END-UNSTRING")
-                || self.at_kind(cobol_lexer::TokenKind::EndUnstring))
+            && (self.at_word("END-UNSTRING") || self.at_kind(cobol_lexer::TokenKind::EndUnstring))
         {
             self.bump();
         }
@@ -1987,7 +2277,9 @@ impl<'t> Parser<'t> {
             }
 
             // UPON clause
-            if self.at_word("UPON") || self.at_kind(cobol_lexer::TokenKind::Word) && self.current_text_upper() == "UPON" {
+            if self.at_word("UPON")
+                || self.at_kind(cobol_lexer::TokenKind::Word) && self.current_text_upper() == "UPON"
+            {
                 self.bump(); // UPON
                 self.skip_ws();
                 if !self.at_end() && self.current_kind() != cobol_lexer::TokenKind::Period {
@@ -2093,7 +2385,9 @@ impl<'t> Parser<'t> {
 
         // Optional END-ADD
         self.skip_ws();
-        if !self.at_end() && (self.at_word("END-ADD") || self.at_kind(cobol_lexer::TokenKind::EndAdd)) {
+        if !self.at_end()
+            && (self.at_word("END-ADD") || self.at_kind(cobol_lexer::TokenKind::EndAdd))
+        {
             self.bump();
         }
 
@@ -2114,8 +2408,7 @@ impl<'t> Parser<'t> {
 
         self.skip_ws();
         if !self.at_end()
-            && (self.at_word("END-SUBTRACT")
-                || self.at_kind(cobol_lexer::TokenKind::EndSubtract))
+            && (self.at_word("END-SUBTRACT") || self.at_kind(cobol_lexer::TokenKind::EndSubtract))
         {
             self.bump();
         }
@@ -2137,8 +2430,7 @@ impl<'t> Parser<'t> {
 
         self.skip_ws();
         if !self.at_end()
-            && (self.at_word("END-MULTIPLY")
-                || self.at_kind(cobol_lexer::TokenKind::EndMultiply))
+            && (self.at_word("END-MULTIPLY") || self.at_kind(cobol_lexer::TokenKind::EndMultiply))
         {
             self.bump();
         }
@@ -2160,8 +2452,7 @@ impl<'t> Parser<'t> {
 
         self.skip_ws();
         if !self.at_end()
-            && (self.at_word("END-DIVIDE")
-                || self.at_kind(cobol_lexer::TokenKind::EndDivide))
+            && (self.at_word("END-DIVIDE") || self.at_kind(cobol_lexer::TokenKind::EndDivide))
         {
             self.bump();
         }
@@ -2175,6 +2466,7 @@ impl<'t> Parser<'t> {
     /// sub-clauses by consuming them as part of the body.
     fn consume_arithmetic_stmt_body(&mut self, end_keywords: &[&str]) {
         self.skip_ws();
+        let mut in_size_error = false;
         while !self.at_end()
             && self.current_kind() != cobol_lexer::TokenKind::Period
             && !self.at_division()
@@ -2183,16 +2475,32 @@ impl<'t> Parser<'t> {
             if end_keywords.iter().any(|kw| self.at_word(kw)) || self.at_scope_terminator() {
                 break;
             }
-            // If we are at a new statement that is NOT preceded by SIZE ERROR
-            // context, break. But ON SIZE ERROR / NOT ON SIZE ERROR may contain
-            // statements, so we handle those by consuming them inline.
+
+            // Detect ON SIZE ERROR / NOT ON SIZE ERROR phrases — consume all
+            // tokens so the HIR layer can parse the handler from the flat
+            // token stream.
+            if self.at_word("ON") || self.at_word("SIZE") || self.at_word("ERROR") {
+                in_size_error = true;
+                self.bump();
+                self.skip_ws();
+                continue;
+            }
+            if self.at_word("NOT") {
+                in_size_error = true;
+                self.bump();
+                self.skip_ws();
+                continue;
+            }
+
+            // Inside a SIZE ERROR handler, consume all tokens (including
+            // statement keywords like MOVE/ADD) — they are part of the handler.
+            if in_size_error {
+                self.bump();
+                self.skip_ws();
+                continue;
+            }
+
             if self.at_statement_start() {
-                // Check if this is a SIZE ERROR handler by looking at what
-                // preceded. This is hard without backtracking, so we use a
-                // simple heuristic: if we previously saw SIZE ERROR, these
-                // statements are part of the handler. For simplicity we just
-                // consume the statement here.
-                // Actually we just let statements flow for now.
                 break;
             }
             self.bump();
@@ -2232,9 +2540,7 @@ impl<'t> Parser<'t> {
         // Only enter handler if we see ON/SIZE/NOT keywords.  Otherwise the
         // next statement (e.g. IF) should be parsed at sentence level.
         self.skip_ws();
-        if !self.at_end()
-            && (self.at_word("ON") || self.at_word("SIZE") || self.at_word("NOT"))
-        {
+        if !self.at_end() && (self.at_word("ON") || self.at_word("SIZE") || self.at_word("NOT")) {
             while !self.at_end()
                 && self.current_kind() != cobol_lexer::TokenKind::Period
                 && !self.at_word("END-COMPUTE")
@@ -2255,8 +2561,7 @@ impl<'t> Parser<'t> {
         // Optional END-COMPUTE
         self.skip_ws();
         if !self.at_end()
-            && (self.at_word("END-COMPUTE")
-                || self.at_kind(cobol_lexer::TokenKind::EndCompute))
+            && (self.at_word("END-COMPUTE") || self.at_kind(cobol_lexer::TokenKind::EndCompute))
         {
             self.bump();
         }
@@ -2347,15 +2652,19 @@ impl<'t> Parser<'t> {
             } else {
                 self.error("expected ')'");
             }
-        } else if self.at_literal() || self.at_figurative() || self.at_identifier()
+        } else if self.at_literal()
+            || self.at_figurative()
+            || self.at_identifier()
             || self.current_is_word_like()
         {
             self.bump();
             // Handle qualified names (identifier OF/IN identifier) and subscripts
             self.skip_ws();
-            while !self.at_end() && (self.at_word("OF") || self.at_word("IN")
-                || self.at_kind(cobol_lexer::TokenKind::Of)
-                || self.at_kind(cobol_lexer::TokenKind::In))
+            while !self.at_end()
+                && (self.at_word("OF")
+                    || self.at_word("IN")
+                    || self.at_kind(cobol_lexer::TokenKind::Of)
+                    || self.at_kind(cobol_lexer::TokenKind::In))
             {
                 self.bump(); // OF/IN
                 self.skip_ws();
@@ -2368,9 +2677,7 @@ impl<'t> Parser<'t> {
             if !self.at_end() && self.current_kind() == cobol_lexer::TokenKind::LeftParen {
                 self.bump(); // (
                 self.skip_ws();
-                while !self.at_end()
-                    && self.current_kind() != cobol_lexer::TokenKind::RightParen
-                {
+                while !self.at_end() && self.current_kind() != cobol_lexer::TokenKind::RightParen {
                     self.bump();
                 }
                 if !self.at_end() && self.current_kind() == cobol_lexer::TokenKind::RightParen {
@@ -2463,8 +2770,7 @@ impl<'t> Parser<'t> {
 
         // Optional END-IF
         self.skip_ws();
-        if !self.at_end()
-            && (self.at_word("END-IF") || self.at_kind(cobol_lexer::TokenKind::EndIf))
+        if !self.at_end() && (self.at_word("END-IF") || self.at_kind(cobol_lexer::TokenKind::EndIf))
         {
             self.bump();
         }
@@ -2514,36 +2820,13 @@ impl<'t> Parser<'t> {
             self.skip_ws();
         }
 
-        // Left side: an atom (identifier, literal, figurative)
-        if self.at_literal() || self.at_figurative() || self.at_identifier()
+        // Left side: an arithmetic expression (one or more atoms with +,-,*,/,**)
+        if self.at_literal()
+            || self.at_figurative()
+            || self.at_identifier()
             || self.current_is_word_like()
         {
-            self.bump();
-            // Handle qualified names
-            self.skip_ws();
-            while !self.at_end() && (self.at_word("OF") || self.at_word("IN")
-                || self.at_kind(cobol_lexer::TokenKind::Of)
-                || self.at_kind(cobol_lexer::TokenKind::In))
-            {
-                self.bump();
-                self.skip_ws();
-                if !self.at_end() && (self.at_identifier() || self.current_is_word_like()) {
-                    self.bump();
-                }
-                self.skip_ws();
-            }
-            // Subscript
-            if !self.at_end() && self.current_kind() == cobol_lexer::TokenKind::LeftParen {
-                self.bump();
-                while !self.at_end()
-                    && self.current_kind() != cobol_lexer::TokenKind::RightParen
-                {
-                    self.bump();
-                }
-                if !self.at_end() && self.current_kind() == cobol_lexer::TokenKind::RightParen {
-                    self.bump();
-                }
-            }
+            self.consume_condition_arith_expr();
         } else if self.current_kind() == cobol_lexer::TokenKind::LeftParen {
             // Parenthesized condition
             self.bump(); // (
@@ -2569,28 +2852,15 @@ impl<'t> Parser<'t> {
 
             // Right side
             self.skip_ws();
-            if self.at_literal() || self.at_figurative() || self.at_identifier()
+            if self.at_literal()
+                || self.at_figurative()
+                || self.at_identifier()
                 || self.current_is_word_like()
             {
-                self.bump();
-                // Handle qualified names on right side
-                self.skip_ws();
-                while !self.at_end() && (self.at_word("OF") || self.at_word("IN")
-                    || self.at_kind(cobol_lexer::TokenKind::Of)
-                    || self.at_kind(cobol_lexer::TokenKind::In))
-                {
-                    self.bump();
-                    self.skip_ws();
-                    if !self.at_end() && (self.at_identifier() || self.current_is_word_like()) {
-                        self.bump();
-                    }
-                    self.skip_ws();
-                }
+                self.consume_condition_arith_expr();
             } else if self.current_kind() == cobol_lexer::TokenKind::LeftParen {
                 self.bump();
-                while !self.at_end()
-                    && self.current_kind() != cobol_lexer::TokenKind::RightParen
-                {
+                while !self.at_end() && self.current_kind() != cobol_lexer::TokenKind::RightParen {
                     self.bump();
                 }
                 if !self.at_end() && self.current_kind() == cobol_lexer::TokenKind::RightParen {
@@ -2599,6 +2869,106 @@ impl<'t> Parser<'t> {
             }
         }
         // If no relop, this is just a truth-value condition (e.g. identifier alone or level-88)
+    }
+
+    /// Consume an arithmetic expression in a condition context:
+    /// atom ((+|-|*|/|**) atom)* with qualifiers and subscripts.
+    fn consume_condition_arith_expr(&mut self) {
+        // First atom
+        self.bump();
+        self.skip_ws();
+        // Handle qualifiers (OF/IN)
+        while !self.at_end()
+            && (self.at_word("OF")
+                || self.at_word("IN")
+                || self.at_kind(cobol_lexer::TokenKind::Of)
+                || self.at_kind(cobol_lexer::TokenKind::In))
+        {
+            self.bump();
+            self.skip_ws();
+            if !self.at_end() && (self.at_identifier() || self.current_is_word_like()) {
+                self.bump();
+            }
+            self.skip_ws();
+        }
+        // Handle subscripts / ref-mod
+        if !self.at_end() && self.current_kind() == cobol_lexer::TokenKind::LeftParen {
+            self.bump();
+            while !self.at_end() && self.current_kind() != cobol_lexer::TokenKind::RightParen {
+                self.bump();
+            }
+            if !self.at_end() && self.current_kind() == cobol_lexer::TokenKind::RightParen {
+                self.bump();
+            }
+        }
+        // Continue with arithmetic operators
+        self.skip_ws();
+        while !self.at_end() && self.at_arith_op() {
+            self.bump(); // operator
+            self.skip_ws();
+            // Next atom
+            if self.at_literal()
+                || self.at_figurative()
+                || self.at_identifier()
+                || self.current_is_word_like()
+            {
+                self.bump();
+                self.skip_ws();
+                // qualifiers
+                while !self.at_end()
+                    && (self.at_word("OF")
+                        || self.at_word("IN")
+                        || self.at_kind(cobol_lexer::TokenKind::Of)
+                        || self.at_kind(cobol_lexer::TokenKind::In))
+                {
+                    self.bump();
+                    self.skip_ws();
+                    if !self.at_end() && (self.at_identifier() || self.current_is_word_like()) {
+                        self.bump();
+                    }
+                    self.skip_ws();
+                }
+                // subscripts / ref-mod
+                if !self.at_end() && self.current_kind() == cobol_lexer::TokenKind::LeftParen {
+                    self.bump();
+                    while !self.at_end()
+                        && self.current_kind() != cobol_lexer::TokenKind::RightParen
+                    {
+                        self.bump();
+                    }
+                    if !self.at_end() && self.current_kind() == cobol_lexer::TokenKind::RightParen {
+                        self.bump();
+                    }
+                }
+            } else if self.current_kind() == cobol_lexer::TokenKind::LeftParen {
+                // Parenthesized sub-expression
+                self.bump();
+                while !self.at_end() && self.current_kind() != cobol_lexer::TokenKind::RightParen {
+                    self.bump();
+                }
+                if !self.at_end() && self.current_kind() == cobol_lexer::TokenKind::RightParen {
+                    self.bump();
+                }
+            } else {
+                break;
+            }
+            self.skip_ws();
+        }
+    }
+
+    /// Check if current token is an arithmetic operator (+, -, *, /, **)
+    fn at_arith_op(&self) -> bool {
+        if self.at_end() {
+            return false;
+        }
+        matches!(
+            self.current_kind(),
+            cobol_lexer::TokenKind::Plus
+                | cobol_lexer::TokenKind::Minus
+                | cobol_lexer::TokenKind::Star
+                | cobol_lexer::TokenKind::Slash
+                | cobol_lexer::TokenKind::DoubleStar
+        )
     }
 
     fn at_relop(&self) -> bool {
@@ -2746,8 +3116,7 @@ impl<'t> Parser<'t> {
 
             self.skip_ws();
             if !self.at_end()
-                && (self.at_word("END-PERFORM")
-                    || self.at_kind(cobol_lexer::TokenKind::EndPerform))
+                && (self.at_word("END-PERFORM") || self.at_kind(cobol_lexer::TokenKind::EndPerform))
             {
                 self.bump();
             }
@@ -2786,8 +3155,7 @@ impl<'t> Parser<'t> {
             }
             self.skip_ws();
             if !self.at_end()
-                && (self.at_word("END-PERFORM")
-                    || self.at_kind(cobol_lexer::TokenKind::EndPerform))
+                && (self.at_word("END-PERFORM") || self.at_kind(cobol_lexer::TokenKind::EndPerform))
             {
                 self.bump();
             }
@@ -2800,9 +3168,11 @@ impl<'t> Parser<'t> {
             let saved = self.pos;
             self.bump(); // literal
             self.skip_ws();
-            if !self.at_end() && (self.at_word("TIMES") || self.at_kind(cobol_lexer::TokenKind::Times)) {
+            if !self.at_end()
+                && (self.at_word("TIMES") || self.at_kind(cobol_lexer::TokenKind::Times))
+            {
                 self.bump(); // TIMES
-                // Parse inline body
+                             // Parse inline body
                 self.skip_ws();
                 while !self.at_end()
                     && self.current_kind() != cobol_lexer::TokenKind::Period
@@ -2915,7 +3285,9 @@ impl<'t> Parser<'t> {
         if !self.at_end() && self.at_literal() {
             self.bump(); // n
             self.skip_ws();
-            if !self.at_end() && (self.at_word("TIMES") || self.at_kind(cobol_lexer::TokenKind::Times)) {
+            if !self.at_end()
+                && (self.at_word("TIMES") || self.at_kind(cobol_lexer::TokenKind::Times))
+            {
                 self.bump(); // TIMES
             }
         } else if !self.at_end() && self.at_identifier() {
@@ -2931,8 +3303,7 @@ impl<'t> Parser<'t> {
 
         // Optional UNTIL
         self.skip_ws();
-        if !self.at_end()
-            && (self.at_word("UNTIL") || self.at_kind(cobol_lexer::TokenKind::Until))
+        if !self.at_end() && (self.at_word("UNTIL") || self.at_kind(cobol_lexer::TokenKind::Until))
         {
             self.bump(); // UNTIL
             self.skip_ws();
@@ -2966,8 +3337,7 @@ impl<'t> Parser<'t> {
 
             self.skip_ws();
             if !self.at_end()
-                && (self.at_word("END-PERFORM")
-                    || self.at_kind(cobol_lexer::TokenKind::EndPerform))
+                && (self.at_word("END-PERFORM") || self.at_kind(cobol_lexer::TokenKind::EndPerform))
             {
                 self.bump();
             }
@@ -3007,8 +3377,7 @@ impl<'t> Parser<'t> {
         }
 
         self.skip_ws();
-        if !self.at_end()
-            && (self.at_word("UNTIL") || self.at_kind(cobol_lexer::TokenKind::Until))
+        if !self.at_end() && (self.at_word("UNTIL") || self.at_kind(cobol_lexer::TokenKind::Until))
         {
             self.bump(); // UNTIL
             self.skip_ws();
@@ -3026,7 +3395,9 @@ impl<'t> Parser<'t> {
                 self.bump(); // loop variable
             }
             self.skip_ws();
-            if !self.at_end() && (self.at_word("FROM") || self.at_kind(cobol_lexer::TokenKind::From)) {
+            if !self.at_end()
+                && (self.at_word("FROM") || self.at_kind(cobol_lexer::TokenKind::From))
+            {
                 self.bump();
                 self.skip_ws();
                 if !self.at_end() && self.current_kind() != cobol_lexer::TokenKind::Period {
@@ -3065,9 +3436,7 @@ impl<'t> Parser<'t> {
 
         self.skip_ws();
         // Optional RUN
-        if !self.at_end()
-            && (self.at_word("RUN") || self.at_kind(cobol_lexer::TokenKind::Run))
-        {
+        if !self.at_end() && (self.at_word("RUN") || self.at_kind(cobol_lexer::TokenKind::Run)) {
             self.bump();
         }
 
@@ -3090,13 +3459,37 @@ impl<'t> Parser<'t> {
             self.bump(); // TO
         }
 
-        // Target paragraph/section name
+        // Consume one or more target paragraph/section names.
+        // Stop when we hit DEPENDING, a period, or end of input.
         self.skip_ws();
-        if !self.at_end()
+        while !self.at_end()
             && self.current_kind() != cobol_lexer::TokenKind::Period
+            && !self.at_word("DEPENDING")
+            && !self.at_kind(cobol_lexer::TokenKind::Depending)
             && (self.at_identifier() || self.current_is_word_like())
         {
             self.bump();
+            self.skip_ws();
+        }
+
+        // Optional DEPENDING ON identifier
+        if !self.at_end()
+            && (self.at_word("DEPENDING")
+                || self.at_kind(cobol_lexer::TokenKind::Depending))
+        {
+            self.bump(); // DEPENDING
+            self.skip_ws();
+            if !self.at_end() && (self.at_word("ON") || self.at_kind(cobol_lexer::TokenKind::On)) {
+                self.bump(); // ON
+            }
+            self.skip_ws();
+            // The DEPENDING ON identifier
+            if !self.at_end()
+                && self.current_kind() != cobol_lexer::TokenKind::Period
+                && (self.at_identifier() || self.current_is_word_like())
+            {
+                self.bump();
+            }
         }
 
         self.finish_node();
@@ -3114,14 +3507,14 @@ impl<'t> Parser<'t> {
 
         self.skip_ws();
         // Optional PROGRAM, SECTION, PARAGRAPH
-        if !self.at_end()
-            && self.at_any_word(&["PROGRAM", "SECTION", "PARAGRAPH"])
-        {
+        if !self.at_end() && self.at_any_word(&["PROGRAM", "SECTION", "PARAGRAPH"]) {
             self.bump();
-        } else if !self.at_end() && matches!(
-            self.current_kind(),
-            cobol_lexer::TokenKind::SectionKw | cobol_lexer::TokenKind::ParagraphKw
-        ) {
+        } else if !self.at_end()
+            && matches!(
+                self.current_kind(),
+                cobol_lexer::TokenKind::SectionKw | cobol_lexer::TokenKind::ParagraphKw
+            )
+        {
             self.bump();
         }
 
@@ -3146,8 +3539,7 @@ impl<'t> Parser<'t> {
 
         // Optional USING clause
         self.skip_ws();
-        if !self.at_end()
-            && (self.at_word("USING") || self.at_kind(cobol_lexer::TokenKind::Using))
+        if !self.at_end() && (self.at_word("USING") || self.at_kind(cobol_lexer::TokenKind::Using))
         {
             self.bump(); // USING
             self.skip_ws();
@@ -3228,9 +3620,7 @@ impl<'t> Parser<'t> {
 
         // Optional FROM clause
         self.skip_ws();
-        if !self.at_end()
-            && (self.at_word("FROM") || self.at_kind(cobol_lexer::TokenKind::From))
-        {
+        if !self.at_end() && (self.at_word("FROM") || self.at_kind(cobol_lexer::TokenKind::From)) {
             self.bump(); // FROM
             self.skip_ws();
             while !self.at_end()
@@ -3328,8 +3718,7 @@ impl<'t> Parser<'t> {
 
         self.skip_ws();
         if !self.at_end()
-            && (self.at_word("END-EVALUATE")
-                || self.at_kind(cobol_lexer::TokenKind::EndEvaluate))
+            && (self.at_word("END-EVALUATE") || self.at_kind(cobol_lexer::TokenKind::EndEvaluate))
         {
             self.bump();
         }
@@ -3458,8 +3847,7 @@ impl<'t> Parser<'t> {
         // Consume END-SEARCH if present
         self.skip_ws();
         if !self.at_end()
-            && (self.at_word("END-SEARCH")
-                || self.at_kind(cobol_lexer::TokenKind::EndSearch))
+            && (self.at_word("END-SEARCH") || self.at_kind(cobol_lexer::TokenKind::EndSearch))
         {
             self.bump();
         }
@@ -3544,7 +3932,11 @@ mod tests {
         Token {
             kind,
             text: SmolStr::new(text),
-            span: Span::new(FileId::new(0), TextRange::new(start, end), ExpansionId::ROOT),
+            span: Span::new(
+                FileId::new(0),
+                TextRange::new(start, end),
+                ExpansionId::ROOT,
+            ),
         }
     }
 
@@ -3693,10 +4085,7 @@ mod tests {
             .children()
             .filter(|c| c.kind() == SyntaxKind::DISPLAY_STMT)
             .collect();
-        assert!(
-            !stmts.is_empty(),
-            "expected DISPLAY_STMT in first sentence"
-        );
+        assert!(!stmts.is_empty(), "expected DISPLAY_STMT in first sentence");
     }
 
     #[test]

@@ -139,6 +139,21 @@ pub struct DataItemData {
     pub span: cobol_span::Span,
     /// Whether this is a group item (has subordinate items).
     pub is_group: bool,
+    /// SIGN IS LEADING/TRAILING SEPARATE CHARACTER clause.
+    pub sign_clause: Option<SignClause>,
+    /// JUSTIFIED RIGHT clause — right-justify alphanumeric data on MOVE.
+    pub justified_right: bool,
+    /// BLANK WHEN ZERO clause — display spaces when value is zero.
+    pub blank_when_zero: bool,
+}
+
+/// SIGN clause: controls how the sign of a numeric field is stored.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SignClause {
+    /// If true, sign is LEADING (before digits); if false, sign is TRAILING (after digits).
+    pub is_leading: bool,
+    /// If true, sign is stored in a SEPARATE CHARACTER byte.
+    pub is_separate: bool,
 }
 
 /// OCCURS clause controlling table (array) dimensions.
@@ -215,8 +230,9 @@ pub struct HirModule {
     pub sections: Vec<HirSection>,
     /// Diagnostics produced during lowering.
     pub diagnostics: Vec<HirDiagnostic>,
-    /// Maps 88-level condition names to (parent DataItemId, condition value, optional THRU value).
-    pub condition_names: std::collections::HashMap<String, (DataItemId, Option<InitialValue>, Option<InitialValue>)>,
+    /// Maps 88-level condition names to (parent DataItemId, list of (value, optional THRU value) pairs).
+    pub condition_names:
+        std::collections::HashMap<String, (DataItemId, Vec<(Option<InitialValue>, Option<InitialValue>)>)>,
 }
 
 /// A FILE SECTION FD entry.
@@ -299,6 +315,7 @@ pub enum HirStatement {
         to: Vec<HirDataRef>,
         giving: Option<Vec<HirDataRef>>,
         on_size_error: Option<Vec<HirStatement>>,
+        not_on_size_error: Option<Vec<HirStatement>>,
         rounded: bool,
     },
     Subtract {
@@ -306,6 +323,7 @@ pub enum HirStatement {
         from: Vec<HirDataRef>,
         giving: Option<Vec<HirDataRef>>,
         on_size_error: Option<Vec<HirStatement>>,
+        not_on_size_error: Option<Vec<HirStatement>>,
         rounded: bool,
     },
     Multiply {
@@ -313,6 +331,7 @@ pub enum HirStatement {
         by: HirExpr,
         giving: Option<Vec<HirDataRef>>,
         on_size_error: Option<Vec<HirStatement>>,
+        not_on_size_error: Option<Vec<HirStatement>>,
         rounded: bool,
     },
     Divide {
@@ -321,6 +340,7 @@ pub enum HirStatement {
         giving: Option<Vec<HirDataRef>>,
         remainder: Option<HirDataRef>,
         on_size_error: Option<Vec<HirStatement>>,
+        not_on_size_error: Option<Vec<HirStatement>>,
         rounded: bool,
         is_into: bool,
     },
@@ -328,6 +348,7 @@ pub enum HirStatement {
         targets: Vec<HirDataRef>,
         expr: HirExpr,
         on_size_error: Option<Vec<HirStatement>>,
+        not_on_size_error: Option<Vec<HirStatement>>,
         rounded: bool,
     },
     If {
@@ -343,6 +364,10 @@ pub enum HirStatement {
     GoTo {
         target: cobol_intern::Name,
     },
+    GoToDependingOn {
+        targets: Vec<cobol_intern::Name>,
+        index: HirDataRef,
+    },
     Call {
         program: HirExpr,
         using: Vec<CallArg>,
@@ -355,9 +380,12 @@ pub enum HirStatement {
         source: AcceptSource,
     },
     StringStmt {
-        sources: Vec<HirExpr>,
+        /// Each source paired with its delimiter (None = DELIMITED BY SIZE)
+        sources: Vec<(HirExpr, Option<HirExpr>)>,
         into: HirDataRef,
         pointer: Option<HirDataRef>,
+        on_overflow: Option<Vec<HirStatement>>,
+        not_on_overflow: Option<Vec<HirStatement>>,
     },
     Continue,
     ExitParagraph,
@@ -403,6 +431,22 @@ pub enum HirStatement {
     Set {
         target: HirDataRef,
         action: SetAction,
+    },
+    MoveCorresponding {
+        from: cobol_intern::Name,
+        to: cobol_intern::Name,
+    },
+    AddCorresponding {
+        from: cobol_intern::Name,
+        to: cobol_intern::Name,
+        on_size_error: Option<Vec<HirStatement>>,
+        not_on_size_error: Option<Vec<HirStatement>>,
+    },
+    SubtractCorresponding {
+        from: cobol_intern::Name,
+        to: cobol_intern::Name,
+        on_size_error: Option<Vec<HirStatement>>,
+        not_on_size_error: Option<Vec<HirStatement>>,
     },
 }
 
@@ -459,6 +503,7 @@ pub enum InspectTallyMode {
     Characters,
     All,
     Leading,
+    Trailing,
 }
 
 /// Mode for INSPECT REPLACING.
@@ -467,6 +512,7 @@ pub enum InspectReplaceMode {
     Characters,
     All,
     Leading,
+    Trailing,
     First,
 }
 
@@ -783,11 +829,16 @@ pub fn parse_picture(pic_string: &str) -> Result<PictureType, String> {
         let count = if i + 1 < len && chars[i + 1] == '(' {
             // Parse repetition count: X(nn)
             let start = i + 2;
-            let end = chars[start..].iter().position(|&c| c == ')')
+            let end = chars[start..]
+                .iter()
+                .position(|&c| c == ')')
                 .map(|p| start + p)
-                .ok_or_else(|| format!("unclosed parenthesis in PIC string at position {}", start))?;
-            let num: u32 = upper[start..end].parse()
-                .map_err(|_| format!("invalid repeat count in PIC string: {}", &upper[start..end]))?;
+                .ok_or_else(|| {
+                    format!("unclosed parenthesis in PIC string at position {}", start)
+                })?;
+            let num: u32 = upper[start..end].parse().map_err(|_| {
+                format!("invalid repeat count in PIC string: {}", &upper[start..end])
+            })?;
             i = end + 1;
             num
         } else {
@@ -896,6 +947,7 @@ struct HirLowerer<'a> {
     linkage_items: Vec<DataItemId>,
     using_params: Vec<cobol_intern::Name>,
     paragraphs: Vec<HirParagraph>,
+    sections: Vec<HirSection>,
     diagnostics: Vec<HirDiagnostic>,
     program_name: Option<cobol_intern::Name>,
     /// SELECT entries from the ENVIRONMENT DIVISION.
@@ -906,8 +958,9 @@ struct HirLowerer<'a> {
     file_data_items: Vec<DataItemId>,
     /// File descriptors built from SELECT + FD.
     file_items: Vec<FileDescriptor>,
-    /// Maps 88-level condition names to (parent DataItemId, condition value, optional THRU value).
-    condition_names: std::collections::HashMap<String, (DataItemId, Option<InitialValue>, Option<InitialValue>)>,
+    /// Maps 88-level condition names to (parent DataItemId, list of (value, optional THRU value) pairs).
+    condition_names:
+        std::collections::HashMap<String, (DataItemId, Vec<(Option<InitialValue>, Option<InitialValue>)>)>,
     /// Tracks the last non-88 data item ID for parenting 88-level items.
     last_non_88_item: Option<DataItemId>,
 }
@@ -921,6 +974,7 @@ impl<'a> HirLowerer<'a> {
             linkage_items: Vec::new(),
             using_params: Vec::new(),
             paragraphs: Vec::new(),
+            sections: Vec::new(),
             diagnostics: Vec::new(),
             program_name: None,
             select_entries: Vec::new(),
@@ -991,8 +1045,10 @@ impl<'a> HirLowerer<'a> {
         for el in node.children_with_tokens() {
             if let Some(tok) = el.into_token() {
                 let kind = tok.kind();
-                if kind == SyntaxKind::WHITESPACE || kind == SyntaxKind::NEWLINE
-                    || kind == SyntaxKind::COMMENT || kind == SyntaxKind::PERIOD
+                if kind == SyntaxKind::WHITESPACE
+                    || kind == SyntaxKind::NEWLINE
+                    || kind == SyntaxKind::COMMENT
+                    || kind == SyntaxKind::PERIOD
                 {
                     continue;
                 }
@@ -1055,7 +1111,8 @@ impl<'a> HirLowerer<'a> {
                         match org_upper.as_str() {
                             "LINE" => {
                                 i += 1;
-                                if i < tokens.len() && tokens[i].eq_ignore_ascii_case("SEQUENTIAL") {
+                                if i < tokens.len() && tokens[i].eq_ignore_ascii_case("SEQUENTIAL")
+                                {
                                     organization = FileOrganization::LineSequential;
                                     i += 1;
                                 }
@@ -1072,11 +1129,15 @@ impl<'a> HirLowerer<'a> {
                                 organization = FileOrganization::Relative;
                                 i += 1;
                             }
-                            _ => { i += 1; }
+                            _ => {
+                                i += 1;
+                            }
                         }
                     }
                 }
-                _ => { i += 1; }
+                _ => {
+                    i += 1;
+                }
             }
         }
 
@@ -1163,9 +1224,10 @@ impl<'a> HirLowerer<'a> {
         // Walk bottom-up: for each group item (byte_size == 0 and level < 88),
         // compute its size as the sum of all immediate children's effective sizes.
         let n = items.len();
-        let mut effective_sizes: Vec<u32> = items.iter().map(|&(_, _, sz, occ)| {
-            if sz > 0 { sz * occ } else { 0 }
-        }).collect();
+        let mut effective_sizes: Vec<u32> = items
+            .iter()
+            .map(|&(_, _, sz, occ)| if sz > 0 { sz * occ } else { 0 })
+            .collect();
 
         // Multiple passes: walk from the end to compute group sizes
         for _pass in 0..5 {
@@ -1225,8 +1287,10 @@ impl<'a> HirLowerer<'a> {
                 for el in child.children_with_tokens() {
                     if let Some(tok) = el.into_token() {
                         let kind = tok.kind();
-                        if kind == SyntaxKind::WHITESPACE || kind == SyntaxKind::NEWLINE
-                            || kind == SyntaxKind::COMMENT || kind == SyntaxKind::PERIOD
+                        if kind == SyntaxKind::WHITESPACE
+                            || kind == SyntaxKind::NEWLINE
+                            || kind == SyntaxKind::COMMENT
+                            || kind == SyntaxKind::PERIOD
                         {
                             continue;
                         }
@@ -1257,7 +1321,8 @@ impl<'a> HirLowerer<'a> {
                             let item = &self.data_items[id.into_raw()];
                             if let Some(rec_name) = item.name {
                                 let rec_name_str = self.interner.resolve(rec_name).to_string();
-                                self.fd_records.entry(fd_name.clone())
+                                self.fd_records
+                                    .entry(fd_name.clone())
                                     .or_insert_with(Vec::new)
                                     .push(rec_name_str);
                             }
@@ -1289,7 +1354,11 @@ impl<'a> HirLowerer<'a> {
             let pic_str = {
                 let mut parts = Vec::new();
                 let mut skip_keyword = true; // skip PIC/PICTURE and IS
-                for tok in pic.syntax().children_with_tokens().filter_map(|el| el.into_token()) {
+                for tok in pic
+                    .syntax()
+                    .children_with_tokens()
+                    .filter_map(|el| el.into_token())
+                {
                     let kind = tok.kind();
                     if kind == SyntaxKind::WHITESPACE || kind == SyntaxKind::NEWLINE {
                         if !parts.is_empty() {
@@ -1389,6 +1458,22 @@ impl<'a> HirLowerer<'a> {
         // Extract REDEFINES clause
         let redefines = self.lower_redefines_clause(item);
 
+        // Extract SIGN clause
+        let sign_clause = Self::extract_sign_clause(item);
+
+        // Extract JUSTIFIED clause
+        let justified_right = item.justified_clause().is_some();
+
+        // Extract BLANK WHEN ZERO clause
+        let blank_when_zero = item.blank_clause().is_some();
+
+        // If SIGN IS SEPARATE, add 1 byte to storage for the sign character
+        if let Some(ref sc) = sign_clause {
+            if sc.is_separate {
+                storage.byte_size += 1;
+            }
+        }
+
         let is_group = pic_type.is_none() && level < 77 && level != 88;
 
         let data = DataItemData {
@@ -1403,6 +1488,9 @@ impl<'a> HirLowerer<'a> {
             value: value.clone(),
             span: self.dummy_span(),
             is_group,
+            sign_clause,
+            justified_right,
+            blank_when_zero,
         };
 
         let idx = self.data_items.alloc(data);
@@ -1419,9 +1507,10 @@ impl<'a> HirLowerer<'a> {
                 let name_str = self.interner.resolve(item_name).to_string();
                 let parent_id = self.find_last_non_88_item();
                 if let Some(parent_id) = parent_id {
-                    // Check for THRU/THROUGH in the VALUE clause
-                    let thru_value = self.extract_88_thru_value(item);
-                    self.condition_names.insert(name_str, (parent_id, value, thru_value));
+                    // Extract all (value, optional THRU) pairs from the VALUE clause
+                    let value_pairs = self.extract_88_all_values(item);
+                    self.condition_names
+                        .insert(name_str, (parent_id, value_pairs));
                 }
             }
         }
@@ -1433,6 +1522,37 @@ impl<'a> HirLowerer<'a> {
     ///
     /// Walks the USAGE_CLAUSE child node's tokens, skips USAGE and IS keywords,
     /// and parses the remaining WORD token as a usage type keyword.
+    /// Extract SIGN clause from a data item's SIGN_CLAUSE AST node.
+    fn extract_sign_clause(item: &cobol_ast::DataItem) -> Option<SignClause> {
+        let sc = item.sign_clause()?;
+        let mut is_leading = false;
+        let mut is_separate = false;
+        for tok in sc
+            .syntax()
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+        {
+            let kind = tok.kind();
+            if kind == SyntaxKind::WHITESPACE
+                || kind == SyntaxKind::NEWLINE
+                || kind == SyntaxKind::COMMENT
+            {
+                continue;
+            }
+            let text_upper = tok.text().to_ascii_uppercase();
+            match text_upper.as_str() {
+                "LEADING" => is_leading = true,
+                "TRAILING" => is_leading = false,
+                "SEPARATE" => is_separate = true,
+                _ => {}
+            }
+        }
+        Some(SignClause {
+            is_leading,
+            is_separate,
+        })
+    }
+
     fn extract_usage_type(item: &cobol_ast::DataItem) -> UsageType {
         let uc = match item.usage_clause() {
             Some(uc) => uc,
@@ -1440,9 +1560,14 @@ impl<'a> HirLowerer<'a> {
         };
         // Walk tokens in the USAGE_CLAUSE node, skip USAGE and IS keywords,
         // take the first non-keyword, non-whitespace WORD as the usage type.
-        for tok in uc.syntax().children_with_tokens().filter_map(|el| el.into_token()) {
+        for tok in uc
+            .syntax()
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+        {
             let kind = tok.kind();
-            if kind == SyntaxKind::WHITESPACE || kind == SyntaxKind::NEWLINE
+            if kind == SyntaxKind::WHITESPACE
+                || kind == SyntaxKind::NEWLINE
                 || kind == SyntaxKind::COMMENT
             {
                 continue;
@@ -1476,10 +1601,9 @@ impl<'a> HirLowerer<'a> {
     fn usage_to_encoding(usage: UsageType) -> DataEncoding {
         match usage {
             UsageType::Display => DataEncoding::Display,
-            UsageType::Comp
-            | UsageType::Comp4
-            | UsageType::Comp5
-            | UsageType::Binary => DataEncoding::Binary,
+            UsageType::Comp | UsageType::Comp4 | UsageType::Comp5 | UsageType::Binary => {
+                DataEncoding::Binary
+            }
             UsageType::Comp1 => DataEncoding::FloatSingle,
             UsageType::Comp2 => DataEncoding::FloatDouble,
             UsageType::Comp3 | UsageType::PackedDecimal => DataEncoding::PackedDecimal,
@@ -1587,55 +1711,158 @@ impl<'a> HirLowerer<'a> {
         None
     }
 
-    /// Extract THRU value from an 88-level VALUE clause (e.g., VALUE 60 THRU 100).
-    fn extract_88_thru_value(&self, item: &cobol_ast::DataItem) -> Option<InitialValue> {
-        let vc = item.value_clause()?;
-        let mut found_thru = false;
-        let mut negate = false;
+    /// Extract all (value, optional THRU value) pairs from an 88-level VALUE clause.
+    ///
+    /// Handles multiple discrete values (e.g., VALUE 1 2 3 4 5) and values
+    /// combined with THRU ranges (e.g., VALUE 1 THRU 5 10 THRU 20).
+    fn extract_88_all_values(
+        &self,
+        item: &cobol_ast::DataItem,
+    ) -> Vec<(Option<InitialValue>, Option<InitialValue>)> {
+        let vc = match item.value_clause() {
+            Some(vc) => vc,
+            None => return Vec::new(),
+        };
+
+        let mut pairs: Vec<(Option<InitialValue>, Option<InitialValue>)> = Vec::new();
+        // Collect all meaningful tokens from the VALUE clause
+        let mut tokens: Vec<(SyntaxKind, String)> = Vec::new();
         for el in vc.syntax().children_with_tokens() {
             if let Some(tok) = el.into_token() {
-                let upper = tok.text().to_ascii_uppercase();
-                if upper == "THRU" || upper == "THROUGH" {
-                    found_thru = true;
-                    negate = false;
+                let kind = tok.kind();
+                if kind == SyntaxKind::WHITESPACE
+                    || kind == SyntaxKind::NEWLINE
+                    || kind == SyntaxKind::COMMENT
+                {
                     continue;
                 }
-                if !found_thru {
+                let text = tok.text().to_string();
+                let upper = text.to_ascii_uppercase();
+                // Skip the VALUE/VALUES/IS/ARE keywords
+                if upper == "VALUE" || upper == "VALUES" || upper == "IS" || upper == "ARE" {
                     continue;
                 }
-                match tok.kind() {
-                    SyntaxKind::MINUS => { negate = true; }
-                    SyntaxKind::INTEGER_LITERAL => {
-                        if let Ok(n) = tok.text().parse::<i64>() {
-                            let value = if negate { -n } else { n };
-                            return Some(InitialValue::Numeric(value, 0));
-                        }
-                    }
-                    SyntaxKind::DECIMAL_LITERAL => {
-                        if let Some(dot_pos) = tok.text().find('.') {
-                            let scale = (tok.text().len() - dot_pos - 1) as i32;
-                            if let Ok(n) = tok.text().replace('.', "").parse::<i64>() {
-                                let value = if negate { -n } else { n };
-                                return Some(InitialValue::Numeric(value, scale));
-                            }
-                        }
-                    }
-                    SyntaxKind::STRING_LITERAL => {
-                        let text = tok.text().to_string();
-                        let inner = if (text.starts_with('"') && text.ends_with('"'))
-                            || (text.starts_with('\'') && text.ends_with('\''))
-                        {
-                            text[1..text.len() - 1].to_string()
-                        } else {
-                            text
-                        };
-                        return Some(InitialValue::String_(inner));
-                    }
-                    _ => {}
-                }
+                tokens.push((kind, text));
             }
         }
-        None
+
+        // Parse tokens into (value, optional thru) pairs
+        let mut i = 0;
+        while i < tokens.len() {
+            let (kind, ref _text) = tokens[i];
+
+            // Check for MINUS sign before a literal
+            let mut negate = false;
+            let mut current_i = i;
+            if kind == SyntaxKind::MINUS {
+                negate = true;
+                current_i += 1;
+                if current_i >= tokens.len() {
+                    break;
+                }
+            }
+
+            let (lit_kind, ref lit_text) = tokens[current_i];
+            let val = self.parse_literal_token(lit_kind, lit_text, negate);
+
+            if val.is_none() {
+                // Skip unrecognized tokens
+                i = current_i + 1;
+                continue;
+            }
+
+            // Check if next meaningful token is THRU/THROUGH
+            let next_i = current_i + 1;
+            if next_i < tokens.len() {
+                let next_upper = tokens[next_i].1.to_ascii_uppercase();
+                if next_upper == "THRU" || next_upper == "THROUGH" {
+                    // Parse the THRU value
+                    let thru_start = next_i + 1;
+                    if thru_start < tokens.len() {
+                        let mut thru_negate = false;
+                        let mut thru_i = thru_start;
+                        if tokens[thru_i].0 == SyntaxKind::MINUS {
+                            thru_negate = true;
+                            thru_i += 1;
+                        }
+                        if thru_i < tokens.len() {
+                            let thru_val = self.parse_literal_token(
+                                tokens[thru_i].0,
+                                &tokens[thru_i].1,
+                                thru_negate,
+                            );
+                            pairs.push((val, thru_val));
+                            i = thru_i + 1;
+                            continue;
+                        }
+                    }
+                    // THRU without valid value: store just the base value
+                    pairs.push((val, None));
+                    i = thru_start;
+                    continue;
+                }
+            }
+
+            // No THRU, this is a discrete value
+            pairs.push((val, None));
+            i = current_i + 1;
+        }
+
+        pairs
+    }
+
+    /// Parse a single literal token into an InitialValue.
+    fn parse_literal_token(
+        &self,
+        kind: SyntaxKind,
+        text: &str,
+        negate: bool,
+    ) -> Option<InitialValue> {
+        match kind {
+            SyntaxKind::INTEGER_LITERAL => {
+                if let Ok(n) = text.parse::<i64>() {
+                    let value = if negate { -n } else { n };
+                    Some(InitialValue::Numeric(value, 0))
+                } else {
+                    None
+                }
+            }
+            SyntaxKind::DECIMAL_LITERAL => {
+                if let Some(dot_pos) = text.find('.') {
+                    let scale = (text.len() - dot_pos - 1) as i32;
+                    if let Ok(n) = text.replace('.', "").parse::<i64>() {
+                        let value = if negate { -n } else { n };
+                        Some(InitialValue::Numeric(value, scale))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            SyntaxKind::STRING_LITERAL => {
+                let inner = if (text.starts_with('"') && text.ends_with('"'))
+                    || (text.starts_with('\'') && text.ends_with('\''))
+                {
+                    text[1..text.len() - 1].to_string()
+                } else {
+                    text.to_string()
+                };
+                Some(InitialValue::String_(inner))
+            }
+            SyntaxKind::WORD => {
+                let upper = text.to_ascii_uppercase();
+                match upper.as_str() {
+                    "ZERO" | "ZEROS" | "ZEROES" => Some(InitialValue::Zero),
+                    "SPACE" | "SPACES" => Some(InitialValue::Space),
+                    "HIGH-VALUE" | "HIGH-VALUES" => Some(InitialValue::HighValue),
+                    "LOW-VALUE" | "LOW-VALUES" => Some(InitialValue::LowValue),
+                    "QUOTE" | "QUOTES" => Some(InitialValue::Quote),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
     }
 
     /// Extract an OCCURS clause from a data item CST node.
@@ -1647,7 +1874,8 @@ impl<'a> HirLowerer<'a> {
                 for el in child.children_with_tokens() {
                     if let Some(tok) = el.into_token() {
                         let kind = tok.kind();
-                        if kind == SyntaxKind::WHITESPACE || kind == SyntaxKind::NEWLINE
+                        if kind == SyntaxKind::WHITESPACE
+                            || kind == SyntaxKind::NEWLINE
                             || kind == SyntaxKind::COMMENT
                         {
                             continue;
@@ -1687,7 +1915,9 @@ impl<'a> HirLowerer<'a> {
                                 }
                             }
                         }
-                        "TIMES" => { i += 1; }
+                        "TIMES" => {
+                            i += 1;
+                        }
                         "DEPENDING" => {
                             i += 1;
                             if i < tokens.len() && tokens[i].eq_ignore_ascii_case("ON") {
@@ -1706,15 +1936,19 @@ impl<'a> HirLowerer<'a> {
                             }
                             while i < tokens.len() {
                                 let tok_upper = tokens[i].to_ascii_uppercase();
-                                if tok_upper == "ASCENDING" || tok_upper == "DESCENDING"
-                                    || tok_upper == "KEY" {
+                                if tok_upper == "ASCENDING"
+                                    || tok_upper == "DESCENDING"
+                                    || tok_upper == "KEY"
+                                {
                                     break;
                                 }
                                 indexed_by.push(self.interner.intern(&tok_upper));
                                 i += 1;
                             }
                         }
-                        _ => { i += 1; }
+                        _ => {
+                            i += 1;
+                        }
                     }
                 }
 
@@ -1740,7 +1974,8 @@ impl<'a> HirLowerer<'a> {
                 for el in child.children_with_tokens() {
                     if let Some(tok) = el.into_token() {
                         let kind = tok.kind();
-                        if kind == SyntaxKind::WHITESPACE || kind == SyntaxKind::NEWLINE
+                        if kind == SyntaxKind::WHITESPACE
+                            || kind == SyntaxKind::NEWLINE
                             || kind == SyntaxKind::COMMENT
                         {
                             continue;
@@ -1774,7 +2009,11 @@ impl<'a> HirLowerer<'a> {
         // Extract USING parameters: scan direct token children for
         // "USING" keyword followed by parameter names until period.
         let mut saw_using = false;
-        for tok in proc_div.syntax().children_with_tokens().filter_map(|el| el.into_token()) {
+        for tok in proc_div
+            .syntax()
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+        {
             let kind = tok.kind();
             let text = tok.text().to_ascii_uppercase();
             if text == "USING" {
@@ -1783,10 +2022,14 @@ impl<'a> HirLowerer<'a> {
             }
             if saw_using {
                 if kind == SyntaxKind::PERIOD || kind == SyntaxKind::NEWLINE {
-                    if kind == SyntaxKind::PERIOD { break; }
+                    if kind == SyntaxKind::PERIOD {
+                        break;
+                    }
                     continue;
                 }
-                if kind == SyntaxKind::WHITESPACE { continue; }
+                if kind == SyntaxKind::WHITESPACE {
+                    continue;
+                }
                 // Skip BY REFERENCE / BY CONTENT / BY VALUE keywords
                 if matches!(text.as_str(), "BY" | "REFERENCE" | "CONTENT" | "VALUE") {
                     continue;
@@ -1819,9 +2062,51 @@ impl<'a> HirLowerer<'a> {
             });
         }
 
-        // Then handle named paragraphs
+        // Then handle named paragraphs (direct children of PROCEDURE DIVISION)
         for para in proc_div.paragraphs() {
             self.lower_paragraph(&para);
+        }
+
+        // Handle sections and their contained paragraphs
+        for section in proc_div.sections() {
+            let section_name = if let Some(tok) = section.name() {
+                self.interner.intern(&tok.text().to_string().to_ascii_uppercase())
+            } else {
+                self.interner.intern("UNNAMED-SECTION")
+            };
+
+            let first_para_idx = self.paragraphs.len();
+
+            // Loose sentences directly inside the section (before any named paragraph)
+            let mut section_loose_stmts = Vec::new();
+            for sent in section.sentences() {
+                self.lower_sentence(&sent, &mut section_loose_stmts);
+            }
+            if !section_loose_stmts.is_empty() {
+                // Create an implicit paragraph for the loose sentences
+                let implicit_name = self.interner.intern(
+                    &format!("_{}", self.interner.resolve(section_name)),
+                );
+                self.paragraphs.push(HirParagraph {
+                    name: implicit_name,
+                    statements: section_loose_stmts,
+                    span: self.dummy_span(),
+                });
+            }
+
+            // Named paragraphs within the section
+            for para in section.paragraphs() {
+                self.lower_paragraph(&para);
+            }
+
+            let last_para_idx = self.paragraphs.len();
+            let paragraph_indices: Vec<usize> = (first_para_idx..last_para_idx).collect();
+
+            self.sections.push(HirSection {
+                name: section_name,
+                paragraphs: paragraph_indices,
+                span: self.dummy_span(),
+            });
         }
     }
 
@@ -1844,11 +2129,7 @@ impl<'a> HirLowerer<'a> {
         });
     }
 
-    fn lower_sentence(
-        &mut self,
-        sentence: &cobol_ast::Sentence,
-        stmts: &mut Vec<HirStatement>,
-    ) {
+    fn lower_sentence(&mut self, sentence: &cobol_ast::Sentence, stmts: &mut Vec<HirStatement>) {
         // Sentences contain statement nodes as children.
         // Statement nodes can be DISPLAY_STMT, STOP_STMT, etc.
         for child in sentence.syntax().children() {
@@ -1995,8 +2276,7 @@ impl<'a> HirLowerer<'a> {
             let upper = text.to_ascii_uppercase();
 
             match upper.as_str() {
-                "DISPLAY" | "UPON" | "WITH" | "IS" | "STANDARD-1" | "STANDARD-2"
-                | "CONSOLE" => {
+                "DISPLAY" | "UPON" | "WITH" | "IS" | "STANDARD-1" | "STANDARD-2" | "CONSOLE" => {
                     i += 1;
                 }
                 "NO" => {
@@ -2046,8 +2326,26 @@ impl<'a> HirLowerer<'a> {
     fn lower_move_stmt(&mut self, node: &cobol_ast::SyntaxNode) -> Option<HirStatement> {
         let tokens = self.collect_tokens(node);
 
+        // Check for MOVE CORRESPONDING/CORR
+        if tokens.len() > 1 {
+            let kw = tokens[1].1.to_ascii_uppercase();
+            if kw == "CORRESPONDING" || kw == "CORR" {
+                // MOVE CORRESPONDING source TO dest
+                let to_idx = tokens
+                    .iter()
+                    .position(|(_, text)| text.eq_ignore_ascii_case("TO"))?;
+                let source_name = tokens.get(2)?.1.to_ascii_uppercase();
+                let dest_name = tokens.get(to_idx + 1)?.1.to_ascii_uppercase();
+                let from = self.interner.intern(&source_name);
+                let to = self.interner.intern(&dest_name);
+                return Some(HirStatement::MoveCorresponding { from, to });
+            }
+        }
+
         // Find TO separator
-        let to_idx = tokens.iter().position(|(_, text)| text.eq_ignore_ascii_case("TO"))?;
+        let to_idx = tokens
+            .iter()
+            .position(|(_, text)| text.eq_ignore_ascii_case("TO"))?;
 
         // Source: parse from position 1 (after MOVE) using parse_expr_at for
         // subscript/ref-mod awareness
@@ -2063,7 +2361,12 @@ impl<'a> HirLowerer<'a> {
         let mut t = to_idx + 1;
         while t < tokens.len() {
             let (kind, ref text) = tokens[t];
-            if text == "(" || text == ")" || text == "," || text == ":" || kind == SyntaxKind::PERIOD {
+            if text == "("
+                || text == ")"
+                || text == ","
+                || text == ":"
+                || kind == SyntaxKind::PERIOD
+            {
                 t += 1;
                 continue;
             }
@@ -2109,8 +2412,11 @@ impl<'a> HirLowerer<'a> {
         while i < tokens.len() {
             let upper = tokens[i].1.to_ascii_uppercase();
             match upper.as_str() {
-                "NUMERIC" | "ALPHANUMERIC" | "ALPHABETIC"
-                | "ALPHANUMERIC-EDITED" | "NUMERIC-EDITED" => {
+                "NUMERIC"
+                | "ALPHANUMERIC"
+                | "ALPHABETIC"
+                | "ALPHANUMERIC-EDITED"
+                | "NUMERIC-EDITED" => {
                     let category = upper.clone();
                     i += 1;
                     // Skip optional "DATA"
@@ -2148,7 +2454,8 @@ impl<'a> HirLowerer<'a> {
         for el in node.children_with_tokens() {
             if let Some(tok) = el.as_token() {
                 let kind = tok.kind();
-                if kind == SyntaxKind::WHITESPACE || kind == SyntaxKind::NEWLINE
+                if kind == SyntaxKind::WHITESPACE
+                    || kind == SyntaxKind::NEWLINE
                     || kind == SyntaxKind::COMMENT
                 {
                     continue;
@@ -2166,7 +2473,8 @@ impl<'a> HirLowerer<'a> {
         for el in node.children_with_tokens() {
             if let Some(tok) = el.into_token() {
                 let kind = tok.kind();
-                if kind == SyntaxKind::WHITESPACE || kind == SyntaxKind::NEWLINE
+                if kind == SyntaxKind::WHITESPACE
+                    || kind == SyntaxKind::NEWLINE
                     || kind == SyntaxKind::COMMENT
                 {
                     continue;
@@ -2233,6 +2541,34 @@ impl<'a> HirLowerer<'a> {
         }
     }
 
+    /// Parse a token at `idx` that may be preceded by a unary minus sign.
+    /// If `tokens[idx]` is a MINUS and the next token is an integer literal,
+    /// return the negated integer. Otherwise delegate to `token_to_expr`.
+    fn parse_signed_token(&mut self, tokens: &[(SyntaxKind, String)], idx: usize) -> HirExpr {
+        if idx < tokens.len() && tokens[idx].0 == SyntaxKind::MINUS {
+            // Check if the next token is an integer or decimal literal
+            if idx + 1 < tokens.len() {
+                match tokens[idx + 1].0 {
+                    SyntaxKind::INTEGER_LITERAL => {
+                        if let Ok(n) = tokens[idx + 1].1.parse::<i64>() {
+                            return HirExpr::Literal(LiteralValue::Integer(-n));
+                        }
+                    }
+                    SyntaxKind::DECIMAL_LITERAL => {
+                        let neg = format!("-{}", tokens[idx + 1].1);
+                        return HirExpr::Literal(LiteralValue::Decimal(neg));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if idx < tokens.len() {
+            self.token_to_expr(tokens[idx].0, &tokens[idx].1)
+        } else {
+            HirExpr::Literal(LiteralValue::Integer(0))
+        }
+    }
+
     /// Parse a single expression (possibly subscripted) from a token slice starting
     /// at position `pos`. Returns `(expr, next_pos)`.
     ///
@@ -2251,13 +2587,18 @@ impl<'a> HirLowerer<'a> {
 
         // Check if this is a DataRef followed by subscripts or ref-mod in parens
         if let HirExpr::DataRef(ref dr) = base_expr {
+            let name = dr.name;
+            let mut subscripts = Vec::new();
+            let mut ref_mod_val = None;
+            let mut next = pos + 1;
+
             if pos + 1 < tokens.len() && tokens[pos + 1].1 == "(" {
                 // Peek inside parens to determine if this is ref-mod (has ':') or subscripts
-                let has_colon = tokens[pos + 2..].iter()
+                let has_colon = tokens[pos + 2..]
+                    .iter()
                     .take_while(|(_, t)| t != ")")
                     .any(|(_, t)| t == ":");
 
-                let name = dr.name;
                 let mut i = pos + 2; // skip name and '('
 
                 if has_colon {
@@ -2270,7 +2611,9 @@ impl<'a> HirLowerer<'a> {
                         HirExpr::Literal(LiteralValue::Integer(1))
                     };
                     // Skip ':'
-                    if i < tokens.len() && tokens[i].1 == ":" { i += 1; }
+                    if i < tokens.len() && tokens[i].1 == ":" {
+                        i += 1;
+                    }
                     // Optional length
                     let length_expr = if i < tokens.len() && tokens[i].1 != ")" {
                         let e = self.token_to_expr(tokens[i].0, &tokens[i].1);
@@ -2279,21 +2622,13 @@ impl<'a> HirLowerer<'a> {
                     } else {
                         None
                     };
-                    if i < tokens.len() && tokens[i].1 == ")" { i += 1; }
-
-                    return (
-                        HirExpr::DataRef(Box::new(HirDataRef {
-                            name,
-                            qualifiers: Vec::new(),
-                            subscripts: Vec::new(),
-                            ref_mod: Some((Box::new(start_expr), length_expr)),
-                            resolved: None,
-                        })),
-                        i,
-                    );
+                    if i < tokens.len() && tokens[i].1 == ")" {
+                        i += 1;
+                    }
+                    ref_mod_val = Some((Box::new(start_expr), length_expr));
+                    next = i;
                 } else {
                     // Subscripts: name(expr, expr, ...)
-                    let mut subscripts = Vec::new();
                     while i < tokens.len() && tokens[i].1 != ")" {
                         let sub_text = &tokens[i].1;
                         if sub_text != "," {
@@ -2301,40 +2636,74 @@ impl<'a> HirLowerer<'a> {
                         }
                         i += 1;
                     }
-                    if i < tokens.len() && tokens[i].1 == ")" { i += 1; }
-
-                    return (
-                        HirExpr::DataRef(Box::new(HirDataRef {
-                            name,
-                            qualifiers: Vec::new(),
-                            subscripts,
-                            ref_mod: None,
-                            resolved: None,
-                        })),
-                        i,
-                    );
+                    if i < tokens.len() && tokens[i].1 == ")" {
+                        i += 1;
+                    }
+                    next = i;
                 }
             }
+
+            // Check for OF/IN qualifier chain
+            let mut qualifiers = Vec::new();
+            while next < tokens.len() {
+                let kw = tokens[next].1.to_ascii_uppercase();
+                if (kw == "OF" || kw == "IN") && next + 1 < tokens.len() {
+                    let qual_text = tokens[next + 1].1.to_ascii_uppercase();
+                    qualifiers.push(self.interner.intern(&qual_text));
+                    next += 2;
+                } else {
+                    break;
+                }
+            }
+
+            return (
+                HirExpr::DataRef(Box::new(HirDataRef {
+                    name,
+                    qualifiers,
+                    subscripts,
+                    ref_mod: ref_mod_val,
+                    resolved: None,
+                })),
+                next,
+            );
         }
 
         (base_expr, pos + 1)
     }
 
-    /// Parse a data reference (possibly subscripted) from a token slice at `pos`.
+    /// Parse a data reference (possibly subscripted, qualified with OF/IN) from a token slice at `pos`.
     /// Returns `(data_ref, next_pos)`.
-    fn parse_data_ref_at(&mut self, tokens: &[(SyntaxKind, String)], pos: usize) -> (HirDataRef, usize) {
+    fn parse_data_ref_at(
+        &mut self,
+        tokens: &[(SyntaxKind, String)],
+        pos: usize,
+    ) -> (HirDataRef, usize) {
         if pos >= tokens.len() {
             let name = self.interner.intern("?");
-            return (HirDataRef { name, qualifiers: Vec::new(), subscripts: Vec::new(), ref_mod: None, resolved: None }, pos);
+            return (
+                HirDataRef {
+                    name,
+                    qualifiers: Vec::new(),
+                    subscripts: Vec::new(),
+                    ref_mod: None,
+                    resolved: None,
+                },
+                pos,
+            );
         }
 
         let text = &tokens[pos].1;
         let upper = text.to_ascii_uppercase();
         let name = self.interner.intern(&upper);
 
+        let mut subscripts = Vec::new();
+        let mut ref_mod = None;
+        let mut next = pos + 1;
+
         // Check for subscripts or ref-mod
         if pos + 1 < tokens.len() && tokens[pos + 1].1 == "(" {
-            let has_colon = tokens[pos + 2..].iter()
+            let has_colon = tokens[pos + 2..]
+                .iter()
                 .take_while(|(_, t)| t != ")")
                 .any(|(_, t)| t == ":");
 
@@ -2349,7 +2718,9 @@ impl<'a> HirLowerer<'a> {
                 } else {
                     HirExpr::Literal(LiteralValue::Integer(1))
                 };
-                if i < tokens.len() && tokens[i].1 == ":" { i += 1; }
+                if i < tokens.len() && tokens[i].1 == ":" {
+                    i += 1;
+                }
                 let length_expr = if i < tokens.len() && tokens[i].1 != ")" {
                     let e = self.token_to_expr(tokens[i].0, &tokens[i].1);
                     i += 1;
@@ -2357,18 +2728,13 @@ impl<'a> HirLowerer<'a> {
                 } else {
                     None
                 };
-                if i < tokens.len() && tokens[i].1 == ")" { i += 1; }
-                return (
-                    HirDataRef {
-                        name, qualifiers: Vec::new(), subscripts: Vec::new(),
-                        ref_mod: Some((Box::new(start_expr), length_expr)),
-                        resolved: None,
-                    },
-                    i,
-                );
+                if i < tokens.len() && tokens[i].1 == ")" {
+                    i += 1;
+                }
+                ref_mod = Some((Box::new(start_expr), length_expr));
+                next = i;
             } else {
                 // Subscripts
-                let mut subscripts = Vec::new();
                 while i < tokens.len() && tokens[i].1 != ")" {
                     let sub_text = &tokens[i].1;
                     if sub_text != "," {
@@ -2376,15 +2742,36 @@ impl<'a> HirLowerer<'a> {
                     }
                     i += 1;
                 }
-                if i < tokens.len() && tokens[i].1 == ")" { i += 1; }
-                return (
-                    HirDataRef { name, qualifiers: Vec::new(), subscripts, ref_mod: None, resolved: None },
-                    i,
-                );
+                if i < tokens.len() && tokens[i].1 == ")" {
+                    i += 1;
+                }
+                next = i;
             }
         }
 
-        (HirDataRef { name, qualifiers: Vec::new(), subscripts: Vec::new(), ref_mod: None, resolved: None }, pos + 1)
+        // Check for OF/IN qualifier chain
+        let mut qualifiers = Vec::new();
+        while next < tokens.len() {
+            let kw = tokens[next].1.to_ascii_uppercase();
+            if (kw == "OF" || kw == "IN") && next + 1 < tokens.len() {
+                let qual_text = tokens[next + 1].1.to_ascii_uppercase();
+                qualifiers.push(self.interner.intern(&qual_text));
+                next += 2;
+            } else {
+                break;
+            }
+        }
+
+        (
+            HirDataRef {
+                name,
+                qualifiers,
+                subscripts,
+                ref_mod,
+                resolved: None,
+            },
+            next,
+        )
     }
 
     /// Helper: make a data ref from a name string.
@@ -2405,7 +2792,8 @@ impl<'a> HirLowerer<'a> {
         let mut mode = OpenMode::Input;
         let mut file_name = None;
 
-        for (_, text) in &tokens[1..] { // Skip OPEN keyword
+        for (_, text) in &tokens[1..] {
+            // Skip OPEN keyword
             let upper = text.to_ascii_uppercase();
             match upper.as_str() {
                 "INPUT" => mode = OpenMode::Input,
@@ -2429,7 +2817,9 @@ impl<'a> HirLowerer<'a> {
     fn lower_close_stmt(&mut self, node: &cobol_ast::SyntaxNode) -> Option<HirStatement> {
         let tokens = self.collect_tokens(node);
         // CLOSE file-name
-        if tokens.len() < 2 { return None; }
+        if tokens.len() < 2 {
+            return None;
+        }
         let file_name = self.interner.intern(&tokens[1].1.to_ascii_uppercase());
         Some(HirStatement::Close { file: file_name })
     }
@@ -2437,7 +2827,9 @@ impl<'a> HirLowerer<'a> {
     fn lower_write_stmt(&mut self, node: &cobol_ast::SyntaxNode) -> Option<HirStatement> {
         let tokens = self.collect_tokens(node);
         // WRITE record-name
-        if tokens.len() < 2 { return None; }
+        if tokens.len() < 2 {
+            return None;
+        }
         let record = self.interner.intern(&tokens[1].1.to_ascii_uppercase());
         Some(HirStatement::Write { record })
     }
@@ -2468,7 +2860,8 @@ impl<'a> HirLowerer<'a> {
                 "INTO" => {
                     i += 1;
                     if i < all_tokens.len() {
-                        into_name = Some(self.interner.intern(&all_tokens[i].1.to_ascii_uppercase()));
+                        into_name =
+                            Some(self.interner.intern(&all_tokens[i].1.to_ascii_uppercase()));
                         i += 1;
                     }
                 }
@@ -2477,16 +2870,21 @@ impl<'a> HirLowerer<'a> {
                     break;
                 }
                 "END-READ" | "NOT" => break,
-                _ => { i += 1; }
+                _ => {
+                    i += 1;
+                }
             }
         }
 
         // Lower AT END statements from child nodes
         for child in node.children() {
             let kind = child.kind();
-            if kind == SyntaxKind::MOVE_STMT || kind == SyntaxKind::DISPLAY_STMT
-                || kind == SyntaxKind::ADD_STMT || kind == SyntaxKind::STOP_STMT
-                || kind == SyntaxKind::COMPUTE_STMT || kind == SyntaxKind::IF_STMT
+            if kind == SyntaxKind::MOVE_STMT
+                || kind == SyntaxKind::DISPLAY_STMT
+                || kind == SyntaxKind::ADD_STMT
+                || kind == SyntaxKind::STOP_STMT
+                || kind == SyntaxKind::COMPUTE_STMT
+                || kind == SyntaxKind::IF_STMT
                 || kind == SyntaxKind::PERFORM_STMT
             {
                 self.lower_child_statement(&child, &mut at_end_stmts);
@@ -2502,6 +2900,27 @@ impl<'a> HirLowerer<'a> {
 
     fn lower_add_stmt(&mut self, node: &cobol_ast::SyntaxNode) -> Option<HirStatement> {
         let tokens = self.collect_tokens(node);
+
+        // Check for ADD CORRESPONDING/CORR
+        if tokens.len() > 1 {
+            let kw = tokens[1].1.to_ascii_uppercase();
+            if kw == "CORRESPONDING" || kw == "CORR" {
+                // ADD CORRESPONDING source TO dest
+                let to_idx = tokens
+                    .iter()
+                    .position(|(_, text)| text.eq_ignore_ascii_case("TO"))?;
+                let source_name = tokens.get(2)?.1.to_ascii_uppercase();
+                let dest_name = tokens.get(to_idx + 1)?.1.to_ascii_uppercase();
+                let from = self.interner.intern(&source_name);
+                let to = self.interner.intern(&dest_name);
+                // Find where size error tokens start (after TO dest)
+                let handler_start = to_idx + 2;
+                let (on_size_error, not_on_size_error) =
+                    self.extract_size_error_handlers(&tokens, handler_start, "END-ADD");
+                return Some(HirStatement::AddCorresponding { from, to, on_size_error, not_on_size_error });
+            }
+        }
+
         // ADD op1 [op2...] TO target / ADD op1 op2 GIVING target
         // Skip "ADD" keyword at index 0
         let has_giving = tokens.iter().any(|(_, t)| t.eq_ignore_ascii_case("GIVING"));
@@ -2517,11 +2936,27 @@ impl<'a> HirLowerer<'a> {
         while i < tokens.len() {
             let upper = tokens[i].1.to_ascii_uppercase();
             match upper.as_str() {
-                "TO" => { phase = 1; i += 1; continue; }
-                "GIVING" => { phase = 2; i += 1; continue; }
-                "ROUNDED" => { rounded = true; i += 1; continue; }
-                "ON" | "SIZE" | "ERROR" | "NOT" | "END-ADD" => break,
-                "(" | ")" | "," => { i += 1; continue; } // stray parens (shouldn't happen with parse_*_at)
+                "TO" => {
+                    phase = 1;
+                    i += 1;
+                    continue;
+                }
+                "GIVING" => {
+                    phase = 2;
+                    i += 1;
+                    continue;
+                }
+                "ROUNDED" => {
+                    rounded = true;
+                    i += 1;
+                    continue;
+                }
+                "ON" | "SIZE" | "ERROR" | "NOT" | "END-ADD" | "ELSE"
+                | "END-IF" | "END-PERFORM" | "END-EVALUATE" | "WHEN" => break,
+                "(" | ")" | "," => {
+                    i += 1;
+                    continue;
+                } // stray parens (shouldn't happen with parse_*_at)
                 _ => {}
             }
             match phase {
@@ -2540,16 +2975,30 @@ impl<'a> HirLowerer<'a> {
                     giving_targets.push(dr);
                     i = next;
                 }
-                _ => { i += 1; }
+                _ => {
+                    i += 1;
+                }
             }
         }
 
+        // Extract ON SIZE ERROR / NOT ON SIZE ERROR handlers
+        let (on_size_error, not_on_size_error) =
+            self.extract_size_error_handlers(&tokens, i, "END-ADD");
+
         if has_giving {
+            // ADD A TO B GIVING C  =>  C = A + B
+            // The TO targets are operands (sources) when GIVING is present,
+            // not accumulator destinations. Merge them into the operand list.
+            let mut all_operands = operands;
+            for t in &to_targets {
+                all_operands.push(HirExpr::DataRef(Box::new(t.clone())));
+            }
             Some(HirStatement::Add {
-                operands,
+                operands: all_operands,
                 to: Vec::new(),
                 giving: Some(giving_targets),
-                on_size_error: None,
+                on_size_error,
+                not_on_size_error,
                 rounded,
             })
         } else if has_to {
@@ -2557,7 +3006,8 @@ impl<'a> HirLowerer<'a> {
                 operands,
                 to: to_targets,
                 giving: None,
-                on_size_error: None,
+                on_size_error,
+                not_on_size_error,
                 rounded,
             })
         } else {
@@ -2567,6 +3017,32 @@ impl<'a> HirLowerer<'a> {
 
     fn lower_subtract_stmt(&mut self, node: &cobol_ast::SyntaxNode) -> Option<HirStatement> {
         let tokens = self.collect_tokens(node);
+
+        // Check for SUBTRACT CORRESPONDING/CORR
+        if tokens.len() > 1 {
+            let kw = tokens[1].1.to_ascii_uppercase();
+            if kw == "CORRESPONDING" || kw == "CORR" {
+                // SUBTRACT CORRESPONDING source FROM dest
+                let from_idx = tokens
+                    .iter()
+                    .position(|(_, text)| text.eq_ignore_ascii_case("FROM"))?;
+                let source_name = tokens.get(2)?.1.to_ascii_uppercase();
+                let dest_name = tokens.get(from_idx + 1)?.1.to_ascii_uppercase();
+                let from = self.interner.intern(&source_name);
+                let to = self.interner.intern(&dest_name);
+                // Find where size error tokens start (after FROM dest)
+                let handler_start = from_idx + 2;
+                let (on_size_error, not_on_size_error) =
+                    self.extract_size_error_handlers(&tokens, handler_start, "END-SUBTRACT");
+                return Some(HirStatement::SubtractCorresponding {
+                    from,
+                    to,
+                    on_size_error,
+                    not_on_size_error,
+                });
+            }
+        }
+
         let has_giving = tokens.iter().any(|(_, t)| t.eq_ignore_ascii_case("GIVING"));
 
         let mut operands = Vec::new();
@@ -2579,11 +3055,27 @@ impl<'a> HirLowerer<'a> {
         while i < tokens.len() {
             let upper = tokens[i].1.to_ascii_uppercase();
             match upper.as_str() {
-                "FROM" => { phase = 1; i += 1; continue; }
-                "GIVING" => { phase = 2; i += 1; continue; }
-                "ROUNDED" => { rounded = true; i += 1; continue; }
-                "ON" | "SIZE" | "ERROR" | "NOT" | "END-SUBTRACT" => break,
-                "(" | ")" | "," => { i += 1; continue; }
+                "FROM" => {
+                    phase = 1;
+                    i += 1;
+                    continue;
+                }
+                "GIVING" => {
+                    phase = 2;
+                    i += 1;
+                    continue;
+                }
+                "ROUNDED" => {
+                    rounded = true;
+                    i += 1;
+                    continue;
+                }
+                "ON" | "SIZE" | "ERROR" | "NOT" | "END-SUBTRACT" | "ELSE"
+                | "END-IF" | "END-PERFORM" | "END-EVALUATE" | "WHEN" => break,
+                "(" | ")" | "," => {
+                    i += 1;
+                    continue;
+                }
                 _ => {}
             }
             match phase {
@@ -2602,17 +3094,274 @@ impl<'a> HirLowerer<'a> {
                     giving_targets.push(dr);
                     i = next;
                 }
-                _ => { i += 1; }
+                _ => {
+                    i += 1;
+                }
             }
         }
+
+        // Extract ON SIZE ERROR / NOT ON SIZE ERROR handlers
+        let (on_size_error, not_on_size_error) =
+            self.extract_size_error_handlers(&tokens, i, "END-SUBTRACT");
 
         Some(HirStatement::Subtract {
             operands,
             from: from_targets,
-            giving: if has_giving { Some(giving_targets) } else { None },
-            on_size_error: None,
+            giving: if has_giving {
+                Some(giving_targets)
+            } else {
+                None
+            },
+            on_size_error,
+            not_on_size_error,
             rounded,
         })
+    }
+
+    /// Extract ON SIZE ERROR / NOT ON SIZE ERROR handler statements from
+    /// tokens starting at position `start`. Returns `(on_size_error, not_on_size_error)`.
+    fn extract_size_error_handlers(
+        &mut self,
+        tokens: &[(SyntaxKind, String)],
+        start: usize,
+        end_keyword: &str,
+    ) -> (Option<Vec<HirStatement>>, Option<Vec<HirStatement>>) {
+        let mut on_size_stmts = Vec::new();
+        let mut not_on_size_stmts = Vec::new();
+
+        // Advance past ON SIZE ERROR keywords
+        let mut pos = start;
+        let mut seen_on_size = false;
+        while pos < tokens.len() {
+            let upper = tokens[pos].1.to_ascii_uppercase();
+            match upper.as_str() {
+                "ON" | "SIZE" | "ERROR" => {
+                    seen_on_size = true;
+                    pos += 1;
+                }
+                _ => break,
+            }
+        }
+
+        if !seen_on_size {
+            return (None, None);
+        }
+
+        // Collect ON SIZE ERROR handler tokens until NOT or end keyword
+        let mut handler_tokens = Vec::new();
+        while pos < tokens.len() {
+            let upper = tokens[pos].1.to_ascii_uppercase();
+            if upper == "NOT" || upper == end_keyword {
+                break;
+            }
+            handler_tokens.push(tokens[pos].clone());
+            pos += 1;
+        }
+        if !handler_tokens.is_empty() {
+            self.parse_inline_statements(&handler_tokens, &mut on_size_stmts);
+        }
+
+        // Check for NOT ON SIZE ERROR
+        if pos < tokens.len() && tokens[pos].1.to_ascii_uppercase() == "NOT" {
+            pos += 1; // skip NOT
+            while pos < tokens.len() {
+                let upper = tokens[pos].1.to_ascii_uppercase();
+                if upper == "ON" || upper == "SIZE" || upper == "ERROR" {
+                    pos += 1;
+                } else {
+                    break;
+                }
+            }
+            let mut not_handler_tokens = Vec::new();
+            while pos < tokens.len() {
+                let upper = tokens[pos].1.to_ascii_uppercase();
+                if upper == end_keyword {
+                    break;
+                }
+                not_handler_tokens.push(tokens[pos].clone());
+                pos += 1;
+            }
+            if !not_handler_tokens.is_empty() {
+                self.parse_inline_statements(&not_handler_tokens, &mut not_on_size_stmts);
+            }
+        }
+
+        (
+            if on_size_stmts.is_empty() {
+                None
+            } else {
+                Some(on_size_stmts)
+            },
+            if not_on_size_stmts.is_empty() {
+                None
+            } else {
+                Some(not_on_size_stmts)
+            },
+        )
+    }
+
+    /// Extract ON OVERFLOW / NOT ON OVERFLOW handler statements from
+    /// tokens starting at position `start`. Returns `(on_overflow, not_on_overflow)`.
+    /// Used for STRING and UNSTRING statements.
+    fn extract_overflow_handlers(
+        &mut self,
+        tokens: &[(SyntaxKind, String)],
+        start: usize,
+        end_keyword: &str,
+    ) -> (Option<Vec<HirStatement>>, Option<Vec<HirStatement>>) {
+        let mut on_overflow_stmts = Vec::new();
+        let mut not_on_overflow_stmts = Vec::new();
+
+        let mut pos = start;
+
+        // Check for ON OVERFLOW or NOT ON OVERFLOW
+        // Could start with "ON OVERFLOW ..." or "NOT ON OVERFLOW ..."
+        if pos >= tokens.len() {
+            return (None, None);
+        }
+
+        let first_upper = tokens[pos].1.to_ascii_uppercase();
+
+        if first_upper == "ON" || first_upper == "OVERFLOW" {
+            // ON OVERFLOW ... — skip ON and OVERFLOW keywords
+            while pos < tokens.len() {
+                let upper = tokens[pos].1.to_ascii_uppercase();
+                if upper == "ON" || upper == "OVERFLOW" {
+                    pos += 1;
+                } else {
+                    break;
+                }
+            }
+            // Collect ON OVERFLOW handler tokens until NOT or end keyword
+            let mut handler_tokens = Vec::new();
+            while pos < tokens.len() {
+                let upper = tokens[pos].1.to_ascii_uppercase();
+                if upper == "NOT" || upper == end_keyword {
+                    break;
+                }
+                handler_tokens.push(tokens[pos].clone());
+                pos += 1;
+            }
+            if !handler_tokens.is_empty() {
+                self.parse_inline_statements(&handler_tokens, &mut on_overflow_stmts);
+            }
+        } else if first_upper == "NOT" {
+            // NOT ON OVERFLOW only (no ON OVERFLOW clause)
+            // Fall through to NOT handling below
+        } else {
+            return (None, None);
+        }
+
+        // Check for NOT ON OVERFLOW
+        if pos < tokens.len() && tokens[pos].1.to_ascii_uppercase() == "NOT" {
+            pos += 1; // skip NOT
+            while pos < tokens.len() {
+                let upper = tokens[pos].1.to_ascii_uppercase();
+                if upper == "ON" || upper == "OVERFLOW" {
+                    pos += 1;
+                } else {
+                    break;
+                }
+            }
+            let mut not_handler_tokens = Vec::new();
+            while pos < tokens.len() {
+                let upper = tokens[pos].1.to_ascii_uppercase();
+                if upper == end_keyword {
+                    break;
+                }
+                not_handler_tokens.push(tokens[pos].clone());
+                pos += 1;
+            }
+            if !not_handler_tokens.is_empty() {
+                self.parse_inline_statements(&not_handler_tokens, &mut not_on_overflow_stmts);
+            }
+        }
+
+        (
+            if on_overflow_stmts.is_empty() {
+                None
+            } else {
+                Some(on_overflow_stmts)
+            },
+            if not_on_overflow_stmts.is_empty() {
+                None
+            } else {
+                Some(not_on_overflow_stmts)
+            },
+        )
+    }
+
+    /// Parse simple inline statements from a token slice (for ON SIZE ERROR handlers).
+    /// Supports MOVE and DISPLAY as the most common handler statements.
+    fn parse_inline_statements(
+        &mut self,
+        tokens: &[(SyntaxKind, String)],
+        stmts: &mut Vec<HirStatement>,
+    ) {
+        let mut i = 0;
+        while i < tokens.len() {
+            let upper = tokens[i].1.to_ascii_uppercase();
+            match upper.as_str() {
+                "MOVE" => {
+                    // Parse: MOVE <value> TO <target> [<target>...]
+                    i += 1;
+                    if i >= tokens.len() {
+                        break;
+                    }
+                    let (from_expr, next) = self.parse_expr_at(tokens, i);
+                    i = next;
+                    // Skip TO
+                    if i < tokens.len() && tokens[i].1.to_ascii_uppercase() == "TO" {
+                        i += 1;
+                    }
+                    let mut targets = Vec::new();
+                    while i < tokens.len() {
+                        let u = tokens[i].1.to_ascii_uppercase();
+                        if u == "MOVE"
+                            || u == "DISPLAY"
+                            || u == "ADD"
+                            || u == "SUBTRACT"
+                            || u == "MULTIPLY"
+                            || u == "DIVIDE"
+                            || u == "COMPUTE"
+                            || u == "SET"
+                            || u == "PERFORM"
+                            || u == "GO"
+                            || u == "IF"
+                        {
+                            break;
+                        }
+                        let (dr, next) = self.parse_data_ref_at(tokens, i);
+                        targets.push(dr);
+                        i = next;
+                    }
+                    stmts.push(HirStatement::Move {
+                        from: from_expr,
+                        to: targets,
+                    });
+                }
+                "DISPLAY" => {
+                    i += 1;
+                    let mut parts = Vec::new();
+                    while i < tokens.len() {
+                        let u = tokens[i].1.to_ascii_uppercase();
+                        if u == "MOVE" || u == "DISPLAY" || u == "ADD" {
+                            break;
+                        }
+                        let (expr, next) = self.parse_expr_at(tokens, i);
+                        parts.push(expr);
+                        i = next;
+                    }
+                    stmts.push(HirStatement::Display {
+                        args: parts,
+                        no_advancing: false,
+                    });
+                }
+                _ => {
+                    i += 1;
+                }
+            }
+        }
     }
 
     fn lower_multiply_stmt(&mut self, node: &cobol_ast::SyntaxNode) -> Option<HirStatement> {
@@ -2627,11 +3376,27 @@ impl<'a> HirLowerer<'a> {
         while i < tokens.len() {
             let upper = tokens[i].1.to_ascii_uppercase();
             match upper.as_str() {
-                "BY" => { phase = 1; i += 1; continue; }
-                "GIVING" => { phase = 2; i += 1; continue; }
-                "ROUNDED" => { rounded = true; i += 1; continue; }
-                "ON" | "SIZE" | "ERROR" | "NOT" | "END-MULTIPLY" => break,
-                "(" | ")" | "," => { i += 1; continue; }
+                "BY" => {
+                    phase = 1;
+                    i += 1;
+                    continue;
+                }
+                "GIVING" => {
+                    phase = 2;
+                    i += 1;
+                    continue;
+                }
+                "ROUNDED" => {
+                    rounded = true;
+                    i += 1;
+                    continue;
+                }
+                "ON" | "SIZE" | "ERROR" | "NOT" | "END-MULTIPLY" | "ELSE"
+                | "END-IF" | "END-PERFORM" | "END-EVALUATE" | "WHEN" => break,
+                "(" | ")" | "," => {
+                    i += 1;
+                    continue;
+                }
                 _ => {}
             }
             match phase {
@@ -2650,15 +3415,25 @@ impl<'a> HirLowerer<'a> {
                     giving_targets.push(dr);
                     i = next;
                 }
-                _ => { i += 1; }
+                _ => {
+                    i += 1;
+                }
             }
         }
+
+        let (on_size_error, not_on_size_error) =
+            self.extract_size_error_handlers(&tokens, i, "END-MULTIPLY");
 
         Some(HirStatement::Multiply {
             operand1: operand1?,
             by: by_operand?,
-            giving: if giving_targets.is_empty() { None } else { Some(giving_targets) },
-            on_size_error: None,
+            giving: if giving_targets.is_empty() {
+                None
+            } else {
+                Some(giving_targets)
+            },
+            on_size_error,
+            not_on_size_error,
             rounded,
         })
     }
@@ -2677,13 +3452,39 @@ impl<'a> HirLowerer<'a> {
         while i < tokens.len() {
             let upper = tokens[i].1.to_ascii_uppercase();
             match upper.as_str() {
-                "INTO" => { is_into = true; phase = 1; i += 1; continue; }
-                "BY" => { is_into = false; phase = 1; i += 1; continue; }
-                "GIVING" => { phase = 2; i += 1; continue; }
-                "REMAINDER" => { phase = 3; i += 1; continue; }
-                "ROUNDED" => { rounded = true; i += 1; continue; }
-                "ON" | "SIZE" | "ERROR" | "NOT" | "END-DIVIDE" => break,
-                "(" | ")" | "," => { i += 1; continue; }
+                "INTO" => {
+                    is_into = true;
+                    phase = 1;
+                    i += 1;
+                    continue;
+                }
+                "BY" => {
+                    is_into = false;
+                    phase = 1;
+                    i += 1;
+                    continue;
+                }
+                "GIVING" => {
+                    phase = 2;
+                    i += 1;
+                    continue;
+                }
+                "REMAINDER" => {
+                    phase = 3;
+                    i += 1;
+                    continue;
+                }
+                "ROUNDED" => {
+                    rounded = true;
+                    i += 1;
+                    continue;
+                }
+                "ON" | "SIZE" | "ERROR" | "NOT" | "END-DIVIDE" | "ELSE"
+                | "END-IF" | "END-PERFORM" | "END-EVALUATE" | "WHEN" => break,
+                "(" | ")" | "," => {
+                    i += 1;
+                    continue;
+                }
                 _ => {}
             }
             match phase {
@@ -2707,16 +3508,26 @@ impl<'a> HirLowerer<'a> {
                     remainder = Some(dr);
                     i = next;
                 }
-                _ => { i += 1; }
+                _ => {
+                    i += 1;
+                }
             }
         }
+
+        let (on_size_error, not_on_size_error) =
+            self.extract_size_error_handlers(&tokens, i, "END-DIVIDE");
 
         Some(HirStatement::Divide {
             operand1: operand1?,
             into_or_by: into_or_by?,
-            giving: if giving_targets.is_empty() { None } else { Some(giving_targets) },
+            giving: if giving_targets.is_empty() {
+                None
+            } else {
+                Some(giving_targets)
+            },
             remainder,
-            on_size_error: None,
+            on_size_error,
+            not_on_size_error,
             rounded,
             is_into,
         })
@@ -2734,15 +3545,63 @@ impl<'a> HirLowerer<'a> {
                 targets.push(self.make_data_ref(text));
             }
         }
-        let rounded = tokens[1..eq_idx].iter().any(|(_, t)| t.eq_ignore_ascii_case("ROUNDED"));
+        let rounded = tokens[1..eq_idx]
+            .iter()
+            .any(|(_, t)| t.eq_ignore_ascii_case("ROUNDED"));
 
-        // Collect expression tokens after "=", filtering out termination keywords and period
-        let expr_tokens: Vec<(SyntaxKind, String)> = tokens[eq_idx + 1..].iter()
-            .filter(|(k, t)| {
-                let u = t.to_ascii_uppercase();
-                *k != SyntaxKind::PERIOD
-                    && !matches!(u.as_str(), "END-COMPUTE" | "ON" | "SIZE" | "ERROR" | "NOT")
-            })
+        // Find where ON SIZE ERROR / NOT ON SIZE ERROR begins (if present)
+        // Scan tokens after "=" for the first ON/SIZE/NOT keyword that signals
+        // a size-error clause (not part of the arithmetic expression).
+        let after_eq = &tokens[eq_idx + 1..];
+        let mut size_error_start = after_eq.len(); // default: no size error clause
+        for (idx, (k, t)) in after_eq.iter().enumerate() {
+            let u = t.to_ascii_uppercase();
+            if *k == SyntaxKind::PERIOD {
+                size_error_start = idx;
+                break;
+            }
+            if u == "END-COMPUTE" {
+                size_error_start = idx;
+                break;
+            }
+            // Detect "ON SIZE ERROR" or "NOT ON SIZE ERROR"
+            // ON must be followed by SIZE (to avoid confusing with other uses)
+            if u == "ON" || u == "NOT" {
+                // Check if this is part of a SIZE ERROR phrase by looking ahead
+                let mut j = idx + 1;
+                // Skip ON after NOT
+                if u == "NOT" && j < after_eq.len()
+                    && after_eq[j].1.eq_ignore_ascii_case("ON")
+                {
+                    j += 1;
+                }
+                // Now check for SIZE
+                if u == "ON" && j < after_eq.len()
+                    && after_eq[j].1.eq_ignore_ascii_case("SIZE")
+                {
+                    size_error_start = idx;
+                    break;
+                }
+                if u == "NOT" && j < after_eq.len()
+                    && after_eq[j].1.eq_ignore_ascii_case("SIZE")
+                {
+                    size_error_start = idx;
+                    break;
+                }
+            }
+            // Also detect bare "SIZE ERROR" (without leading ON)
+            if u == "SIZE" && idx + 1 < after_eq.len()
+                && after_eq[idx + 1].1.eq_ignore_ascii_case("ERROR")
+            {
+                size_error_start = idx;
+                break;
+            }
+        }
+
+        // Collect expression tokens (before size error clause), filtering out period
+        let expr_tokens: Vec<(SyntaxKind, String)> = after_eq[..size_error_start]
+            .iter()
+            .filter(|(k, _)| *k != SyntaxKind::PERIOD)
             .cloned()
             .collect();
 
@@ -2754,10 +3613,17 @@ impl<'a> HirLowerer<'a> {
         let mut pos = 0;
         let expr = self.parse_arith_additive(&expr_tokens, &mut pos);
 
+        // Extract ON SIZE ERROR / NOT ON SIZE ERROR handlers from
+        // the remaining tokens (after the expression, before END-COMPUTE)
+        let handler_start = eq_idx + 1 + size_error_start;
+        let (on_size_error, not_on_size_error) =
+            self.extract_size_error_handlers(&tokens, handler_start, "END-COMPUTE");
+
         Some(HirStatement::Compute {
             targets,
             expr,
-            on_size_error: None,
+            on_size_error,
+            not_on_size_error,
             rounded,
         })
     }
@@ -2767,7 +3633,11 @@ impl<'a> HirLowerer<'a> {
     /// Precedence (low to high): +/-, *//, **
 
     /// additive = multiplicative (('+' | '-') multiplicative)*
-    fn parse_arith_additive(&mut self, tokens: &[(SyntaxKind, String)], pos: &mut usize) -> HirExpr {
+    fn parse_arith_additive(
+        &mut self,
+        tokens: &[(SyntaxKind, String)],
+        pos: &mut usize,
+    ) -> HirExpr {
         let mut left = self.parse_arith_multiplicative(tokens, pos);
 
         while *pos < tokens.len() {
@@ -2790,7 +3660,11 @@ impl<'a> HirLowerer<'a> {
     }
 
     /// multiplicative = power (('*' | '/') power)*
-    fn parse_arith_multiplicative(&mut self, tokens: &[(SyntaxKind, String)], pos: &mut usize) -> HirExpr {
+    fn parse_arith_multiplicative(
+        &mut self,
+        tokens: &[(SyntaxKind, String)],
+        pos: &mut usize,
+    ) -> HirExpr {
         let mut left = self.parse_arith_power(tokens, pos);
 
         while *pos < tokens.len() {
@@ -2880,7 +3754,7 @@ impl<'a> HirLowerer<'a> {
         if *pos < tokens.len() && tokens[*pos].1 == "(" {
             if let HirExpr::DataRef(mut dr) = expr {
                 *pos += 1; // skip '('
-                // Collect tokens inside parens
+                           // Collect tokens inside parens
                 let mut paren_depth = 1;
                 let mut inner_tokens = Vec::new();
                 while *pos < tokens.len() && paren_depth > 0 {
@@ -2930,6 +3804,21 @@ impl<'a> HirLowerer<'a> {
             }
         }
 
+        // Handle OF/IN qualifier chain for unsubscripted data refs
+        if let HirExpr::DataRef(mut dr) = expr {
+            while *pos < tokens.len() {
+                let kw = tokens[*pos].1.to_ascii_uppercase();
+                if (kw == "OF" || kw == "IN") && *pos + 1 < tokens.len() {
+                    let qual_text = tokens[*pos + 1].1.to_ascii_uppercase();
+                    dr.qualifiers.push(self.interner.intern(&qual_text));
+                    *pos += 2;
+                } else {
+                    break;
+                }
+            }
+            return HirExpr::DataRef(dr);
+        }
+
         expr
     }
 
@@ -2942,7 +3831,7 @@ impl<'a> HirLowerer<'a> {
         // The parser creates a STRING_STMT node with all tokens as children.
         let tokens = self.collect_all_tokens(node);
 
-        let mut sources: Vec<HirExpr> = Vec::new();
+        let mut sources: Vec<(HirExpr, Option<HirExpr>)> = Vec::new();
         let mut into_ref = None;
         let mut pointer_ref = None;
         let mut i = 0;
@@ -2970,7 +3859,9 @@ impl<'a> HirLowerer<'a> {
 
             // Check for WITH POINTER
             if upper == "WITH" || upper == "POINTER" {
-                if upper == "WITH" { i += 1; }
+                if upper == "WITH" {
+                    i += 1;
+                }
                 if i < tokens.len() && tokens[i].1.eq_ignore_ascii_case("POINTER") {
                     i += 1;
                 }
@@ -2981,28 +3872,59 @@ impl<'a> HirLowerer<'a> {
                 continue;
             }
 
-            // Check for END-STRING
+            // Check for END-STRING or ON OVERFLOW / NOT ON OVERFLOW
             if upper == "END-STRING" {
                 break;
             }
+            if upper == "ON" || upper == "OVERFLOW" || upper == "NOT" {
+                // Reached ON OVERFLOW / NOT ON OVERFLOW — stop collecting sources
+                break;
+            }
 
-            // Skip DELIMITED, BY, SIZE keywords
-            if matches!(upper.as_str(), "DELIMITED" | "BY" | "SIZE") {
+            // Skip standalone DELIMITED, BY keywords (handled below with source)
+            if matches!(upper.as_str(), "DELIMITED" | "BY") {
                 i += 1;
                 continue;
             }
 
             // This should be a source value
             let expr = self.token_to_expr(tokens[i].0, &tokens[i].1);
-            sources.push(expr);
             i += 1;
+
+            // Look ahead for DELIMITED BY <delimiter|SIZE>
+            let mut delimiter = None;
+            if i < tokens.len() && tokens[i].1.eq_ignore_ascii_case("DELIMITED") {
+                i += 1; // skip DELIMITED
+                if i < tokens.len() && tokens[i].1.eq_ignore_ascii_case("BY") {
+                    i += 1; // skip BY
+                }
+                if i < tokens.len() {
+                    let du = tokens[i].1.to_ascii_uppercase();
+                    if du == "SIZE" {
+                        // DELIMITED BY SIZE — no delimiter (copy all)
+                        delimiter = None;
+                        i += 1;
+                    } else {
+                        // DELIMITED BY <value> — use as delimiter
+                        delimiter = Some(self.token_to_expr(tokens[i].0, &tokens[i].1));
+                        i += 1;
+                    }
+                }
+            }
+            sources.push((expr, delimiter));
         }
+
+        // Extract ON OVERFLOW / NOT ON OVERFLOW handlers
+        let (on_overflow, not_on_overflow) =
+            self.extract_overflow_handlers(&tokens, i, "END-STRING");
 
         let into = into_ref?;
         Some(HirStatement::StringStmt {
             sources,
             into,
             pointer: pointer_ref,
+            on_overflow,
+            not_on_overflow,
         })
     }
 
@@ -3016,7 +3938,9 @@ impl<'a> HirLowerer<'a> {
         }
 
         // Get the target identifier
-        if i >= tokens.len() { return None; }
+        if i >= tokens.len() {
+            return None;
+        }
         let target = self.make_data_ref(&tokens[i].1);
         i += 1;
 
@@ -3027,7 +3951,9 @@ impl<'a> HirLowerer<'a> {
                 "TALLYING" => {
                     i += 1;
                     // TALLYING tally_var FOR {ALL|LEADING|CHARACTERS} {literal} [BEFORE|AFTER INITIAL ...]
-                    if i >= tokens.len() { return None; }
+                    if i >= tokens.len() {
+                        return None;
+                    }
                     let tally_var = self.make_data_ref(&tokens[i].1);
                     i += 1;
 
@@ -3044,9 +3970,22 @@ impl<'a> HirLowerer<'a> {
                     while i < tokens.len() {
                         let u = tokens[i].1.to_ascii_uppercase();
                         match u.as_str() {
-                            "ALL" => { mode = InspectTallyMode::All; i += 1; }
-                            "LEADING" => { mode = InspectTallyMode::Leading; i += 1; }
-                            "CHARACTERS" => { mode = InspectTallyMode::Characters; i += 1; }
+                            "ALL" => {
+                                mode = InspectTallyMode::All;
+                                i += 1;
+                            }
+                            "LEADING" => {
+                                mode = InspectTallyMode::Leading;
+                                i += 1;
+                            }
+                            "TRAILING" => {
+                                mode = InspectTallyMode::Trailing;
+                                i += 1;
+                            }
+                            "CHARACTERS" => {
+                                mode = InspectTallyMode::Characters;
+                                i += 1;
+                            }
                             "BEFORE" => {
                                 i += 1;
                                 // Skip optional INITIAL
@@ -3054,7 +3993,8 @@ impl<'a> HirLowerer<'a> {
                                     i += 1;
                                 }
                                 if i < tokens.len() {
-                                    before_initial = Some(self.token_to_expr(tokens[i].0, &tokens[i].1));
+                                    before_initial =
+                                        Some(self.token_to_expr(tokens[i].0, &tokens[i].1));
                                     i += 1;
                                 }
                             }
@@ -3064,7 +4004,8 @@ impl<'a> HirLowerer<'a> {
                                     i += 1;
                                 }
                                 if i < tokens.len() {
-                                    after_initial = Some(self.token_to_expr(tokens[i].0, &tokens[i].1));
+                                    after_initial =
+                                        Some(self.token_to_expr(tokens[i].0, &tokens[i].1));
                                     i += 1;
                                 }
                             }
@@ -3100,14 +4041,31 @@ impl<'a> HirLowerer<'a> {
                     while i < tokens.len() {
                         let u = tokens[i].1.to_ascii_uppercase();
                         match u.as_str() {
-                            "ALL" => { mode = InspectReplaceMode::All; i += 1; }
-                            "LEADING" => { mode = InspectReplaceMode::Leading; i += 1; }
-                            "FIRST" => { mode = InspectReplaceMode::First; i += 1; }
-                            "CHARACTERS" => { mode = InspectReplaceMode::Characters; i += 1; }
+                            "ALL" => {
+                                mode = InspectReplaceMode::All;
+                                i += 1;
+                            }
+                            "LEADING" => {
+                                mode = InspectReplaceMode::Leading;
+                                i += 1;
+                            }
+                            "FIRST" => {
+                                mode = InspectReplaceMode::First;
+                                i += 1;
+                            }
+                            "TRAILING" => {
+                                mode = InspectReplaceMode::Trailing;
+                                i += 1;
+                            }
+                            "CHARACTERS" => {
+                                mode = InspectReplaceMode::Characters;
+                                i += 1;
+                            }
                             "BY" => {
                                 i += 1;
                                 if i < tokens.len() {
-                                    replacement = Some(self.token_to_expr(tokens[i].0, &tokens[i].1));
+                                    replacement =
+                                        Some(self.token_to_expr(tokens[i].0, &tokens[i].1));
                                     i += 1;
                                 }
                             }
@@ -3117,7 +4075,8 @@ impl<'a> HirLowerer<'a> {
                                     i += 1;
                                 }
                                 if i < tokens.len() {
-                                    before_initial = Some(self.token_to_expr(tokens[i].0, &tokens[i].1));
+                                    before_initial =
+                                        Some(self.token_to_expr(tokens[i].0, &tokens[i].1));
                                     i += 1;
                                 }
                             }
@@ -3127,7 +4086,8 @@ impl<'a> HirLowerer<'a> {
                                     i += 1;
                                 }
                                 if i < tokens.len() {
-                                    after_initial = Some(self.token_to_expr(tokens[i].0, &tokens[i].1));
+                                    after_initial =
+                                        Some(self.token_to_expr(tokens[i].0, &tokens[i].1));
                                     i += 1;
                                 }
                             }
@@ -3156,7 +4116,9 @@ impl<'a> HirLowerer<'a> {
                 "CONVERTING" => {
                     i += 1;
                     // CONVERTING from BY to [BEFORE|AFTER INITIAL ...]
-                    if i >= tokens.len() { return None; }
+                    if i >= tokens.len() {
+                        return None;
+                    }
                     let from = self.token_to_expr(tokens[i].0, &tokens[i].1);
                     i += 1;
 
@@ -3169,7 +4131,9 @@ impl<'a> HirLowerer<'a> {
                         i += 1;
                     }
 
-                    if i >= tokens.len() { return None; }
+                    if i >= tokens.len() {
+                        return None;
+                    }
                     let to = self.token_to_expr(tokens[i].0, &tokens[i].1);
                     i += 1;
 
@@ -3185,7 +4149,8 @@ impl<'a> HirLowerer<'a> {
                                     i += 1;
                                 }
                                 if i < tokens.len() {
-                                    before_initial = Some(self.token_to_expr(tokens[i].0, &tokens[i].1));
+                                    before_initial =
+                                        Some(self.token_to_expr(tokens[i].0, &tokens[i].1));
                                     i += 1;
                                 }
                             }
@@ -3195,11 +4160,14 @@ impl<'a> HirLowerer<'a> {
                                     i += 1;
                                 }
                                 if i < tokens.len() {
-                                    after_initial = Some(self.token_to_expr(tokens[i].0, &tokens[i].1));
+                                    after_initial =
+                                        Some(self.token_to_expr(tokens[i].0, &tokens[i].1));
                                     i += 1;
                                 }
                             }
-                            _ => { i += 1; }
+                            _ => {
+                                i += 1;
+                            }
                         }
                     }
 
@@ -3213,7 +4181,9 @@ impl<'a> HirLowerer<'a> {
                         },
                     });
                 }
-                _ => { i += 1; }
+                _ => {
+                    i += 1;
+                }
             }
         }
 
@@ -3230,7 +4200,9 @@ impl<'a> HirLowerer<'a> {
         }
 
         // Get the source identifier
-        if i >= tokens.len() { return None; }
+        if i >= tokens.len() {
+            return None;
+        }
         let source = self.make_data_ref(&tokens[i].1);
         i += 1;
 
@@ -3251,10 +4223,21 @@ impl<'a> HirLowerer<'a> {
                     }
                     // Parse delimiters: [ALL] delim [OR [ALL] delim]...
                     loop {
-                        if i >= tokens.len() { break; }
+                        if i >= tokens.len() {
+                            break;
+                        }
                         let u = tokens[i].1.to_ascii_uppercase();
-                        if matches!(u.as_str(), "INTO" | "WITH" | "POINTER" | "TALLYING"
-                            | "ON" | "NOT" | "END-UNSTRING" | "OVERFLOW") {
+                        if matches!(
+                            u.as_str(),
+                            "INTO"
+                                | "WITH"
+                                | "POINTER"
+                                | "TALLYING"
+                                | "ON"
+                                | "NOT"
+                                | "END-UNSTRING"
+                                | "OVERFLOW"
+                        ) {
                             break;
                         }
                         if u == "OR" {
@@ -3265,7 +4248,9 @@ impl<'a> HirLowerer<'a> {
                         if u == "ALL" {
                             all = true;
                             i += 1;
-                            if i >= tokens.len() { break; }
+                            if i >= tokens.len() {
+                                break;
+                            }
                         }
                         let value = self.token_to_expr(tokens[i].0, &tokens[i].1);
                         delimiters.push(UnstringDelimiter { value, all });
@@ -3282,8 +4267,16 @@ impl<'a> HirLowerer<'a> {
                     // Parse targets: identifier [DELIMITER IN identifier] [COUNT IN identifier]
                     while i < tokens.len() {
                         let u = tokens[i].1.to_ascii_uppercase();
-                        if matches!(u.as_str(), "WITH" | "POINTER" | "TALLYING"
-                            | "ON" | "NOT" | "END-UNSTRING" | "OVERFLOW") {
+                        if matches!(
+                            u.as_str(),
+                            "WITH"
+                                | "POINTER"
+                                | "TALLYING"
+                                | "ON"
+                                | "NOT"
+                                | "END-UNSTRING"
+                                | "OVERFLOW"
+                        ) {
                             break;
                         }
                         if u == "DELIMITER" {
@@ -3391,7 +4384,9 @@ impl<'a> HirLowerer<'a> {
         }
 
         // Get program name (string literal or identifier)
-        if i >= tokens.len() { return None; }
+        if i >= tokens.len() {
+            return None;
+        }
         let program_expr = self.token_to_expr(tokens[i].0, &tokens[i].1);
         i += 1;
 
@@ -3402,11 +4397,37 @@ impl<'a> HirLowerer<'a> {
         while i < tokens.len() {
             let upper = tokens[i].1.to_ascii_uppercase();
             match upper.as_str() {
-                "USING" | "BY" => { i += 1; continue; }
-                "REFERENCE" => { mode = CallArgMode::ByReference; i += 1; continue; }
-                "CONTENT" => { mode = CallArgMode::ByContent; i += 1; continue; }
-                "VALUE" => { mode = CallArgMode::ByValue; i += 1; continue; }
-                "RETURNING" | "END-CALL" | "ON" | "NOT" => break,
+                "USING" | "BY" => {
+                    i += 1;
+                    continue;
+                }
+                "REFERENCE" => {
+                    mode = CallArgMode::ByReference;
+                    i += 1;
+                    continue;
+                }
+                "CONTENT" => {
+                    mode = CallArgMode::ByContent;
+                    i += 1;
+                    continue;
+                }
+                "VALUE" => {
+                    mode = CallArgMode::ByValue;
+                    i += 1;
+                    continue;
+                }
+                "RETURNING" => {
+                    i += 1; // skip RETURNING
+                            // Next token is the RETURNING target identifier
+                    if i < tokens.len() {
+                        let (_dr, _next) = self.parse_data_ref_at(&tokens, i);
+                        // Store returning but warn — not yet fully supported in codegen
+                        // (The MIR CALL will need to handle the return value)
+                        break; // done after RETURNING target
+                    }
+                    break;
+                }
+                "END-CALL" | "ON" | "NOT" => break,
                 _ => {
                     let expr = self.token_to_expr(tokens[i].0, &tokens[i].1);
                     using_args.push(CallArg { mode, value: expr });
@@ -3418,31 +4439,83 @@ impl<'a> HirLowerer<'a> {
         Some(HirStatement::Call {
             program: program_expr,
             using: using_args,
-            returning: None,
+            returning: None, // TODO: wire through when codegen supports return values
         })
     }
 
     fn lower_go_to_stmt(&mut self, node: &cobol_ast::SyntaxNode) -> Option<HirStatement> {
-        // GO TO paragraph-name
+        // GO TO paragraph-name [paragraph-name ...] [DEPENDING ON identifier]
         let tokens = self.collect_all_tokens(node);
-        // Skip GO and TO keywords, then find the target name
-        let mut target_name = None;
-        for (kind, text) in &tokens {
-            if *kind == SyntaxKind::PERIOD {
-                continue;
-            }
-            let upper = text.to_ascii_uppercase();
+
+        // Collect all paragraph names, stopping at DEPENDING or end.
+        let mut targets: Vec<String> = Vec::new();
+        let mut depending_index_name: Option<String> = None;
+        let mut i = 0;
+
+        // Skip GO and TO keywords
+        while i < tokens.len() {
+            let upper = tokens[i].1.to_ascii_uppercase();
             if upper == "GO" || upper == "TO" {
+                i += 1;
                 continue;
             }
-            // First non-keyword token is the target paragraph name
-            target_name = Some(upper);
             break;
         }
 
-        let target_str = target_name?;
-        let target = self.interner.intern(&target_str);
-        Some(HirStatement::GoTo { target })
+        // Collect paragraph targets until DEPENDING or period/end
+        while i < tokens.len() {
+            if tokens[i].0 == SyntaxKind::PERIOD {
+                i += 1;
+                continue;
+            }
+            let upper = tokens[i].1.to_ascii_uppercase();
+            if upper == "DEPENDING" {
+                i += 1; // skip DEPENDING
+                // Skip ON
+                if i < tokens.len() && tokens[i].1.eq_ignore_ascii_case("ON") {
+                    i += 1;
+                }
+                // Next token is the index identifier
+                while i < tokens.len() {
+                    if tokens[i].0 == SyntaxKind::PERIOD {
+                        i += 1;
+                        continue;
+                    }
+                    depending_index_name = Some(tokens[i].1.to_ascii_uppercase());
+                    break;
+                }
+                break;
+            }
+            targets.push(upper);
+            i += 1;
+        }
+
+        if let Some(index_name) = depending_index_name {
+            // GO TO ... DEPENDING ON
+            if targets.is_empty() {
+                return None;
+            }
+            let interned_targets: Vec<cobol_intern::Name> = targets
+                .iter()
+                .map(|t| self.interner.intern(t))
+                .collect();
+            let index_ref = HirDataRef {
+                name: self.interner.intern(&index_name),
+                qualifiers: Vec::new(),
+                subscripts: Vec::new(),
+                ref_mod: None,
+                resolved: None,
+            };
+            Some(HirStatement::GoToDependingOn {
+                targets: interned_targets,
+                index: index_ref,
+            })
+        } else {
+            // Simple GO TO
+            let target_str = targets.into_iter().next()?;
+            let target = self.interner.intern(&target_str);
+            Some(HirStatement::GoTo { target })
+        }
     }
 
     fn lower_accept_stmt(&mut self, node: &cobol_ast::SyntaxNode) -> Option<HirStatement> {
@@ -3524,7 +4597,8 @@ impl<'a> HirLowerer<'a> {
                 return HirStatement::ExitParagraph;
             }
         }
-        HirStatement::ExitParagraph
+        // Plain EXIT (no qualifier) is a no-op in COBOL
+        HirStatement::Continue
     }
 
     fn lower_if_stmt(&mut self, node: &cobol_ast::SyntaxNode) -> Option<HirStatement> {
@@ -3540,8 +4614,10 @@ impl<'a> HirLowerer<'a> {
         for el in node.children_with_tokens() {
             if let Some(tok) = el.as_token() {
                 let kind = tok.kind();
-                if kind == SyntaxKind::WHITESPACE || kind == SyntaxKind::NEWLINE
-                    || kind == SyntaxKind::COMMENT || kind == SyntaxKind::PERIOD
+                if kind == SyntaxKind::WHITESPACE
+                    || kind == SyntaxKind::NEWLINE
+                    || kind == SyntaxKind::COMMENT
+                    || kind == SyntaxKind::PERIOD
                 {
                     continue;
                 }
@@ -3571,7 +4647,11 @@ impl<'a> HirLowerer<'a> {
         Some(HirStatement::If {
             condition: condition.unwrap_or(HirExpr::Literal(LiteralValue::Integer(1))),
             then_branch: then_stmts,
-            else_branch: if else_stmts.is_empty() { None } else { Some(else_stmts) },
+            else_branch: if else_stmts.is_empty() {
+                None
+            } else {
+                Some(else_stmts)
+            },
         })
     }
 
@@ -3604,7 +4684,10 @@ impl<'a> HirLowerer<'a> {
                 idx += 1;
                 continue;
             }
-            subject_token_groups.last_mut().unwrap().push(tokens[idx].clone());
+            subject_token_groups
+                .last_mut()
+                .unwrap()
+                .push(tokens[idx].clone());
             idx += 1;
         }
 
@@ -3613,12 +4696,17 @@ impl<'a> HirLowerer<'a> {
         let mut is_evaluate_true = false;
         let mut is_evaluate_false = false;
         for (i, group) in subject_token_groups.iter().enumerate() {
-            if group.is_empty() { continue; }
-            if i == 0 && group.len() == 1 && group[0].1.eq_ignore_ascii_case("TRUE") {
-                is_evaluate_true = true;
+            if group.is_empty() {
+                continue;
             }
-            if i == 0 && group.len() == 1 && group[0].1.eq_ignore_ascii_case("FALSE") {
-                is_evaluate_false = true;
+            if group.len() == 1 && group[0].1.eq_ignore_ascii_case("TRUE") {
+                if i == 0 {
+                    is_evaluate_true = true;
+                }
+            } else if group.len() == 1 && group[0].1.eq_ignore_ascii_case("FALSE") {
+                if i == 0 {
+                    is_evaluate_false = true;
+                }
             }
             subjects.push(self.token_to_expr(group[0].0, &group[0].1));
         }
@@ -3641,8 +4729,10 @@ impl<'a> HirLowerer<'a> {
         for el in node.children_with_tokens() {
             if let Some(tok) = el.as_token() {
                 let kind = tok.kind();
-                if kind == SyntaxKind::WHITESPACE || kind == SyntaxKind::NEWLINE
-                    || kind == SyntaxKind::COMMENT || kind == SyntaxKind::PERIOD
+                if kind == SyntaxKind::WHITESPACE
+                    || kind == SyntaxKind::NEWLINE
+                    || kind == SyntaxKind::COMMENT
+                    || kind == SyntaxKind::PERIOD
                 {
                     continue;
                 }
@@ -3658,11 +4748,19 @@ impl<'a> HirLowerer<'a> {
                 if text_upper == "WHEN" {
                     // Flush any pending WHEN value tokens
                     if let Some(val_toks) = when_value_tokens.take() {
-                        self.flush_evaluate_when_values(&val_toks, &subjects,
-                            is_evaluate_true, is_evaluate_false, &mut current_conditions);
+                        self.flush_evaluate_when_values(
+                            &val_toks,
+                            &subjects,
+                            is_evaluate_true,
+                            is_evaluate_false,
+                            &mut current_conditions,
+                        );
                     }
-                    // Save previous WHEN clause if any
-                    if in_when {
+                    // Save previous WHEN clause if it has statements.
+                    // If the previous WHEN has no statements (stacked/fall-through
+                    // WHEN), keep its conditions accumulated so they merge with the
+                    // next WHEN that does have statements.
+                    if in_when && !current_stmts.is_empty() {
                         whens.push(WhenClause {
                             conditions: std::mem::take(&mut current_conditions),
                             statements: std::mem::take(&mut current_stmts),
@@ -3684,7 +4782,10 @@ impl<'a> HirLowerer<'a> {
                     if when_value_tokens.is_none() {
                         when_value_tokens = Some(Vec::new());
                     }
-                    when_value_tokens.as_mut().unwrap().push((kind, tok.text().to_string()));
+                    when_value_tokens
+                        .as_mut()
+                        .unwrap()
+                        .push((kind, tok.text().to_string()));
                     continue;
                 }
                 if !past_subject {
@@ -3696,8 +4797,13 @@ impl<'a> HirLowerer<'a> {
                 }
                 // Flush any pending WHEN value tokens before processing statements
                 if let Some(val_toks) = when_value_tokens.take() {
-                    self.flush_evaluate_when_values(&val_toks, &subjects,
-                        is_evaluate_true, is_evaluate_false, &mut current_conditions);
+                    self.flush_evaluate_when_values(
+                        &val_toks,
+                        &subjects,
+                        is_evaluate_true,
+                        is_evaluate_false,
+                        &mut current_conditions,
+                    );
                     need_condition_value = false;
                 }
                 if in_when {
@@ -3710,8 +4816,13 @@ impl<'a> HirLowerer<'a> {
 
         // Flush any pending WHEN value tokens
         if let Some(val_toks) = when_value_tokens.take() {
-            self.flush_evaluate_when_values(&val_toks, &subjects,
-                is_evaluate_true, is_evaluate_false, &mut current_conditions);
+            self.flush_evaluate_when_values(
+                &val_toks,
+                &subjects,
+                is_evaluate_true,
+                is_evaluate_false,
+                &mut current_conditions,
+            );
         }
         // Push the last WHEN clause
         if in_when {
@@ -3742,15 +4853,14 @@ impl<'a> HirLowerer<'a> {
             // For EVALUATE TRUE/FALSE, parse as condition expression
             if let Some(cond_expr) = self.parse_condition_tokens(val_toks) {
                 let final_cond = if is_evaluate_false {
-                    HirExpr::Condition(Box::new(HirCondition::Not(
-                        Box::new(match cond_expr {
-                            HirExpr::Condition(c) => *c,
-                            _ => HirCondition::Comparison {
-                                left: cond_expr, op: BinaryOp::Ne,
-                                right: HirExpr::Literal(LiteralValue::Integer(0)),
-                            },
-                        })
-                    )))
+                    HirExpr::Condition(Box::new(HirCondition::Not(Box::new(match cond_expr {
+                        HirExpr::Condition(c) => *c,
+                        _ => HirCondition::Comparison {
+                            left: cond_expr,
+                            op: BinaryOp::Ne,
+                            right: HirExpr::Literal(LiteralValue::Integer(0)),
+                        },
+                    }))))
                 } else {
                     cond_expr
                 };
@@ -3776,13 +4886,11 @@ impl<'a> HirLowerer<'a> {
                 continue;
             }
             let value_expr = self.token_to_expr(group[0].0, &group[0].1);
-            all_conditions.push(HirExpr::Condition(Box::new(
-                HirCondition::Comparison {
-                    left: subjects[i].clone(),
-                    op: BinaryOp::Eq,
-                    right: value_expr,
-                },
-            )));
+            all_conditions.push(HirExpr::Condition(Box::new(HirCondition::Comparison {
+                left: subjects[i].clone(),
+                op: BinaryOp::Eq,
+                right: value_expr,
+            })));
         }
 
         // If multiple conditions (ALSO), AND them together
@@ -3796,14 +4904,16 @@ impl<'a> HirLowerer<'a> {
                     Box::new(match combined {
                         HirExpr::Condition(c) => *c,
                         _ => HirCondition::Comparison {
-                            left: combined, op: BinaryOp::Ne,
+                            left: combined,
+                            op: BinaryOp::Ne,
                             right: HirExpr::Literal(LiteralValue::Integer(0)),
                         },
                     }),
                     Box::new(match cond {
                         HirExpr::Condition(c) => *c,
                         _ => HirCondition::Comparison {
-                            left: cond, op: BinaryOp::Ne,
+                            left: cond,
+                            op: BinaryOp::Ne,
                             right: HirExpr::Literal(LiteralValue::Integer(0)),
                         },
                     }),
@@ -3848,8 +4958,10 @@ impl<'a> HirLowerer<'a> {
         for el in node.children_with_tokens() {
             if let Some(tok) = el.as_token() {
                 let kind = tok.kind();
-                if kind == SyntaxKind::WHITESPACE || kind == SyntaxKind::NEWLINE
-                    || kind == SyntaxKind::COMMENT || kind == SyntaxKind::PERIOD
+                if kind == SyntaxKind::WHITESPACE
+                    || kind == SyntaxKind::NEWLINE
+                    || kind == SyntaxKind::COMMENT
+                    || kind == SyntaxKind::PERIOD
                 {
                     continue;
                 }
@@ -4033,73 +5145,117 @@ impl<'a> HirLowerer<'a> {
                 }
             }
             SyntaxKind::MOVE_STMT => {
-                if let Some(s) = self.lower_move_stmt(node) { stmts.push(s); }
+                if let Some(s) = self.lower_move_stmt(node) {
+                    stmts.push(s);
+                }
             }
             SyntaxKind::ADD_STMT => {
-                if let Some(s) = self.lower_add_stmt(node) { stmts.push(s); }
+                if let Some(s) = self.lower_add_stmt(node) {
+                    stmts.push(s);
+                }
             }
             SyntaxKind::SUBTRACT_STMT => {
-                if let Some(s) = self.lower_subtract_stmt(node) { stmts.push(s); }
+                if let Some(s) = self.lower_subtract_stmt(node) {
+                    stmts.push(s);
+                }
             }
             SyntaxKind::MULTIPLY_STMT => {
-                if let Some(s) = self.lower_multiply_stmt(node) { stmts.push(s); }
+                if let Some(s) = self.lower_multiply_stmt(node) {
+                    stmts.push(s);
+                }
             }
             SyntaxKind::DIVIDE_STMT => {
-                if let Some(s) = self.lower_divide_stmt(node) { stmts.push(s); }
+                if let Some(s) = self.lower_divide_stmt(node) {
+                    stmts.push(s);
+                }
             }
             SyntaxKind::COMPUTE_STMT => {
-                if let Some(s) = self.lower_compute_stmt(node) { stmts.push(s); }
+                if let Some(s) = self.lower_compute_stmt(node) {
+                    stmts.push(s);
+                }
             }
             SyntaxKind::IF_STMT => {
-                if let Some(s) = self.lower_if_stmt(node) { stmts.push(s); }
+                if let Some(s) = self.lower_if_stmt(node) {
+                    stmts.push(s);
+                }
             }
             SyntaxKind::PERFORM_STMT => {
-                if let Some(s) = self.lower_perform_stmt(node) { stmts.push(s); }
+                if let Some(s) = self.lower_perform_stmt(node) {
+                    stmts.push(s);
+                }
             }
             SyntaxKind::STRING_STMT => {
-                if let Some(s) = self.lower_string_stmt(node) { stmts.push(s); }
+                if let Some(s) = self.lower_string_stmt(node) {
+                    stmts.push(s);
+                }
             }
             SyntaxKind::CALL_STMT => {
-                if let Some(s) = self.lower_call_stmt(node) { stmts.push(s); }
+                if let Some(s) = self.lower_call_stmt(node) {
+                    stmts.push(s);
+                }
             }
             SyntaxKind::EXIT_STMT => {
                 stmts.push(self.lower_exit_stmt(node));
             }
             SyntaxKind::OPEN_STMT => {
-                if let Some(s) = self.lower_open_stmt(node) { stmts.push(s); }
+                if let Some(s) = self.lower_open_stmt(node) {
+                    stmts.push(s);
+                }
             }
             SyntaxKind::CLOSE_STMT => {
-                if let Some(s) = self.lower_close_stmt(node) { stmts.push(s); }
+                if let Some(s) = self.lower_close_stmt(node) {
+                    stmts.push(s);
+                }
             }
             SyntaxKind::WRITE_STMT => {
-                if let Some(s) = self.lower_write_stmt(node) { stmts.push(s); }
+                if let Some(s) = self.lower_write_stmt(node) {
+                    stmts.push(s);
+                }
             }
             SyntaxKind::READ_STMT => {
-                if let Some(s) = self.lower_read_stmt(node) { stmts.push(s); }
+                if let Some(s) = self.lower_read_stmt(node) {
+                    stmts.push(s);
+                }
             }
             SyntaxKind::EVALUATE_STMT => {
-                if let Some(s) = self.lower_evaluate_stmt(node) { stmts.push(s); }
+                if let Some(s) = self.lower_evaluate_stmt(node) {
+                    stmts.push(s);
+                }
             }
             SyntaxKind::GO_TO_STMT => {
-                if let Some(s) = self.lower_go_to_stmt(node) { stmts.push(s); }
+                if let Some(s) = self.lower_go_to_stmt(node) {
+                    stmts.push(s);
+                }
             }
             SyntaxKind::ACCEPT_STMT => {
-                if let Some(s) = self.lower_accept_stmt(node) { stmts.push(s); }
+                if let Some(s) = self.lower_accept_stmt(node) {
+                    stmts.push(s);
+                }
             }
             SyntaxKind::INSPECT_STMT => {
-                if let Some(s) = self.lower_inspect_stmt(node) { stmts.push(s); }
+                if let Some(s) = self.lower_inspect_stmt(node) {
+                    stmts.push(s);
+                }
             }
             SyntaxKind::UNSTRING_STMT => {
-                if let Some(s) = self.lower_unstring_stmt(node) { stmts.push(s); }
+                if let Some(s) = self.lower_unstring_stmt(node) {
+                    stmts.push(s);
+                }
             }
             SyntaxKind::INITIALIZE_STMT => {
-                if let Some(s) = self.lower_initialize_stmt(node) { stmts.push(s); }
+                if let Some(s) = self.lower_initialize_stmt(node) {
+                    stmts.push(s);
+                }
             }
             SyntaxKind::SEARCH_STMT => {
-                if let Some(s) = self.lower_search_stmt(node) { stmts.push(s); }
+                if let Some(s) = self.lower_search_stmt(node) {
+                    stmts.push(s);
+                }
             }
             SyntaxKind::SET_STMT => {
-                if let Some(s) = self.lower_set_stmt(node) { stmts.push(s); }
+                if let Some(s) = self.lower_set_stmt(node) {
+                    stmts.push(s);
+                }
             }
             SyntaxKind::SENTENCE => {
                 // Sentence wrapping statements
@@ -4119,15 +5275,70 @@ impl<'a> HirLowerer<'a> {
             // Check for single-token condition name (level 88)
             if tokens.len() == 1 {
                 let name = self.interner.intern(&tokens[0].1.to_ascii_uppercase());
-                return Some(HirExpr::Condition(Box::new(HirCondition::ConditionName(HirDataRef {
-                    name,
-                    qualifiers: Vec::new(),
-                    subscripts: Vec::new(),
-                    ref_mod: None,
-                    resolved: None,
-                }))));
+                return Some(HirExpr::Condition(Box::new(HirCondition::ConditionName(
+                    HirDataRef {
+                        name,
+                        qualifiers: Vec::new(),
+                        subscripts: Vec::new(),
+                        ref_mod: None,
+                        resolved: None,
+                    },
+                ))));
             }
             return None;
+        }
+
+        // Handle NOT followed by a parenthesized sub-expression: NOT (...)
+        if tokens[0].1.eq_ignore_ascii_case("NOT") && tokens.len() > 2 && tokens[1].1 == "(" {
+            // Check if the paren at index 1 matches the closing paren at the end
+            let mut depth = 0;
+            let mut matching = false;
+            for (i, (_, t)) in tokens[1..].iter().enumerate() {
+                if t == "(" {
+                    depth += 1;
+                } else if t == ")" {
+                    depth -= 1;
+                    if depth == 0 {
+                        // The paren at index 1 closes at index 1+i
+                        if 1 + i == tokens.len() - 1 {
+                            matching = true;
+                        }
+                        break;
+                    }
+                }
+            }
+            if matching {
+                // Strip NOT and outer parens, parse inner, wrap in Not
+                let inner = &tokens[2..tokens.len() - 1];
+                if let Some(inner_expr) = self.parse_condition_tokens(inner) {
+                    let inner_cond = self.expr_to_condition(inner_expr);
+                    return Some(HirExpr::Condition(Box::new(HirCondition::Not(
+                        Box::new(inner_cond),
+                    ))));
+                }
+            }
+        }
+
+        // Strip outer matching parentheses: (...) -> recurse on inner tokens
+        if tokens[0].1 == "(" && tokens[tokens.len() - 1].1 == ")" {
+            let mut depth = 0;
+            let mut outer_match = false;
+            for (i, (_, t)) in tokens.iter().enumerate() {
+                if t == "(" {
+                    depth += 1;
+                } else if t == ")" {
+                    depth -= 1;
+                    if depth == 0 {
+                        if i == tokens.len() - 1 {
+                            outer_match = true;
+                        }
+                        break;
+                    }
+                }
+            }
+            if outer_match {
+                return self.parse_condition_tokens(&tokens[1..tokens.len() - 1]);
+            }
         }
 
         // Split at OR (lowest precedence) respecting parentheses
@@ -4189,8 +5400,12 @@ impl<'a> HirLowerer<'a> {
         let mut start = 0;
         let mut paren_depth = 0;
         for (i, (_, t)) in tokens.iter().enumerate() {
-            if t == "(" { paren_depth += 1; }
-            if t == ")" { paren_depth -= 1; }
+            if t == "(" {
+                paren_depth += 1;
+            }
+            if t == ")" {
+                paren_depth -= 1;
+            }
             if paren_depth == 0 && t.eq_ignore_ascii_case(keyword) {
                 if i > start {
                     parts.push(&tokens[start..i]);
@@ -4223,84 +5438,144 @@ impl<'a> HirLowerer<'a> {
             // Single-token condition name
             if tokens.len() == 1 {
                 let name = self.interner.intern(&tokens[0].1.to_ascii_uppercase());
-                return Some(HirExpr::Condition(Box::new(HirCondition::ConditionName(HirDataRef {
-                    name,
-                    qualifiers: Vec::new(),
-                    subscripts: Vec::new(),
-                    ref_mod: None,
-                    resolved: None,
-                }))));
+                return Some(HirExpr::Condition(Box::new(HirCondition::ConditionName(
+                    HirDataRef {
+                        name,
+                        qualifiers: Vec::new(),
+                        subscripts: Vec::new(),
+                        ref_mod: None,
+                        resolved: None,
+                    },
+                ))));
             }
             return None;
+        }
+
+        // -----------------------------------------------------------------
+        // Sign condition: identifier IS [NOT] POSITIVE/NEGATIVE/ZERO/ZEROS/ZEROES
+        // Detect before the comparison operator search because IS is not a
+        // comparison operator and would cause the condition to fail silently.
+        // -----------------------------------------------------------------
+        {
+            // Find "IS" keyword outside parentheses
+            let mut is_idx = None;
+            let mut pd = 0i32;
+            for (i, (_, t)) in tokens.iter().enumerate() {
+                if t == "(" { pd += 1; continue; }
+                if t == ")" { pd -= 1; continue; }
+                if pd > 0 { continue; }
+                if t.eq_ignore_ascii_case("IS") {
+                    is_idx = Some(i);
+                    break;
+                }
+            }
+            if let Some(is_pos) = is_idx {
+                if is_pos > 0 {
+                    let mut pos = is_pos + 1;
+                    if pos < tokens.len() {
+                        let negated = if tokens[pos].1.eq_ignore_ascii_case("NOT") {
+                            pos += 1;
+                            true
+                        } else {
+                            false
+                        };
+                        if pos < tokens.len() {
+                            let kw = tokens[pos].1.to_ascii_uppercase();
+                            let sign_type = match kw.as_str() {
+                                "POSITIVE" => Some(SignCheckType::Positive),
+                                "NEGATIVE" => Some(SignCheckType::Negative),
+                                "ZERO" | "ZEROS" | "ZEROES" => Some(SignCheckType::Zero),
+                                _ => None,
+                            };
+                            if let Some(st) = sign_type {
+                                // Ensure no extra tokens after the sign keyword
+                                if pos + 1 >= tokens.len() {
+                                    // Build operand from tokens before IS
+                                    let (operand, _) = self.parse_expr_at(tokens, 0);
+                                    let cond = HirCondition::SignCheck {
+                                        operand,
+                                        sign: st,
+                                    };
+                                    return if negated {
+                                        Some(HirExpr::Condition(Box::new(
+                                            HirCondition::Not(Box::new(cond)),
+                                        )))
+                                    } else {
+                                        Some(HirExpr::Condition(Box::new(cond)))
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Find the comparison operator, skipping tokens inside parentheses
         let mut paren_depth = 0;
         let mut op_idx = None;
         for (i, (_, t)) in tokens.iter().enumerate() {
-            if t == "(" { paren_depth += 1; continue; }
-            if t == ")" { paren_depth -= 1; continue; }
-            if paren_depth > 0 { continue; }
+            if t == "(" {
+                paren_depth += 1;
+                continue;
+            }
+            if t == ")" {
+                paren_depth -= 1;
+                continue;
+            }
+            if paren_depth > 0 {
+                continue;
+            }
 
             let u = t.to_ascii_uppercase();
-            if matches!(u.as_str(), "=" | ">" | "<" | ">=" | "<=" | "<>"
-                | "EQUAL" | "GREATER" | "LESS" | "NOT")
-            {
+            if matches!(
+                u.as_str(),
+                "=" | ">" | "<" | ">=" | "<=" | "<>" | "EQUAL" | "GREATER" | "LESS" | "NOT"
+            ) {
                 op_idx = Some(i);
                 break;
             }
         }
-        let op_idx = op_idx?;
+        let _op_idx = op_idx?;
 
-        // Build left-side expression from tokens[0..op_idx]
-        // Check for subscript or reference modification: NAME(subscript) or NAME(offset:length)
-        let left = if op_idx >= 4
-            && tokens[1].1 == "("
-            && tokens[op_idx - 1].1 == ")"
-        {
-            let inner_tokens = &tokens[2..op_idx - 1];
-            let has_colon = inner_tokens.iter().any(|(_, t)| t == ":");
-            if has_colon {
-                // Reference modification: NAME(offset:length)
-                let name = self.interner.intern(&tokens[0].1.to_ascii_uppercase());
-                let colon_pos = inner_tokens.iter()
-                    .position(|(_, t)| t == ":")
-                    .unwrap();
-                let offset_expr = if colon_pos > 0 {
-                    self.token_to_expr(inner_tokens[0].0, &inner_tokens[0].1)
-                } else {
-                    HirExpr::Literal(LiteralValue::Integer(1))
-                };
-                let length_expr = if colon_pos + 1 < inner_tokens.len() {
-                    Some(Box::new(self.token_to_expr(inner_tokens[colon_pos + 1].0, &inner_tokens[colon_pos + 1].1)))
-                } else {
-                    None
-                };
-                HirExpr::DataRef(Box::new(HirDataRef {
-                    name,
-                    qualifiers: Vec::new(),
-                    subscripts: Vec::new(),
-                    ref_mod: Some((Box::new(offset_expr), length_expr)),
-                    resolved: None,
-                }))
-            } else {
-                // Subscript: NAME(subscript-expr)
-                let name = self.interner.intern(&tokens[0].1.to_ascii_uppercase());
-                let subscript = if inner_tokens.len() == 1 {
-                    self.token_to_expr(inner_tokens[0].0, &inner_tokens[0].1)
-                } else {
-                    self.token_to_expr(inner_tokens[0].0, &inner_tokens[0].1)
-                };
-                HirExpr::DataRef(Box::new(HirDataRef {
-                    name,
-                    qualifiers: Vec::new(),
-                    subscripts: vec![subscript],
-                    ref_mod: None,
-                    resolved: None,
-                }))
+        // Build left-side expression using parse_arith_additive to support
+        // arithmetic expressions in conditions (e.g., IF A + B > C).
+        // The arithmetic parser naturally stops at comparison operators.
+        let mut left_pos = 0;
+        let left = self.parse_arith_additive(tokens, &mut left_pos);
+        let left_end = left_pos;
+
+        // Re-find the operator starting from where the left expression ended
+        // (the original op_idx may be wrong if qualifiers shifted things)
+        let actual_op_idx = {
+            let mut found = None;
+            let mut paren_depth = 0;
+            for i in left_end..tokens.len() {
+                if tokens[i].1 == "(" {
+                    paren_depth += 1;
+                    continue;
+                }
+                if tokens[i].1 == ")" {
+                    paren_depth -= 1;
+                    continue;
+                }
+                if paren_depth > 0 {
+                    continue;
+                }
+                let u = tokens[i].1.to_ascii_uppercase();
+                if matches!(
+                    u.as_str(),
+                    "=" | ">" | "<" | ">=" | "<=" | "<>" | "EQUAL" | "GREATER" | "LESS" | "NOT"
+                ) {
+                    found = Some(i);
+                    break;
+                }
             }
-        } else {
-            self.token_to_expr(tokens[0].0, &tokens[0].1)
+            found
+        };
+        let op_idx = match actual_op_idx {
+            Some(i) => i,
+            None => return None,
         };
 
         // Parse operator (may span multiple tokens like "NOT EQUAL")
@@ -4309,14 +5584,18 @@ impl<'a> HirLowerer<'a> {
             match op_text.as_str() {
                 "=" | "EQUAL" => (BinaryOp::Eq, op_idx + 1),
                 ">" | "GREATER" => {
-                    if op_idx + 1 < tokens.len() && tokens[op_idx + 1].1.eq_ignore_ascii_case("THAN") {
+                    if op_idx + 1 < tokens.len()
+                        && tokens[op_idx + 1].1.eq_ignore_ascii_case("THAN")
+                    {
                         (BinaryOp::Gt, op_idx + 2)
                     } else {
                         (BinaryOp::Gt, op_idx + 1)
                     }
                 }
                 "<" | "LESS" => {
-                    if op_idx + 1 < tokens.len() && tokens[op_idx + 1].1.eq_ignore_ascii_case("THAN") {
+                    if op_idx + 1 < tokens.len()
+                        && tokens[op_idx + 1].1.eq_ignore_ascii_case("THAN")
+                    {
                         (BinaryOp::Lt, op_idx + 2)
                     } else {
                         (BinaryOp::Lt, op_idx + 1)
@@ -4346,7 +5625,10 @@ impl<'a> HirLowerer<'a> {
             return None;
         }
 
-        let right = self.token_to_expr(tokens[right_start].0, &tokens[right_start].1);
+        // Parse right-side expression using parse_arith_additive to support
+        // arithmetic expressions (e.g., IF A > B + C)
+        let mut right_pos = right_start;
+        let right = self.parse_arith_additive(tokens, &mut right_pos);
 
         Some(HirExpr::Condition(Box::new(HirCondition::Comparison {
             left,
@@ -4366,29 +5648,41 @@ impl<'a> HirLowerer<'a> {
         //   }
         let tokens = self.collect_tokens(node);
 
-        let has_varying = tokens.iter().any(|(_, t)| t.eq_ignore_ascii_case("VARYING"));
+        let has_varying = tokens
+            .iter()
+            .any(|(_, t)| t.eq_ignore_ascii_case("VARYING"));
 
         if has_varying {
-            let varying_idx = tokens.iter().position(|(_, t)| t.eq_ignore_ascii_case("VARYING"))?;
-            let from_idx = tokens.iter().position(|(_, t)| t.eq_ignore_ascii_case("FROM"))?;
-            let by_idx = tokens.iter().position(|(_, t)| t.eq_ignore_ascii_case("BY"))?;
+            let varying_idx = tokens
+                .iter()
+                .position(|(_, t)| t.eq_ignore_ascii_case("VARYING"))?;
+            let from_idx = tokens
+                .iter()
+                .position(|(_, t)| t.eq_ignore_ascii_case("FROM"))?;
+            let by_idx = tokens
+                .iter()
+                .position(|(_, t)| t.eq_ignore_ascii_case("BY"))?;
 
             let var_name = &tokens[varying_idx + 1].1;
             let var_ref = self.make_data_ref(var_name);
 
-            let from_expr = self.token_to_expr(tokens[from_idx + 1].0, &tokens[from_idx + 1].1);
-            let by_expr = self.token_to_expr(tokens[by_idx + 1].0, &tokens[by_idx + 1].1);
+            let from_expr = self.parse_signed_token(&tokens, from_idx + 1);
+            let by_expr = self.parse_signed_token(&tokens, by_idx + 1);
 
             // Parse AFTER clauses: AFTER var FROM expr BY expr [AFTER ...]
             let mut after_clauses = Vec::new();
-            let after_positions: Vec<usize> = tokens.iter().enumerate()
+            let after_positions: Vec<usize> = tokens
+                .iter()
+                .enumerate()
                 .filter(|(_, (_, t))| t.eq_ignore_ascii_case("AFTER"))
                 .map(|(i, _)| i)
                 .collect();
 
             for &after_pos in &after_positions {
                 // AFTER var FROM expr BY expr
-                if after_pos + 1 >= tokens.len() { continue; }
+                if after_pos + 1 >= tokens.len() {
+                    continue;
+                }
                 let after_var = self.make_data_ref(&tokens[after_pos + 1].1);
                 // Find FROM and BY after this AFTER
                 let mut after_from = None;
@@ -4435,7 +5729,43 @@ impl<'a> HirLowerer<'a> {
                 }
             }
 
-            let until_expr = condition_exprs.first()
+            // Fallback: if no CONDITION_EXPR child was found (e.g. when the parser
+            // did not group the UNTIL tokens into a separate node because a
+            // negative BY value consumed the minus sign), extract the UNTIL
+            // condition directly from the flat token stream.
+            if condition_exprs.is_empty() {
+                if let Some(until_pos) = tokens.iter().position(|(_, t)| t.eq_ignore_ascii_case("UNTIL")) {
+                    // Collect condition tokens after UNTIL, stopping at known
+                    // statement keywords, AFTER, or END-PERFORM.
+                    let mut cond_end = until_pos + 1;
+                    while cond_end < tokens.len() {
+                        let u = tokens[cond_end].1.to_ascii_uppercase();
+                        if matches!(
+                            u.as_str(),
+                            "END-PERFORM" | "AFTER" | "ADD" | "SUBTRACT" | "MOVE"
+                            | "DISPLAY" | "COMPUTE" | "MULTIPLY" | "DIVIDE" | "PERFORM"
+                            | "IF" | "EVALUATE" | "CALL" | "GO" | "SET" | "STRING"
+                            | "UNSTRING" | "INSPECT" | "ACCEPT" | "STOP" | "READ"
+                            | "WRITE" | "REWRITE" | "DELETE" | "OPEN" | "CLOSE"
+                            | "START" | "RETURN" | "SEARCH" | "SORT" | "MERGE"
+                            | "RELEASE" | "INITIALIZE" | "EXIT" | "CONTINUE"
+                            | "GOBACK" | "ALTER" | "CANCEL" | "ENTER"
+                        ) {
+                            break;
+                        }
+                        cond_end += 1;
+                    }
+                    let cond_tokens = &tokens[until_pos + 1..cond_end];
+                    if !cond_tokens.is_empty() {
+                        if let Some(cond) = self.parse_condition_tokens(cond_tokens) {
+                            condition_exprs.push(cond);
+                        }
+                    }
+                }
+            }
+
+            let until_expr = condition_exprs
+                .first()
                 .cloned()
                 .unwrap_or(HirExpr::Literal(LiteralValue::Integer(0)));
 
@@ -4446,7 +5776,11 @@ impl<'a> HirLowerer<'a> {
                 }
             }
 
-            let body = if inline_stmts.is_empty() { None } else { Some(inline_stmts) };
+            let body = if inline_stmts.is_empty() {
+                None
+            } else {
+                Some(inline_stmts)
+            };
 
             Some(HirStatement::Perform(PerformType::Varying {
                 target: self.interner.intern("_INLINE"),
@@ -4469,7 +5803,9 @@ impl<'a> HirLowerer<'a> {
             }
 
             // Check if we have inline body (END-PERFORM present or statement children)
-            let has_end_perform = tokens.iter().any(|(_, t)| t.eq_ignore_ascii_case("END-PERFORM"));
+            let has_end_perform = tokens
+                .iter()
+                .any(|(_, t)| t.eq_ignore_ascii_case("END-PERFORM"));
             let has_times = tokens.iter().any(|(_, t)| t.eq_ignore_ascii_case("TIMES"));
             let has_until = tokens.iter().any(|(_, t)| t.eq_ignore_ascii_case("UNTIL"));
 
@@ -4499,8 +5835,10 @@ impl<'a> HirLowerer<'a> {
 
                     // Optional THRU
                     let mut thru = None;
-                    if idx < tokens.len() && (tokens[idx].1.eq_ignore_ascii_case("THRU")
-                        || tokens[idx].1.eq_ignore_ascii_case("THROUGH")) {
+                    if idx < tokens.len()
+                        && (tokens[idx].1.eq_ignore_ascii_case("THRU")
+                            || tokens[idx].1.eq_ignore_ascii_case("THROUGH"))
+                    {
                         idx += 1;
                         if idx < tokens.len() {
                             let thru_name = tokens[idx].1.to_ascii_uppercase();
@@ -4542,14 +5880,16 @@ impl<'a> HirLowerer<'a> {
                         }
                     }
                     // Also try from flat tokens (skip UNTIL keyword)
-                    let mut cond_idx = idx + 1;
+                    let cond_idx = idx + 1;
                     if cond_idx < tokens.len() {
                         // Collect tokens until END-PERFORM or a statement keyword
-                        let cond_end = tokens[cond_idx..].iter()
+                        let cond_end = tokens[cond_idx..]
+                            .iter()
                             .position(|(_, t)| t.eq_ignore_ascii_case("END-PERFORM"))
                             .map(|p| cond_idx + p)
                             .unwrap_or(tokens.len());
-                        let cond_tokens: Vec<(SyntaxKind, String)> = tokens[cond_idx..cond_end].to_vec();
+                        let cond_tokens: Vec<(SyntaxKind, String)> =
+                            tokens[cond_idx..cond_end].to_vec();
                         if let Some(cond) = self.parse_condition_tokens(&cond_tokens) {
                             condition = cond;
                         }
@@ -4567,8 +5907,10 @@ impl<'a> HirLowerer<'a> {
 
                     // Optional THRU
                     let mut thru = None;
-                    if idx < tokens.len() && (tokens[idx].1.eq_ignore_ascii_case("THRU")
-                        || tokens[idx].1.eq_ignore_ascii_case("THROUGH")) {
+                    if idx < tokens.len()
+                        && (tokens[idx].1.eq_ignore_ascii_case("THRU")
+                            || tokens[idx].1.eq_ignore_ascii_case("THROUGH"))
+                    {
                         idx += 1;
                         if idx < tokens.len() {
                             let thru_name = tokens[idx].1.to_ascii_uppercase();
@@ -4629,8 +5971,10 @@ impl<'a> HirLowerer<'a> {
                 idx += 1;
 
                 let mut thru = None;
-                if idx < tokens.len() && (tokens[idx].1.eq_ignore_ascii_case("THRU")
-                    || tokens[idx].1.eq_ignore_ascii_case("THROUGH")) {
+                if idx < tokens.len()
+                    && (tokens[idx].1.eq_ignore_ascii_case("THRU")
+                        || tokens[idx].1.eq_ignore_ascii_case("THROUGH"))
+                {
                     idx += 1;
                     if idx < tokens.len() {
                         let thru_name = tokens[idx].1.to_ascii_uppercase();
@@ -4672,7 +6016,7 @@ impl<'a> HirLowerer<'a> {
             using_params: self.using_params,
             file_items: self.file_items,
             paragraphs: self.paragraphs,
-            sections: Vec::new(),
+            sections: self.sections,
             diagnostics: self.diagnostics,
             condition_names: self.condition_names,
         }
@@ -4749,7 +6093,10 @@ mod tests {
     #[test]
     fn sign_position_variants() {
         assert_ne!(SignPosition::Leading, SignPosition::Trailing);
-        assert_ne!(SignPosition::LeadingSeparate, SignPosition::TrailingSeparate);
+        assert_ne!(
+            SignPosition::LeadingSeparate,
+            SignPosition::TrailingSeparate
+        );
         assert_ne!(SignPosition::None, SignPosition::Leading);
     }
 
@@ -4923,7 +6270,10 @@ mod tests {
         // PACKED-DECIMAL: (digits + 1) / 2
         // PIC 9(7) -> (7 + 1) / 2 = 4 bytes
         let pic = parse_picture("9(7)").unwrap();
-        assert_eq!(HirLowerer::compute_byte_size(UsageType::PackedDecimal, &pic), 4);
+        assert_eq!(
+            HirLowerer::compute_byte_size(UsageType::PackedDecimal, &pic),
+            4
+        );
     }
 
     #[test]
@@ -4936,18 +6286,54 @@ mod tests {
 
     #[test]
     fn usage_to_encoding_mappings() {
-        assert_eq!(HirLowerer::usage_to_encoding(UsageType::Display), DataEncoding::Display);
-        assert_eq!(HirLowerer::usage_to_encoding(UsageType::Comp), DataEncoding::Binary);
-        assert_eq!(HirLowerer::usage_to_encoding(UsageType::Comp1), DataEncoding::FloatSingle);
-        assert_eq!(HirLowerer::usage_to_encoding(UsageType::Comp2), DataEncoding::FloatDouble);
-        assert_eq!(HirLowerer::usage_to_encoding(UsageType::Comp3), DataEncoding::PackedDecimal);
-        assert_eq!(HirLowerer::usage_to_encoding(UsageType::Comp4), DataEncoding::Binary);
-        assert_eq!(HirLowerer::usage_to_encoding(UsageType::Comp5), DataEncoding::Binary);
-        assert_eq!(HirLowerer::usage_to_encoding(UsageType::Binary), DataEncoding::Binary);
-        assert_eq!(HirLowerer::usage_to_encoding(UsageType::PackedDecimal), DataEncoding::PackedDecimal);
-        assert_eq!(HirLowerer::usage_to_encoding(UsageType::Index), DataEncoding::Index);
-        assert_eq!(HirLowerer::usage_to_encoding(UsageType::Pointer), DataEncoding::Pointer);
-        assert_eq!(HirLowerer::usage_to_encoding(UsageType::FunctionPointer), DataEncoding::Pointer);
+        assert_eq!(
+            HirLowerer::usage_to_encoding(UsageType::Display),
+            DataEncoding::Display
+        );
+        assert_eq!(
+            HirLowerer::usage_to_encoding(UsageType::Comp),
+            DataEncoding::Binary
+        );
+        assert_eq!(
+            HirLowerer::usage_to_encoding(UsageType::Comp1),
+            DataEncoding::FloatSingle
+        );
+        assert_eq!(
+            HirLowerer::usage_to_encoding(UsageType::Comp2),
+            DataEncoding::FloatDouble
+        );
+        assert_eq!(
+            HirLowerer::usage_to_encoding(UsageType::Comp3),
+            DataEncoding::PackedDecimal
+        );
+        assert_eq!(
+            HirLowerer::usage_to_encoding(UsageType::Comp4),
+            DataEncoding::Binary
+        );
+        assert_eq!(
+            HirLowerer::usage_to_encoding(UsageType::Comp5),
+            DataEncoding::Binary
+        );
+        assert_eq!(
+            HirLowerer::usage_to_encoding(UsageType::Binary),
+            DataEncoding::Binary
+        );
+        assert_eq!(
+            HirLowerer::usage_to_encoding(UsageType::PackedDecimal),
+            DataEncoding::PackedDecimal
+        );
+        assert_eq!(
+            HirLowerer::usage_to_encoding(UsageType::Index),
+            DataEncoding::Index
+        );
+        assert_eq!(
+            HirLowerer::usage_to_encoding(UsageType::Pointer),
+            DataEncoding::Pointer
+        );
+        assert_eq!(
+            HirLowerer::usage_to_encoding(UsageType::FunctionPointer),
+            DataEncoding::Pointer
+        );
     }
 
     // ------------------------------------------------------------------
@@ -4955,7 +6341,11 @@ mod tests {
     // ------------------------------------------------------------------
 
     /// Helper: find the first working-storage data item by name (case-insensitive).
-    fn find_ws_item<'a>(module: &'a HirModule, interner: &cobol_intern::Interner, name: &str) -> &'a DataItemData {
+    fn find_ws_item<'a>(
+        module: &'a HirModule,
+        interner: &cobol_intern::Interner,
+        name: &str,
+    ) -> &'a DataItemData {
         for &id in &module.working_storage {
             let item = &module.data_items[id.into_raw()];
             if let Some(n) = item.name {

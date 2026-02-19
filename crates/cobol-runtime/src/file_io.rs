@@ -1,16 +1,21 @@
 /// File handle for COBOL file operations
 #[repr(C)]
 pub struct FileHandle {
-    pub fd: i32,           // OS file descriptor or -1
-    pub organization: u8,  // 0=sequential, 1=relative, 2=indexed, 3=line-sequential
-    pub access_mode: u8,   // 0=sequential, 1=random, 2=dynamic
-    pub status: [u8; 2],   // 2-char file status
+    pub fd: i32,          // OS file descriptor or -1
+    pub organization: u8, // 0=sequential, 1=relative, 2=indexed, 3=line-sequential
+    pub access_mode: u8,  // 0=sequential, 1=random, 2=dynamic
+    pub status: [u8; 2],  // 2-char file status
     pub record_size: u32,
 }
 
 /// Open a file
+///
+/// # Safety
+///
+/// - `handle` must point to a valid, writable `FileHandle`, or be null.
+/// - `path` must point to at least `path_len` readable bytes, or be null.
 #[no_mangle]
-pub extern "C" fn cobolrt_file_open(
+pub unsafe extern "C" fn cobolrt_file_open(
     handle: *mut FileHandle,
     path: *const u8,
     path_len: u32,
@@ -22,15 +27,24 @@ pub extern "C" fn cobolrt_file_open(
 }
 
 /// Close a file
+///
+/// # Safety
+///
+/// - `handle` must point to a valid, writable `FileHandle`, or be null.
 #[no_mangle]
-pub extern "C" fn cobolrt_file_close(handle: *mut FileHandle) -> i32 {
+pub unsafe extern "C" fn cobolrt_file_close(handle: *mut FileHandle) -> i32 {
     let _ = handle;
     0
 }
 
 /// Read a record
+///
+/// # Safety
+///
+/// - `handle` must point to a valid, writable `FileHandle`, or be null.
+/// - `buffer` must point to at least `buffer_len` writable bytes, or be null.
 #[no_mangle]
-pub extern "C" fn cobolrt_file_read(
+pub unsafe extern "C" fn cobolrt_file_read(
     handle: *mut FileHandle,
     buffer: *mut u8,
     buffer_len: u32,
@@ -41,8 +55,13 @@ pub extern "C" fn cobolrt_file_read(
 }
 
 /// Write a record
+///
+/// # Safety
+///
+/// - `handle` must point to a valid, writable `FileHandle`, or be null.
+/// - `data` must point to at least `data_len` readable bytes, or be null.
 #[no_mangle]
-pub extern "C" fn cobolrt_file_write(
+pub unsafe extern "C" fn cobolrt_file_write(
     handle: *mut FileHandle,
     data: *const u8,
     data_len: u32,
@@ -52,8 +71,13 @@ pub extern "C" fn cobolrt_file_write(
 }
 
 /// Rewrite (update) a record
+///
+/// # Safety
+///
+/// - `handle` must point to a valid, writable `FileHandle`, or be null.
+/// - `data` must point to at least `data_len` readable bytes, or be null.
 #[no_mangle]
-pub extern "C" fn cobolrt_file_rewrite(
+pub unsafe extern "C" fn cobolrt_file_rewrite(
     handle: *mut FileHandle,
     data: *const u8,
     data_len: u32,
@@ -63,20 +87,28 @@ pub extern "C" fn cobolrt_file_rewrite(
 }
 
 /// Delete a record
+///
+/// # Safety
+///
+/// - `handle` must point to a valid, writable `FileHandle`, or be null.
 #[no_mangle]
-pub extern "C" fn cobolrt_file_delete(handle: *mut FileHandle) -> i32 {
+pub unsafe extern "C" fn cobolrt_file_delete(handle: *mut FileHandle) -> i32 {
     let _ = handle;
     0
 }
 
 /// Get file status as 2-char code
+///
+/// # Safety
+///
+/// - `handle` must point to a valid `FileHandle`, or be null.
+/// - `status` must point to at least 2 writable bytes, or be null.
 #[no_mangle]
-pub extern "C" fn cobolrt_file_status(handle: *const FileHandle, status: *mut u8) {
+pub unsafe extern "C" fn cobolrt_file_status(handle: *const FileHandle, status: *mut u8) {
     if handle.is_null() || status.is_null() {
         return;
     }
-    unsafe {
-        *status = (*handle).status[0];
-        *status.add(1) = (*handle).status[1];
-    }
+    // SAFETY: Caller guarantees `handle` is a valid FileHandle and `status` has 2 writable bytes.
+    *status = (*handle).status[0];
+    *status.add(1) = (*handle).status[1];
 }

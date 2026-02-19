@@ -210,7 +210,7 @@ impl<'a> Scanner<'a> {
             if self.remaining().starts_with("==") {
                 let content = self.text[start..self.pos].to_string();
                 self.advance(2); // skip closing ==
-                // Normalize whitespace: collapse multiple spaces to single space
+                                 // Normalize whitespace: collapse multiple spaces to single space
                 let normalized = normalize_pseudo_text(&content);
                 return Some(normalized);
             }
@@ -676,7 +676,9 @@ fn apply_pseudo_text_replacement(text: &str, from: &str, to: &str) -> String {
 
     // Check if the from-text contains special characters (like colons) that
     // indicate it's a tag-style pattern needing substring matching
-    let has_special = from.bytes().any(|b| !b.is_ascii_alphanumeric() && b != b'-');
+    let has_special = from
+        .bytes()
+        .any(|b| !b.is_ascii_alphanumeric() && b != b'-');
 
     let mut pos = 0;
     while pos < text.len() {
@@ -688,8 +690,7 @@ fn apply_pseudo_text_replacement(text: &str, from: &str, to: &str) -> String {
                 continue;
             }
             // Word-style pattern: check word boundaries
-            let before_ok =
-                pos == 0 || is_word_boundary_char(text.as_bytes()[pos - 1]);
+            let before_ok = pos == 0 || is_word_boundary_char(text.as_bytes()[pos - 1]);
             let after_ok = pos + from_len >= text.len()
                 || is_word_boundary_char(text.as_bytes()[pos + from_len]);
 
@@ -938,8 +939,7 @@ impl<'a> Preprocessor<'a> {
                     match copybook_text {
                         Some(text) => {
                             // Apply REPLACING if present
-                            let replaced_text =
-                                apply_replacements(&text, &copy_dir.replacements);
+                            let replaced_text = apply_replacements(&text, &copy_dir.replacements);
 
                             // Create expansion info
                             let copy_file_id = self.alloc_file_id();
@@ -963,8 +963,12 @@ impl<'a> Preprocessor<'a> {
                                 });
 
                             // Recursively expand any nested COPY directives
-                            let expanded =
-                                self.expand(&replaced_text, copy_file_id, new_expansion_id, depth + 1);
+                            let expanded = self.expand(
+                                &replaced_text,
+                                copy_file_id,
+                                new_expansion_id,
+                                depth + 1,
+                            );
 
                             let out_start = output.len();
                             output.push_str(&expanded);
@@ -1153,13 +1157,15 @@ mod tests {
         }
 
         fn add(&mut self, name: &str, content: &str) {
-            self.copybooks.insert(name.to_ascii_uppercase(), content.to_string());
+            self.copybooks
+                .insert(name.to_ascii_uppercase(), content.to_string());
         }
     }
 
     impl cobol_vfs::FileLoader for MockLoader {
         fn load(&self, path: &Path) -> Result<String, VfsError> {
-            let name = path.file_stem()
+            let name = path
+                .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("")
                 .to_ascii_uppercase();
@@ -1242,8 +1248,7 @@ mod tests {
         let mut loader = MockLoader::new();
         loader.add("MYFIELDS", "       01 :PREFIX:-NAME PIC X(10).\n");
 
-        let source =
-            "       COPY MYFIELDS REPLACING ==:PREFIX:-NAME== BY ==WS-CUSTOMER-NAME==.\n";
+        let source = "       COPY MYFIELDS REPLACING ==:PREFIX:-NAME== BY ==WS-CUSTOMER-NAME==.\n";
         let file_id = cobol_span::FileId::new(0);
 
         let result = preprocess(source, file_id, &loader);
@@ -1306,7 +1311,10 @@ mod tests {
     #[test]
     fn nested_copy() {
         let mut loader = MockLoader::new();
-        loader.add("OUTER", "       COPY INNER.\n       01 WS-OUTER PIC X(5).\n");
+        loader.add(
+            "OUTER",
+            "       COPY INNER.\n       01 WS-OUTER PIC X(5).\n",
+        );
         loader.add("INNER", "       01 WS-INNER PIC X(5).\n");
 
         let source = "       COPY OUTER.\n";
@@ -1330,10 +1338,12 @@ mod tests {
     #[test]
     fn leading_replacing() {
         let mut loader = MockLoader::new();
-        loader.add("PREFIXED", "       01 :PFX:-NAME PIC X(5).\n       01 :PFX:-ADDR PIC X(20).\n");
+        loader.add(
+            "PREFIXED",
+            "       01 :PFX:-NAME PIC X(5).\n       01 :PFX:-ADDR PIC X(20).\n",
+        );
 
-        let source =
-            "       COPY PREFIXED REPLACING LEADING ==:PFX:== BY ==WS==.\n";
+        let source = "       COPY PREFIXED REPLACING LEADING ==:PFX:== BY ==WS==.\n";
         let file_id = cobol_span::FileId::new(0);
 
         let result = preprocess(source, file_id, &loader);

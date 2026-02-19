@@ -3,6 +3,8 @@
 pub extern "C" fn cobolrt_alloc(size: u32) -> *mut u8 {
     let layout =
         std::alloc::Layout::from_size_align(size as usize, 8).expect("invalid allocation size");
+    // SAFETY: Layout is valid (checked above). The returned pointer is either
+    // valid or null, and we handle the null case.
     unsafe {
         let ptr = std::alloc::alloc_zeroed(layout);
         if ptr.is_null() {
@@ -13,23 +15,33 @@ pub extern "C" fn cobolrt_alloc(size: u32) -> *mut u8 {
 }
 
 /// Free memory allocated by cobolrt_alloc
+///
+/// # Safety
+///
+/// - `ptr` must have been previously returned by `cobolrt_alloc` with the same `size`,
+///   or be null.
 #[no_mangle]
-pub extern "C" fn cobolrt_free(ptr: *mut u8, size: u32) {
+pub unsafe extern "C" fn cobolrt_free(ptr: *mut u8, size: u32) {
     if ptr.is_null() {
         return;
     }
     let layout =
         std::alloc::Layout::from_size_align(size as usize, 8).expect("invalid allocation size");
-    unsafe {
-        std::alloc::dealloc(ptr, layout);
-    }
+    // SAFETY: Caller guarantees `ptr` was allocated by `cobolrt_alloc` with matching `size`.
+    std::alloc::dealloc(ptr, layout);
 }
 
 /// Move (copy) data between fields, with space/zero padding
 /// Alphanumeric: left-justified, space-padded
 /// Numeric: right-justified, zero-padded
+///
+/// # Safety
+///
+/// - `src` must point to at least `src_len` readable bytes, or be null.
+/// - `dest` must point to at least `dest_len` writable bytes, or be null.
+/// - `src` and `dest` must not overlap.
 #[no_mangle]
-pub extern "C" fn cobolrt_move_alphanumeric(
+pub unsafe extern "C" fn cobolrt_move_alphanumeric(
     src: *const u8,
     src_len: u32,
     dest: *mut u8,
@@ -39,12 +51,11 @@ pub extern "C" fn cobolrt_move_alphanumeric(
         return;
     }
     let copy_len = std::cmp::min(src_len, dest_len) as usize;
-    unsafe {
-        std::ptr::copy_nonoverlapping(src, dest, copy_len);
-        // Pad with spaces
-        if (dest_len as usize) > copy_len {
-            std::ptr::write_bytes(dest.add(copy_len), b' ', dest_len as usize - copy_len);
-        }
+    // SAFETY: Caller guarantees both pointers are valid and non-overlapping.
+    std::ptr::copy_nonoverlapping(src, dest, copy_len);
+    // Pad with spaces
+    if (dest_len as usize) > copy_len {
+        std::ptr::write_bytes(dest.add(copy_len), b' ', dest_len as usize - copy_len);
     }
 }
 
@@ -54,8 +65,13 @@ pub extern "C" fn cobolrt_move_alphanumeric(
 /// `src_scale` / `dest_scale` are the number of implied decimal digits.
 /// `src_dot_pos` / `dest_dot_pos` are the byte position of a literal '.'
 /// character in the display buffer (-1 if no literal dot).
+///
+/// # Safety
+///
+/// - `src` must point to at least `src_len` readable bytes, or be null.
+/// - `dest` must point to at least `dest_len` writable bytes, or be null.
 #[no_mangle]
-pub extern "C" fn cobolrt_move_numeric(
+pub unsafe extern "C" fn cobolrt_move_numeric(
     src: *const u8,
     src_len: u32,
     src_scale: i32,
@@ -69,12 +85,13 @@ pub extern "C" fn cobolrt_move_numeric(
     if src.is_null() || dest.is_null() {
         return;
     }
-    let src_slice = unsafe { std::slice::from_raw_parts(src, src_len as usize) };
+    // SAFETY: Caller guarantees `src` points to `src_len` readable bytes.
+    let src_slice = std::slice::from_raw_parts(src, src_len as usize);
 
     // Extract the integer value from source, skipping any '.' character
     let mut src_val: i64 = 0;
     for &b in src_slice {
-        if b >= b'0' && b <= b'9' {
+        if b.is_ascii_digit() {
             src_val = src_val * 10 + (b - b'0') as i64;
         }
     }
@@ -106,7 +123,8 @@ pub extern "C" fn cobolrt_move_numeric(
     }
 
     // Write the result into the destination buffer
-    let dest_slice = unsafe { std::slice::from_raw_parts_mut(dest, dest_len as usize) };
+    // SAFETY: Caller guarantees `dest` points to `dest_len` writable bytes.
+    let dest_slice = std::slice::from_raw_parts_mut(dest, dest_len as usize);
 
     // Fill with '0' first
     for b in dest_slice.iter_mut() {
@@ -136,8 +154,14 @@ pub extern "C" fn cobolrt_move_numeric(
 
 /// Move numeric display data to an alphanumeric field.
 /// Left-justifies the numeric representation and space-pads the right.
+///
+/// # Safety
+///
+/// - `src` must point to at least `src_len` readable bytes, or be null.
+/// - `dest` must point to at least `dest_len` writable bytes, or be null.
+/// - `src` and `dest` must not overlap.
 #[no_mangle]
-pub extern "C" fn cobolrt_move_num_to_alpha(
+pub unsafe extern "C" fn cobolrt_move_num_to_alpha(
     src: *const u8,
     src_len: u32,
     dest: *mut u8,
@@ -147,19 +171,23 @@ pub extern "C" fn cobolrt_move_num_to_alpha(
         return;
     }
     let copy_len = std::cmp::min(src_len, dest_len) as usize;
-    unsafe {
-        std::ptr::copy_nonoverlapping(src, dest, copy_len);
-        if (dest_len as usize) > copy_len {
-            std::ptr::write_bytes(dest.add(copy_len), b' ', dest_len as usize - copy_len);
-        }
+    // SAFETY: Caller guarantees both pointers are valid and non-overlapping.
+    std::ptr::copy_nonoverlapping(src, dest, copy_len);
+    if (dest_len as usize) > copy_len {
+        std::ptr::write_bytes(dest.add(copy_len), b' ', dest_len as usize - copy_len);
     }
 }
 
 /// Move alphanumeric data to a numeric field.
 /// Parses digits from the alphanumeric source, ignoring non-digit characters.
 /// Result is right-justified and zero-padded.
+///
+/// # Safety
+///
+/// - `src` must point to at least `src_len` readable bytes, or be null.
+/// - `dest` must point to at least `dest_len` writable bytes, or be null.
 #[no_mangle]
-pub extern "C" fn cobolrt_move_alpha_to_num(
+pub unsafe extern "C" fn cobolrt_move_alpha_to_num(
     src: *const u8,
     src_len: u32,
     dest: *mut u8,
@@ -169,8 +197,10 @@ pub extern "C" fn cobolrt_move_alpha_to_num(
     if src.is_null() || dest.is_null() {
         return;
     }
-    let src_slice = unsafe { std::slice::from_raw_parts(src, src_len as usize) };
-    let dest_slice = unsafe { std::slice::from_raw_parts_mut(dest, dest_len as usize) };
+    // SAFETY: Caller guarantees `src` points to `src_len` readable bytes.
+    let src_slice = std::slice::from_raw_parts(src, src_len as usize);
+    // SAFETY: Caller guarantees `dest` points to `dest_len` writable bytes.
+    let dest_slice = std::slice::from_raw_parts_mut(dest, dest_len as usize);
 
     // Parse the source as a number
     let mut int_part: i64 = 0;
@@ -183,7 +213,7 @@ pub extern "C" fn cobolrt_move_alpha_to_num(
             in_frac = true;
             continue;
         }
-        if b >= b'0' && b <= b'9' {
+        if b.is_ascii_digit() {
             if in_frac {
                 frac_part = frac_part * 10 + (b - b'0') as i64;
                 frac_digits += 1;
@@ -240,23 +270,30 @@ pub extern "C" fn cobolrt_move_alpha_to_num(
     }
 }
 
-/// Initialize a data item (INITIALIZE verb)
+/// Initialize a data item (INITIALIZE verb) - fills with spaces.
+///
+/// # Safety
+///
+/// - `data` must point to at least `len` writable bytes, or be null.
 #[no_mangle]
-pub extern "C" fn cobolrt_initialize_alphanumeric(data: *mut u8, len: u32) {
+pub unsafe extern "C" fn cobolrt_initialize_alphanumeric(data: *mut u8, len: u32) {
     if data.is_null() {
         return;
     }
-    unsafe {
-        std::ptr::write_bytes(data, b' ', len as usize);
-    }
+    // SAFETY: Caller guarantees `data` points to `len` writable bytes.
+    std::ptr::write_bytes(data, b' ', len as usize);
 }
 
+/// Initialize a numeric data item - fills with ASCII zeros.
+///
+/// # Safety
+///
+/// - `data` must point to at least `len` writable bytes, or be null.
 #[no_mangle]
-pub extern "C" fn cobolrt_initialize_numeric(data: *mut u8, len: u32) {
+pub unsafe extern "C" fn cobolrt_initialize_numeric(data: *mut u8, len: u32) {
     if data.is_null() {
         return;
     }
-    unsafe {
-        std::ptr::write_bytes(data, b'0', len as usize);
-    }
+    // SAFETY: Caller guarantees `data` points to `len` writable bytes.
+    std::ptr::write_bytes(data, b'0', len as usize);
 }

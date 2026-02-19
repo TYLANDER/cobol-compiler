@@ -113,6 +113,9 @@ ast_node!(DataItem, DATA_ITEM);
 ast_node!(PicClause, PIC_CLAUSE);
 ast_node!(ValueClause, VALUE_CLAUSE);
 ast_node!(UsageClause, USAGE_CLAUSE);
+ast_node!(SignClause, SIGN_CLAUSE);
+ast_node!(JustifiedClause, JUSTIFIED_CLAUSE);
+ast_node!(BlankClause, BLANK_CLAUSE);
 ast_node!(ProcedureDivision, PROCEDURE_DIVISION);
 ast_node!(Paragraph, PARAGRAPH);
 ast_node!(Section, SECTION);
@@ -264,6 +267,21 @@ impl DataItem {
     pub fn usage_clause(&self) -> Option<UsageClause> {
         children::<UsageClause>(&self.syntax).next()
     }
+
+    /// Returns the SIGN clause, if present.
+    pub fn sign_clause(&self) -> Option<SignClause> {
+        children::<SignClause>(&self.syntax).next()
+    }
+
+    /// Returns the JUSTIFIED clause, if present.
+    pub fn justified_clause(&self) -> Option<JustifiedClause> {
+        children::<JustifiedClause>(&self.syntax).next()
+    }
+
+    /// Returns the BLANK WHEN ZERO clause, if present.
+    pub fn blank_clause(&self) -> Option<BlankClause> {
+        children::<BlankClause>(&self.syntax).next()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -313,6 +331,28 @@ impl Paragraph {
 }
 
 // ---------------------------------------------------------------------------
+// Section methods
+// ---------------------------------------------------------------------------
+
+impl Section {
+    /// Returns the section name token (first WORD child).
+    pub fn name(&self) -> Option<SyntaxToken> {
+        child_token(&self.syntax, SyntaxKind::WORD)
+    }
+
+    /// Returns an iterator over all paragraphs in this section.
+    pub fn paragraphs(&self) -> impl Iterator<Item = Paragraph> + '_ {
+        children::<Paragraph>(&self.syntax)
+    }
+
+    /// Returns an iterator over all sentences directly in this section
+    /// (not inside a named paragraph).
+    pub fn sentences(&self) -> impl Iterator<Item = Sentence> + '_ {
+        children::<Sentence>(&self.syntax)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Sentence methods
 // ---------------------------------------------------------------------------
 
@@ -340,11 +380,17 @@ mod tests {
 
     #[test]
     fn all_node_types_can_cast_their_own_kind() {
-        assert!(IdentificationDivision::can_cast(SyntaxKind::IDENTIFICATION_DIVISION));
+        assert!(IdentificationDivision::can_cast(
+            SyntaxKind::IDENTIFICATION_DIVISION
+        ));
         assert!(ProgramIdClause::can_cast(SyntaxKind::PROGRAM_ID_CLAUSE));
-        assert!(EnvironmentDivision::can_cast(SyntaxKind::ENVIRONMENT_DIVISION));
+        assert!(EnvironmentDivision::can_cast(
+            SyntaxKind::ENVIRONMENT_DIVISION
+        ));
         assert!(DataDivision::can_cast(SyntaxKind::DATA_DIVISION));
-        assert!(WorkingStorageSection::can_cast(SyntaxKind::WORKING_STORAGE_SECTION));
+        assert!(WorkingStorageSection::can_cast(
+            SyntaxKind::WORKING_STORAGE_SECTION
+        ));
         assert!(LinkageSection::can_cast(SyntaxKind::LINKAGE_SECTION));
         assert!(DataItem::can_cast(SyntaxKind::DATA_ITEM));
         assert!(PicClause::can_cast(SyntaxKind::PIC_CLAUSE));

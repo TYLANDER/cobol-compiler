@@ -114,7 +114,11 @@ impl CraneliftCodegen {
     }
 
     /// Compile an entire MIR module to an object file at `output`.
-    fn compile_module(mut self, mir: &MirModule, output: &std::path::Path) -> Result<(), CodegenError> {
+    fn compile_module(
+        mut self,
+        mir: &MirModule,
+        output: &std::path::Path,
+    ) -> Result<(), CodegenError> {
         // 1. Declare and define all globals.
         self.declare_globals(&mir.globals)?;
         self.define_globals(&mir.globals)?;
@@ -132,12 +136,25 @@ impl CraneliftCodegen {
         for func in &mir.functions {
             for block in &func.blocks {
                 for inst in &block.instructions {
-                    if let MirInst::CallRuntime { func: ref name, args, .. } = inst {
+                    if let MirInst::CallRuntime {
+                        func: ref name,
+                        args,
+                        ..
+                    } = inst
+                    {
                         let entry = extern_funcs.entry(name.clone()).or_insert(0);
                         *entry = (*entry).max(args.len());
                     }
-                    if let MirInst::MoveAlphanumeric { .. } = inst {
-                        extern_funcs.entry("cobolrt_move_alphanumeric".to_string()).or_insert(4);
+                    if let MirInst::MoveAlphanumeric { justified, .. } = inst {
+                        if *justified {
+                            extern_funcs
+                                .entry("cobolrt_move_alphanumeric_justified".to_string())
+                                .or_insert(4);
+                        } else {
+                            extern_funcs
+                                .entry("cobolrt_move_alphanumeric".to_string())
+                                .or_insert(4);
+                        }
                     }
                 }
             }
@@ -172,6 +189,15 @@ impl CraneliftCodegen {
     // -- globals --------------------------------------------------------------
 
     fn declare_globals(&mut self, globals: &[MirGlobal]) -> Result<(), CodegenError> {
+        // First pass: build a map from name -> (parent_name, relative_offset)
+        // so we can compute accumulated offsets for nested children.
+        let mut raw_parent_offsets: HashMap<String, (String, u32)> = HashMap::new();
+        for g in globals {
+            if let Some((ref parent_name, byte_offset)) = g.parent_offset {
+                raw_parent_offsets.insert(g.name.clone(), (parent_name.clone(), byte_offset));
+            }
+        }
+
         for g in globals {
             if let Some(ref redef_target) = g.redefines {
                 // REDEFINES: share the same DataId as the redefined item
@@ -182,17 +208,32 @@ impl CraneliftCodegen {
             }
             if let Some((ref parent_name, byte_offset)) = g.parent_offset {
                 // Child of a group item: share the parent's DataId.
-                // The actual offset is applied at GlobalAddr emission time.
+                // Compute the accumulated offset by walking the parent chain.
                 if let Some(&parent_id) = self.data_ids.get(parent_name) {
                     self.data_ids.insert(g.name.clone(), parent_id);
-                    self.parent_offsets.insert(g.name.clone(), (parent_name.clone(), byte_offset));
+                    // Walk the parent chain to accumulate the total offset from the root.
+                    let mut total_offset = byte_offset;
+                    let mut current = parent_name.clone();
+                    while let Some((grandparent, gp_offset)) = raw_parent_offsets.get(&current) {
+                        total_offset += gp_offset;
+                        current = grandparent.clone();
+                    }
+                    self.parent_offsets
+                        .insert(g.name.clone(), (current, total_offset));
                     continue;
                 }
             }
             let data_id = self
                 .module
-                .declare_data(&g.name, Linkage::Local, true /* writable */, false /* tls */)
-                .map_err(|e| CodegenError::BackendError(format!("declare data '{}': {}", g.name, e)))?;
+                .declare_data(
+                    &g.name,
+                    Linkage::Local,
+                    true,  /* writable */
+                    false, /* tls */
+                )
+                .map_err(|e| {
+                    CodegenError::BackendError(format!("declare data '{}': {}", g.name, e))
+                })?;
             self.data_ids.insert(g.name.clone(), data_id);
         }
         Ok(())
@@ -203,7 +244,10 @@ impl CraneliftCodegen {
         let mut children_of: HashMap<String, Vec<(u32, &MirGlobal)>> = HashMap::new();
         for g in globals {
             if let Some((ref parent_name, byte_offset)) = g.parent_offset {
-                children_of.entry(parent_name.clone()).or_default().push((byte_offset, g));
+                children_of
+                    .entry(parent_name.clone())
+                    .or_default()
+                    .push((byte_offset, g));
             }
         }
 
@@ -223,34 +267,10 @@ impl CraneliftCodegen {
             let has_children = children_of.contains_key(&g.name);
 
             if has_children && g.initial_value.is_none() {
-                // Group item: build composite initial value from children
+                // Group item: build composite initial value from children (recursively)
                 let size = mir_type_size(&g.ty);
                 let mut buf = vec![b' '; size]; // default: spaces (alphanumeric default)
-
-                if let Some(children) = children_of.get(&g.name) {
-                    for &(offset, child) in children {
-                        let child_size = mir_type_size(&child.ty);
-                        let child_bytes: Vec<u8> = match &child.initial_value {
-                            Some(MirConst::Str(s)) => {
-                                let mut b = s.as_bytes().to_vec();
-                                b.resize(child_size, b' ');
-                                b
-                            }
-                            Some(MirConst::Bytes(b)) => b.clone(),
-                            Some(MirConst::Int(n)) => n.to_le_bytes().to_vec(),
-                            None => {
-                                // No VALUE clause: default zeros for numeric (PIC 9),
-                                // spaces for alpha. Use zeros as default (common for PIC 9).
-                                vec![b'0'; child_size]
-                            }
-                            _ => vec![0u8; child_size],
-                        };
-                        let start = offset as usize;
-                        let end = (start + child_bytes.len()).min(buf.len());
-                        let copy_len = end - start;
-                        buf[start..end].copy_from_slice(&child_bytes[..copy_len]);
-                    }
-                }
+                build_composite_init(&mut buf, &g.name, &children_of);
                 desc.define(buf.into_boxed_slice());
             } else {
                 match &g.initial_value {
@@ -285,9 +305,9 @@ impl CraneliftCodegen {
                 }
             }
 
-            self.module
-                .define_data(data_id, &desc)
-                .map_err(|e| CodegenError::BackendError(format!("define data '{}': {}", g.name, e)))?;
+            self.module.define_data(data_id, &desc).map_err(|e| {
+                CodegenError::BackendError(format!("define data '{}': {}", g.name, e))
+            })?;
         }
         Ok(())
     }
@@ -311,75 +331,98 @@ impl CraneliftCodegen {
 
     /// Declare an external runtime function (imported).
     /// `arg_count` is used for unknown functions to infer the signature.
-    fn declare_runtime_function(&mut self, name: &str, arg_count: usize) -> Result<FuncId, CodegenError> {
+    fn declare_runtime_function(
+        &mut self,
+        name: &str,
+        arg_count: usize,
+    ) -> Result<FuncId, CodegenError> {
         let mut sig = self.module.make_signature();
         let ptr = self.pointer_type;
 
         match name {
             "cobolrt_display_line" | "cobolrt_display" => {
-                sig.params.push(AbiParam::new(ptr));       // data ptr
+                sig.params.push(AbiParam::new(ptr)); // data ptr
                 sig.params.push(AbiParam::new(types::I32)); // len
             }
             "cobolrt_stop_run" => {
                 sig.params.push(AbiParam::new(types::I32)); // exit status
             }
             "cobolrt_accept" => {
-                sig.params.push(AbiParam::new(ptr));        // buffer ptr
+                sig.params.push(AbiParam::new(ptr)); // buffer ptr
                 sig.params.push(AbiParam::new(types::I32)); // buffer len
             }
-            "cobolrt_accept_date" | "cobolrt_accept_day"
-            | "cobolrt_accept_time" | "cobolrt_accept_day_of_week" => {
-                sig.params.push(AbiParam::new(ptr));        // buffer ptr
+            "cobolrt_accept_date"
+            | "cobolrt_accept_day"
+            | "cobolrt_accept_time"
+            | "cobolrt_accept_day_of_week" => {
+                sig.params.push(AbiParam::new(ptr)); // buffer ptr
                 sig.params.push(AbiParam::new(types::I32)); // buffer len
             }
             "cobolrt_move_alphanumeric" => {
-                sig.params.push(AbiParam::new(ptr));        // src
+                sig.params.push(AbiParam::new(ptr)); // src
                 sig.params.push(AbiParam::new(types::I32)); // src_len
-                sig.params.push(AbiParam::new(ptr));        // dest
+                sig.params.push(AbiParam::new(ptr)); // dest
                 sig.params.push(AbiParam::new(types::I32)); // dest_len
             }
             "cobolrt_move_numeric" => {
-                sig.params.push(AbiParam::new(ptr));        // src
+                sig.params.push(AbiParam::new(ptr)); // src
                 sig.params.push(AbiParam::new(types::I32)); // src_len
                 sig.params.push(AbiParam::new(types::I32)); // src_scale
                 sig.params.push(AbiParam::new(types::I32)); // src_dot_pos
-                sig.params.push(AbiParam::new(ptr));        // dest
+                sig.params.push(AbiParam::new(ptr)); // dest
                 sig.params.push(AbiParam::new(types::I32)); // dest_len
                 sig.params.push(AbiParam::new(types::I32)); // dest_scale
                 sig.params.push(AbiParam::new(types::I32)); // dest_dot_pos
                 sig.params.push(AbiParam::new(types::I32)); // rounded
             }
             "cobolrt_move_num_to_alpha" => {
-                sig.params.push(AbiParam::new(ptr));        // src
+                sig.params.push(AbiParam::new(ptr)); // src
                 sig.params.push(AbiParam::new(types::I32)); // src_len
-                sig.params.push(AbiParam::new(ptr));        // dest
+                sig.params.push(AbiParam::new(ptr)); // dest
                 sig.params.push(AbiParam::new(types::I32)); // dest_len
             }
             "cobolrt_move_alpha_to_num" => {
-                sig.params.push(AbiParam::new(ptr));        // src
+                sig.params.push(AbiParam::new(ptr)); // src
                 sig.params.push(AbiParam::new(types::I32)); // src_len
-                sig.params.push(AbiParam::new(ptr));        // dest
+                sig.params.push(AbiParam::new(ptr)); // dest
                 sig.params.push(AbiParam::new(types::I32)); // dest_len
                 sig.params.push(AbiParam::new(types::I32)); // dest_dot_pos
             }
-            "cobolrt_add_numeric" | "cobolrt_subtract_numeric"
-            | "cobolrt_multiply_numeric" | "cobolrt_divide_numeric" => {
-                sig.params.push(AbiParam::new(ptr));        // src1
+            "cobolrt_add_numeric"
+            | "cobolrt_subtract_numeric"
+            | "cobolrt_multiply_numeric"
+            | "cobolrt_divide_numeric" => {
+                sig.params.push(AbiParam::new(ptr)); // src1
                 sig.params.push(AbiParam::new(types::I32)); // src1_len
-                sig.params.push(AbiParam::new(ptr));        // src2
+                sig.params.push(AbiParam::new(ptr)); // src2
                 sig.params.push(AbiParam::new(types::I32)); // src2_len
-                sig.params.push(AbiParam::new(ptr));        // dest
+                sig.params.push(AbiParam::new(ptr)); // dest
                 sig.params.push(AbiParam::new(types::I32)); // dest_len
+                sig.params.push(AbiParam::new(types::I32)); // dest_is_signed
             }
             "cobolrt_compare_numeric" | "cobolrt_compare_alphanumeric" => {
-                sig.params.push(AbiParam::new(ptr));        // src1
+                sig.params.push(AbiParam::new(ptr)); // src1
                 sig.params.push(AbiParam::new(types::I32)); // src1_len
-                sig.params.push(AbiParam::new(ptr));        // src2
+                sig.params.push(AbiParam::new(ptr)); // src2
                 sig.params.push(AbiParam::new(types::I32)); // src2_len
                 sig.returns.push(AbiParam::new(types::I32)); // -1, 0, 1
             }
+            "cobolrt_is_numeric"
+            | "cobolrt_is_alphabetic"
+            | "cobolrt_is_alphabetic_lower"
+            | "cobolrt_is_alphabetic_upper" => {
+                sig.params.push(AbiParam::new(ptr)); // data ptr
+                sig.params.push(AbiParam::new(types::I32)); // len
+                sig.returns.push(AbiParam::new(types::I32)); // 1=true, 0=false
+            }
+            "cobolrt_last_size_error" => {
+                sig.returns.push(AbiParam::new(types::I32)); // 0 or 1
+            }
+            "cobolrt_set_size_error" => {
+                sig.params.push(AbiParam::new(types::I32)); // flag
+            }
             "cobolrt_file_open" => {
-                sig.params.push(AbiParam::new(ptr));        // filename ptr
+                sig.params.push(AbiParam::new(ptr)); // filename ptr
                 sig.params.push(AbiParam::new(types::I32)); // filename len
                 sig.params.push(AbiParam::new(types::I32)); // mode (0=input,1=output,2=io,3=extend)
                 sig.returns.push(AbiParam::new(types::I32)); // file handle
@@ -389,32 +432,34 @@ impl CraneliftCodegen {
             }
             "cobolrt_file_write_line" => {
                 sig.params.push(AbiParam::new(types::I32)); // file handle
-                sig.params.push(AbiParam::new(ptr));        // data ptr
+                sig.params.push(AbiParam::new(ptr)); // data ptr
                 sig.params.push(AbiParam::new(types::I32)); // data len
             }
             "cobolrt_file_read_line" => {
                 sig.params.push(AbiParam::new(types::I32)); // file handle
-                sig.params.push(AbiParam::new(ptr));        // buffer ptr
+                sig.params.push(AbiParam::new(ptr)); // buffer ptr
                 sig.params.push(AbiParam::new(types::I32)); // buffer len
                 sig.returns.push(AbiParam::new(types::I32)); // eof flag (0=ok, 1=eof)
             }
             "cobolrt_string_append" => {
-                sig.params.push(AbiParam::new(ptr));        // src
+                sig.params.push(AbiParam::new(ptr)); // src
                 sig.params.push(AbiParam::new(types::I32)); // src_len
-                sig.params.push(AbiParam::new(ptr));        // dest
+                sig.params.push(AbiParam::new(ptr)); // dest
                 sig.params.push(AbiParam::new(types::I32)); // dest_len
-                sig.params.push(AbiParam::new(ptr));        // ptr (pointer var)
+                sig.params.push(AbiParam::new(ptr)); // ptr (pointer var)
                 sig.params.push(AbiParam::new(types::I32)); // ptr_len
+                sig.params.push(AbiParam::new(ptr)); // delim
+                sig.params.push(AbiParam::new(types::I32)); // delim_len
             }
             "cobolrt_divide_scaled" => {
                 // (ptr, i32, i32, ptr, i32, i32, ptr, i32, i32, i32, i32)
-                sig.params.push(AbiParam::new(ptr));        // src1
+                sig.params.push(AbiParam::new(ptr)); // src1
                 sig.params.push(AbiParam::new(types::I32)); // src1_len
                 sig.params.push(AbiParam::new(types::I32)); // src1_scale
-                sig.params.push(AbiParam::new(ptr));        // src2
+                sig.params.push(AbiParam::new(ptr)); // src2
                 sig.params.push(AbiParam::new(types::I32)); // src2_len
                 sig.params.push(AbiParam::new(types::I32)); // src2_scale
-                sig.params.push(AbiParam::new(ptr));        // dest
+                sig.params.push(AbiParam::new(ptr)); // dest
                 sig.params.push(AbiParam::new(types::I32)); // dest_len
                 sig.params.push(AbiParam::new(types::I32)); // dest_scale
                 sig.params.push(AbiParam::new(types::I32)); // dest_dot_pos
@@ -423,40 +468,43 @@ impl CraneliftCodegen {
             "cobolrt_remainder_scaled" => {
                 // (dividend_ptr, dv_len, dv_scale, divisor_ptr, ds_len, ds_scale,
                 //  quotient_ptr, q_len, q_scale, remainder_ptr, rem_len, rem_scale, rem_dot_pos)
-                sig.params.push(AbiParam::new(ptr));        // dividend
+                sig.params.push(AbiParam::new(ptr)); // dividend
                 sig.params.push(AbiParam::new(types::I32)); // dividend_len
                 sig.params.push(AbiParam::new(types::I32)); // dividend_scale
-                sig.params.push(AbiParam::new(ptr));        // divisor
+                sig.params.push(AbiParam::new(ptr)); // divisor
                 sig.params.push(AbiParam::new(types::I32)); // divisor_len
                 sig.params.push(AbiParam::new(types::I32)); // divisor_scale
-                sig.params.push(AbiParam::new(ptr));        // quotient
+                sig.params.push(AbiParam::new(ptr)); // quotient
                 sig.params.push(AbiParam::new(types::I32)); // quotient_len
                 sig.params.push(AbiParam::new(types::I32)); // quotient_scale
-                sig.params.push(AbiParam::new(ptr));        // remainder
+                sig.params.push(AbiParam::new(ptr)); // remainder
                 sig.params.push(AbiParam::new(types::I32)); // remainder_len
                 sig.params.push(AbiParam::new(types::I32)); // remainder_scale
                 sig.params.push(AbiParam::new(types::I32)); // remainder_dot_pos
             }
             "cobolrt_alloc_temp" => {
-                sig.params.push(AbiParam::new(ptr));        // src string
+                sig.params.push(AbiParam::new(ptr)); // src string
                 sig.params.push(AbiParam::new(types::I32)); // src_len
-                sig.returns.push(AbiParam::new(ptr));       // result ptr
+                sig.returns.push(AbiParam::new(ptr)); // result ptr
             }
-            "cobolrt_decimal_add" | "cobolrt_decimal_sub" | "cobolrt_decimal_mul"
-            | "cobolrt_decimal_div" | "cobolrt_decimal_pow" => {
+            "cobolrt_decimal_add"
+            | "cobolrt_decimal_sub"
+            | "cobolrt_decimal_mul"
+            | "cobolrt_decimal_div"
+            | "cobolrt_decimal_pow" => {
                 // Display-format: (left_ptr, left_len, right_ptr, right_len, result_len) -> ptr
-                sig.params.push(AbiParam::new(ptr));        // left ptr
+                sig.params.push(AbiParam::new(ptr)); // left ptr
                 sig.params.push(AbiParam::new(types::I32)); // left len
-                sig.params.push(AbiParam::new(ptr));        // right ptr
+                sig.params.push(AbiParam::new(ptr)); // right ptr
                 sig.params.push(AbiParam::new(types::I32)); // right len
                 sig.params.push(AbiParam::new(types::I32)); // result len
-                sig.returns.push(AbiParam::new(ptr));       // result ptr
+                sig.returns.push(AbiParam::new(ptr)); // result ptr
             }
             "cobolrt_store_compute_result" => {
                 // (src_ptr, src_len, dest_ptr, dest_len, dest_scale, dest_dot_pos, rounded) -> void
-                sig.params.push(AbiParam::new(ptr));        // src ptr
+                sig.params.push(AbiParam::new(ptr)); // src ptr
                 sig.params.push(AbiParam::new(types::I32)); // src len
-                sig.params.push(AbiParam::new(ptr));        // dest ptr
+                sig.params.push(AbiParam::new(ptr)); // dest ptr
                 sig.params.push(AbiParam::new(types::I32)); // dest len
                 sig.params.push(AbiParam::new(types::I32)); // dest scale
                 sig.params.push(AbiParam::new(types::I32)); // dest dot pos
@@ -468,24 +516,46 @@ impl CraneliftCodegen {
                 sig.returns.push(AbiParam::new(types::I32)); // -1/0/1
             }
             "cobolrt_negate_numeric" => {
-                sig.params.push(AbiParam::new(ptr));        // data ptr
+                sig.params.push(AbiParam::new(ptr)); // data ptr
                 sig.params.push(AbiParam::new(types::I32)); // data len
-                sig.returns.push(AbiParam::new(ptr));       // result ptr
+                sig.returns.push(AbiParam::new(ptr)); // result ptr
             }
             "cobolrt_display_to_int" => {
-                sig.params.push(AbiParam::new(ptr));        // data ptr
+                sig.params.push(AbiParam::new(ptr)); // data ptr
                 sig.params.push(AbiParam::new(types::I32)); // len
                 sig.returns.push(AbiParam::new(types::I64)); // integer value
             }
             "cobolrt_int_to_display" => {
                 sig.params.push(AbiParam::new(types::I64)); // value
-                sig.params.push(AbiParam::new(ptr));        // dest ptr
+                sig.params.push(AbiParam::new(ptr)); // dest ptr
             }
             "cobolrt_format_numeric_edited" => {
-                sig.params.push(AbiParam::new(ptr));        // data ptr
+                sig.params.push(AbiParam::new(ptr)); // data ptr
                 sig.params.push(AbiParam::new(types::I32)); // data_len
-                sig.params.push(AbiParam::new(ptr));        // pic string ptr
+                sig.params.push(AbiParam::new(ptr)); // pic string ptr
                 sig.params.push(AbiParam::new(types::I32)); // pic_len
+            }
+            "cobolrt_unstring_begin" => {
+                sig.params.push(AbiParam::new(types::I32)); // num_delimiters
+            }
+            "cobolrt_unstring_add_delim" => {
+                sig.params.push(AbiParam::new(ptr));        // delim ptr
+                sig.params.push(AbiParam::new(types::I32)); // delim_len
+                sig.params.push(AbiParam::new(types::I32)); // all_flag
+            }
+            "cobolrt_unstring_field" => {
+                sig.params.push(AbiParam::new(ptr));        // source
+                sig.params.push(AbiParam::new(types::I32)); // source_len
+                sig.params.push(AbiParam::new(ptr));        // target
+                sig.params.push(AbiParam::new(types::I32)); // target_len
+                sig.params.push(AbiParam::new(ptr));        // pointer
+                sig.params.push(AbiParam::new(types::I32)); // pointer_len
+                sig.params.push(AbiParam::new(ptr));        // tally
+                sig.params.push(AbiParam::new(types::I32)); // tally_len
+                sig.params.push(AbiParam::new(ptr));        // count_in
+                sig.params.push(AbiParam::new(types::I32)); // count_in_len
+                sig.params.push(AbiParam::new(ptr));        // delim_in
+                sig.params.push(AbiParam::new(types::I32)); // delim_in_len
             }
             _ => {
                 // Unknown function (likely a subprogram call).
@@ -498,7 +568,9 @@ impl CraneliftCodegen {
 
         self.module
             .declare_function(name, Linkage::Import, &sig)
-            .map_err(|e| CodegenError::BackendError(format!("declare runtime fn '{}': {}", name, e)))
+            .map_err(|e| {
+                CodegenError::BackendError(format!("declare runtime fn '{}': {}", name, e))
+            })
     }
 
     // -- function definition (translation) ------------------------------------
@@ -515,7 +587,10 @@ impl CraneliftCodegen {
 
         // Reproduce the signature in the context.
         for (_pname, ty) in &func.params {
-            ctx.func.signature.params.push(AbiParam::new(self.mir_type_to_cl(ty)));
+            ctx.func
+                .signature
+                .params
+                .push(AbiParam::new(self.mir_type_to_cl(ty)));
         }
         if func.return_type != MirType::Void {
             ctx.func
@@ -583,7 +658,9 @@ impl CraneliftCodegen {
 
         self.module
             .define_function(func_id, &mut ctx)
-            .map_err(|e| CodegenError::BackendError(format!("define fn '{}': {}", func.name, e)))?;
+            .map_err(|e| {
+                CodegenError::BackendError(format!("define fn '{}': {:?}", func.name, e))
+            })?;
 
         self.module.clear_context(&mut ctx);
         Ok(())
@@ -621,18 +698,28 @@ impl CraneliftCodegen {
                         let data_id = if let Some(&did) = self.data_ids.get(&gname) {
                             did
                         } else {
-                            let did = self.module
-                                .declare_data(&gname, Linkage::Local, false /* not writable */, false)
-                                .map_err(|e| CodegenError::BackendError(
-                                    format!("declare str const '{}': {}", gname, e)
-                                ))?;
+                            let did = self
+                                .module
+                                .declare_data(
+                                    &gname,
+                                    Linkage::Local,
+                                    false, /* not writable */
+                                    false,
+                                )
+                                .map_err(|e| {
+                                    CodegenError::BackendError(format!(
+                                        "declare str const '{}': {}",
+                                        gname, e
+                                    ))
+                                })?;
                             let mut desc = DataDescription::new();
                             desc.define(s.as_bytes().to_vec().into_boxed_slice());
-                            self.module
-                                .define_data(did, &desc)
-                                .map_err(|e| CodegenError::BackendError(
-                                    format!("define str const '{}': {}", gname, e)
-                                ))?;
+                            self.module.define_data(did, &desc).map_err(|e| {
+                                CodegenError::BackendError(format!(
+                                    "define str const '{}': {}",
+                                    gname, e
+                                ))
+                            })?;
                             self.data_ids.insert(gname, did);
                             did
                         };
@@ -682,7 +769,12 @@ impl CraneliftCodegen {
                 let v = builder.ins().iadd_imm(b, *offset as i64);
                 val_map.insert(dest.raw(), v);
             }
-            MirInst::GetElementAddr { dest, base, index, element_size } => {
+            MirInst::GetElementAddr {
+                dest,
+                base,
+                index,
+                element_size,
+            } => {
                 let b = self.lookup(val_map, base)?;
                 let idx = self.lookup(val_map, index)?;
                 let sz = builder.ins().iconst(ptr_ty, *element_size as i64);
@@ -693,14 +785,12 @@ impl CraneliftCodegen {
 
             // -- Integer arithmetic -------------------------------------------
             MirInst::IAdd { dest, left, right } => {
-                let l = self.lookup(val_map, left)?;
-                let r = self.lookup(val_map, right)?;
+                let (l, r) = self.lookup_and_coerce_pair(val_map, left, right, builder)?;
                 let v = builder.ins().iadd(l, r);
                 val_map.insert(dest.raw(), v);
             }
             MirInst::ISub { dest, left, right } => {
-                let l = self.lookup(val_map, left)?;
-                let r = self.lookup(val_map, right)?;
+                let (l, r) = self.lookup_and_coerce_pair(val_map, left, right, builder)?;
                 let v = builder.ins().isub(l, r);
                 val_map.insert(dest.raw(), v);
             }
@@ -798,7 +888,11 @@ impl CraneliftCodegen {
                 }
             }
 
-            MirInst::CallProgram { dest, program: _, args: _ } => {
+            MirInst::CallProgram {
+                dest,
+                program: _,
+                args: _,
+            } => {
                 // TODO: implement CALL <program> properly.
                 // For now, just map dest to zero if present.
                 if let Some(d) = dest {
@@ -808,8 +902,19 @@ impl CraneliftCodegen {
             }
 
             // -- String operations (runtime-backed) ---------------------------
-            MirInst::MoveAlphanumeric { dest, src, dest_len, src_len } => {
-                if let Some(&fid) = runtime_func_ids.get("cobolrt_move_alphanumeric") {
+            MirInst::MoveAlphanumeric {
+                dest,
+                src,
+                dest_len,
+                src_len,
+                justified,
+            } => {
+                let func_name = if *justified {
+                    "cobolrt_move_alphanumeric_justified"
+                } else {
+                    "cobolrt_move_alphanumeric"
+                };
+                if let Some(&fid) = runtime_func_ids.get(func_name) {
                     let func_ref = self.module.declare_func_in_func(fid, builder.func);
                     let src_val = self.lookup(val_map, src)?;
                     let dest_val = self.lookup(val_map, dest)?;
@@ -820,10 +925,18 @@ impl CraneliftCodegen {
             }
 
             // -- Decimal operations (stubs -- will call runtime) --------------
-            MirInst::DecimalAdd { dest, left, right, .. }
-            | MirInst::DecimalSub { dest, left, right, .. }
-            | MirInst::DecimalMul { dest, left, right, .. }
-            | MirInst::DecimalDiv { dest, left, right, .. } => {
+            MirInst::DecimalAdd {
+                dest, left, right, ..
+            }
+            | MirInst::DecimalSub {
+                dest, left, right, ..
+            }
+            | MirInst::DecimalMul {
+                dest, left, right, ..
+            }
+            | MirInst::DecimalDiv {
+                dest, left, right, ..
+            } => {
                 // Fall back to integer add for now; the runtime will handle
                 // scale adjustment.
                 let l = self.lookup(val_map, left)?;
@@ -893,7 +1006,6 @@ impl CraneliftCodegen {
             MirInst::SizeError { .. } => {
                 // TODO: implement SIZE ERROR handling.
             }
-
         }
         Ok(())
     }
@@ -915,16 +1027,23 @@ impl CraneliftCodegen {
                 let blk = block_map[&target.raw()];
                 builder.ins().jump(blk, &[]);
             }
-            Terminator::Branch { cond, then_block, else_block } => {
-                let c = val_map
-                    .get(&cond.raw())
-                    .copied()
-                    .ok_or_else(|| CodegenError::BackendError("missing branch cond value".into()))?;
+            Terminator::Branch {
+                cond,
+                then_block,
+                else_block,
+            } => {
+                let c = val_map.get(&cond.raw()).copied().ok_or_else(|| {
+                    CodegenError::BackendError("missing branch cond value".into())
+                })?;
                 let tb = block_map[&then_block.raw()];
                 let eb = block_map[&else_block.raw()];
                 builder.ins().brif(c, tb, &[], eb, &[]);
             }
-            Terminator::Switch { value, cases, default } => {
+            Terminator::Switch {
+                value,
+                cases,
+                default,
+            } => {
                 // Implement as a chain of brif comparisons.
                 let v = val_map
                     .get(&value.raw())
@@ -973,7 +1092,7 @@ impl CraneliftCodegen {
         let ptr_ty = self.pointer_type;
         let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(types::I32)); // argc
-        sig.params.push(AbiParam::new(ptr_ty));      // argv
+        sig.params.push(AbiParam::new(ptr_ty)); // argv
         sig.returns.push(AbiParam::new(types::I32)); // return code
 
         let main_id = self
@@ -993,7 +1112,9 @@ impl CraneliftCodegen {
             builder.switch_to_block(entry);
             builder.seal_block(entry);
 
-            let func_ref = self.module.declare_func_in_func(cobol_main_id, builder.func);
+            let func_ref = self
+                .module
+                .declare_func_in_func(cobol_main_id, builder.func);
             builder.ins().call(func_ref, &[]);
 
             let zero = builder.ins().iconst(types::I32, 0);
@@ -1072,7 +1193,7 @@ impl CraneliftCodegen {
             MirType::Pointer => self.pointer_type,
             MirType::Void => self.pointer_type, // placeholder; never used in returns
             MirType::Bytes(_) => self.pointer_type, // pointer to byte array
-            MirType::Decimal { .. } => types::I64,  // scaled-integer representation
+            MirType::Decimal { .. } => types::I64, // scaled-integer representation
             MirType::PackedDecimal { .. } => self.pointer_type, // pointer to BCD data
         }
     }
@@ -1099,6 +1220,74 @@ fn coerce_value(builder: &mut FunctionBuilder, val: ir::Value, target_ty: ir::Ty
     // Float <-> int coercions could be added here if needed.
     // For now, return the value unchanged (the verifier will catch real mismatches).
     val
+}
+
+/// Recursively build a composite initial value buffer for a group item.
+///
+/// For each direct child of `parent_name`, if the child has an explicit
+/// `initial_value` (from a VALUE clause), write it into `buf` at the child's
+/// offset. If the child is itself a group (no `initial_value` but has its own
+/// children), recurse to fill the child's portion of the buffer from its
+/// sub-children. Children with no VALUE clause and no sub-children default to
+/// spaces (the COBOL alphanumeric default).
+fn build_composite_init(
+    buf: &mut [u8],
+    parent_name: &str,
+    children_of: &HashMap<String, Vec<(u32, &MirGlobal)>>,
+) {
+    if let Some(children) = children_of.get(parent_name) {
+        for &(offset, child) in children {
+            let child_size = mir_type_size(&child.ty);
+            let start = offset as usize;
+            let end = (start + child_size).min(buf.len());
+            if start >= buf.len() {
+                continue;
+            }
+
+            match &child.initial_value {
+                Some(MirConst::Str(s)) => {
+                    let mut b = s.as_bytes().to_vec();
+                    b.resize(child_size, b' ');
+                    let copy_len = end - start;
+                    buf[start..end].copy_from_slice(&b[..copy_len]);
+                }
+                Some(MirConst::Bytes(b)) => {
+                    let copy_len = end - start;
+                    let src_len = copy_len.min(b.len());
+                    buf[start..start + src_len].copy_from_slice(&b[..src_len]);
+                }
+                Some(MirConst::Int(n)) => {
+                    let bytes = n.to_le_bytes();
+                    let copy_len = (end - start).min(bytes.len());
+                    buf[start..start + copy_len].copy_from_slice(&bytes[..copy_len]);
+                }
+                None => {
+                    // No VALUE clause on this child. If the child is itself a group
+                    // item with sub-children, recursively composite from them.
+                    // Otherwise, default to spaces (alphanumeric default).
+                    if children_of.contains_key(&child.name) {
+                        // Fill child region with spaces first (default), then recurse
+                        for byte in &mut buf[start..end] {
+                            *byte = b' ';
+                        }
+                        // Recurse into the child's sub-region of the buffer
+                        build_composite_init(&mut buf[start..end], &child.name, children_of);
+                    } else {
+                        // Leaf item with no VALUE: default to spaces
+                        for byte in &mut buf[start..end] {
+                            *byte = b' ';
+                        }
+                    }
+                }
+                _ => {
+                    // Other types: zero-fill
+                    for byte in &mut buf[start..end] {
+                        *byte = 0;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Return the byte-size of a MIR type for global allocation.
@@ -1177,7 +1366,9 @@ mod tests {
         let out = dir.join("minimal.o");
 
         let backend = CraneliftBackend::new();
-        backend.compile(&module, &out).expect("compile should succeed");
+        backend
+            .compile(&module, &out)
+            .expect("compile should succeed");
 
         // The output file should exist and contain a valid object header.
         let bytes = std::fs::read(&out).unwrap();
@@ -1249,7 +1440,9 @@ mod tests {
         let out = dir.join("hello.o");
 
         let backend = CraneliftBackend::new();
-        backend.compile(&module, &out).expect("compile should succeed");
+        backend
+            .compile(&module, &out)
+            .expect("compile should succeed");
 
         let bytes = std::fs::read(&out).unwrap();
         assert!(!bytes.is_empty());
@@ -1324,7 +1517,9 @@ mod tests {
         let out = dir.join("branch.o");
 
         let backend = CraneliftBackend::new();
-        backend.compile(&module, &out).expect("compile should succeed");
+        backend
+            .compile(&module, &out)
+            .expect("compile should succeed");
 
         let bytes = std::fs::read(&out).unwrap();
         assert!(!bytes.is_empty());
@@ -1396,7 +1591,9 @@ mod tests {
         let out = dir.join("arith.o");
 
         let backend = CraneliftBackend::new();
-        backend.compile(&module, &out).expect("compile should succeed");
+        backend
+            .compile(&module, &out)
+            .expect("compile should succeed");
 
         let bytes = std::fs::read(&out).unwrap();
         assert!(!bytes.is_empty());
@@ -1415,8 +1612,26 @@ mod tests {
         assert_eq!(mir_type_size(&MirType::Pointer), 8);
         assert_eq!(mir_type_size(&MirType::Void), 0);
         assert_eq!(mir_type_size(&MirType::Bytes(80)), 80);
-        assert_eq!(mir_type_size(&MirType::Decimal { digits: 9, scale: 2 }), 8);
-        assert_eq!(mir_type_size(&MirType::Decimal { digits: 20, scale: 2 }), 16);
-        assert_eq!(mir_type_size(&MirType::PackedDecimal { digits: 9, scale: 2 }), 5);
+        assert_eq!(
+            mir_type_size(&MirType::Decimal {
+                digits: 9,
+                scale: 2
+            }),
+            8
+        );
+        assert_eq!(
+            mir_type_size(&MirType::Decimal {
+                digits: 20,
+                scale: 2
+            }),
+            16
+        );
+        assert_eq!(
+            mir_type_size(&MirType::PackedDecimal {
+                digits: 9,
+                scale: 2
+            }),
+            5
+        );
     }
 }

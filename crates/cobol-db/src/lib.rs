@@ -6,8 +6,8 @@
 //!
 //! Will be backed by Salsa once the full pipeline is connected.
 
-use cobol_span::FileId;
 use cobol_diag::Diagnostic;
+use cobol_span::FileId;
 
 /// Input queries -- set by the driver (CLI or LSP)
 pub trait InputDatabase {
