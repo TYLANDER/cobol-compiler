@@ -44,15 +44,69 @@ pub extern "C" fn cobolrt_intrinsic_lower_case(data: *mut u8, len: u32) {
 }
 
 /// FUNCTION CURRENT-DATE - returns 21-char date string (YYYYMMDDHHMMSSFF+HHMM)
+///
+/// Format: `YYYYMMDDHHMMSSFFshhmm`
+///   - YYYY = 4-digit year
+///   - MM   = month (01-12)
+///   - DD   = day (01-31)
+///   - HH   = hours (00-23)
+///   - MM   = minutes (00-59)
+///   - SS   = seconds (00-59)
+///   - FF   = hundredths of seconds (00-99)
+///   - s    = sign of UTC offset ('+' or '-')
+///   - hhmm = UTC offset hours and minutes
+///
+/// Note: UTC offset is reported as +0000 (UTC) since determining local
+/// timezone offset without libc/chrono is non-trivial. The date/time
+/// components are UTC.
 #[no_mangle]
 pub extern "C" fn cobolrt_intrinsic_current_date(output: *mut u8) {
     if output.is_null() {
         return;
     }
-    // TODO: implement with actual date/time
-    let placeholder = b"00000000000000000+0000";
+    let (secs, millis) = crate::display::unix_now();
+    let days = secs.div_euclid(86400);
+    let (year, month, day) = crate::display::civil_from_days(days);
+    let day_secs = secs.rem_euclid(86400) as u32;
+    let hh = day_secs / 3600;
+    let mm = (day_secs % 3600) / 60;
+    let ss = day_secs % 60;
+    let cs = millis / 10; // hundredths
+
+    let mut buf = [b'0'; 21];
+    // YYYY
+    let y = year.unsigned_abs() as u32;
+    buf[0] = b'0' + ((y / 1000) % 10) as u8;
+    buf[1] = b'0' + ((y / 100) % 10) as u8;
+    buf[2] = b'0' + ((y / 10) % 10) as u8;
+    buf[3] = b'0' + (y % 10) as u8;
+    // MM
+    buf[4] = b'0' + (month / 10) as u8;
+    buf[5] = b'0' + (month % 10) as u8;
+    // DD
+    buf[6] = b'0' + (day / 10) as u8;
+    buf[7] = b'0' + (day % 10) as u8;
+    // HH
+    buf[8] = b'0' + (hh / 10) as u8;
+    buf[9] = b'0' + (hh % 10) as u8;
+    // MM
+    buf[10] = b'0' + (mm / 10) as u8;
+    buf[11] = b'0' + (mm % 10) as u8;
+    // SS
+    buf[12] = b'0' + (ss / 10) as u8;
+    buf[13] = b'0' + (ss % 10) as u8;
+    // FF (hundredths)
+    buf[14] = b'0' + (cs / 10) as u8;
+    buf[15] = b'0' + (cs % 10) as u8;
+    // UTC offset: +0000
+    buf[16] = b'+';
+    buf[17] = b'0';
+    buf[18] = b'0';
+    buf[19] = b'0';
+    buf[20] = b'0';
+
     unsafe {
-        std::ptr::copy_nonoverlapping(placeholder.as_ptr(), output, 21);
+        std::ptr::copy_nonoverlapping(buf.as_ptr(), output, 21);
     }
 }
 

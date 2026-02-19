@@ -1,3 +1,4 @@
+pub mod arithmetic;
 pub mod compare;
 pub mod decimal;
 pub mod display;
@@ -159,7 +160,8 @@ mod tests {
     }
 
     #[test]
-    fn decimal_div_stub() {
+    fn decimal_div_null_returns_error() {
+        // Division with null pointers should return -1 (error)
         assert_eq!(
             crate::decimal::cobolrt_decimal_div(
                 std::ptr::null(),
@@ -168,7 +170,7 @@ mod tests {
                 std::ptr::null_mut(),
                 false,
             ),
-            0,
+            -1,
         );
     }
 

@@ -350,21 +350,33 @@ impl CraneliftCodegen {
                 sig.params.push(AbiParam::new(types::I32)); // rounded
             }
             "cobolrt_decimal_add" | "cobolrt_decimal_sub" | "cobolrt_decimal_mul"
-            | "cobolrt_decimal_div" => {
-                sig.params.push(AbiParam::new(ptr)); // left ptr
-                sig.params.push(AbiParam::new(ptr)); // right ptr
-                sig.params.push(AbiParam::new(ptr)); // result ptr
-                sig.params.push(AbiParam::new(types::I8)); // rounded
+            | "cobolrt_decimal_div" | "cobolrt_decimal_pow" => {
+                // Display-format: (left_ptr, left_len, right_ptr, right_len, result_len) -> ptr
+                sig.params.push(AbiParam::new(ptr));        // left ptr
+                sig.params.push(AbiParam::new(types::I32)); // left len
+                sig.params.push(AbiParam::new(ptr));        // right ptr
+                sig.params.push(AbiParam::new(types::I32)); // right len
+                sig.params.push(AbiParam::new(types::I32)); // result len
+                sig.returns.push(AbiParam::new(ptr));       // result ptr
             }
             "cobolrt_decimal_cmp" => {
                 sig.params.push(AbiParam::new(ptr)); // left ptr
                 sig.params.push(AbiParam::new(ptr)); // right ptr
                 sig.returns.push(AbiParam::new(types::I32)); // -1/0/1
             }
+            "cobolrt_negate_numeric" => {
+                sig.params.push(AbiParam::new(ptr));        // data ptr
+                sig.params.push(AbiParam::new(types::I32)); // data len
+                sig.returns.push(AbiParam::new(ptr));       // result ptr
+            }
             "cobolrt_display_to_int" => {
                 sig.params.push(AbiParam::new(ptr));        // data ptr
                 sig.params.push(AbiParam::new(types::I32)); // len
                 sig.returns.push(AbiParam::new(types::I64)); // integer value
+            }
+            "cobolrt_int_to_display" => {
+                sig.params.push(AbiParam::new(types::I64)); // value
+                sig.params.push(AbiParam::new(ptr));        // dest ptr
             }
             _ => {
                 // Unknown function (likely a subprogram call).

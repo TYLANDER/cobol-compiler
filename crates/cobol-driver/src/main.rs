@@ -542,6 +542,414 @@ void cobolrt_move_alpha_to_num(
         int_to_display(result, dest, dest_len);
     }
 }
+
+/* ---- INSPECT runtime functions ---- */
+
+/* Find first occurrence of needle in haystack. Returns -1 if not found. */
+static int find_substr(const char *haystack, unsigned int hay_len,
+                       const char *needle, unsigned int ndl_len) {
+    if (ndl_len == 0 || ndl_len > hay_len) return -1;
+    for (unsigned int i = 0; i <= hay_len - ndl_len; i++) {
+        if (memcmp(haystack + i, needle, ndl_len) == 0) return (int)i;
+    }
+    return -1;
+}
+
+void cobolrt_inspect_tallying(
+    const char *data, unsigned int data_len,
+    char *tally, unsigned int tally_len,
+    unsigned int mode,
+    const char *search, unsigned int search_len,
+    const char *before_initial, unsigned int before_initial_len,
+    const char *after_initial, unsigned int after_initial_len
+) {
+    if (!data || !tally) return;
+
+    /* Read current tally value */
+    long long tally_val = display_to_int(tally, tally_len);
+
+    /* Determine effective range */
+    unsigned int start_pos = 0;
+    unsigned int end_pos = data_len;
+
+    if (after_initial && after_initial_len > 0) {
+        int pos = find_substr(data, data_len, after_initial, after_initial_len);
+        if (pos >= 0) start_pos = (unsigned int)pos + after_initial_len;
+        else start_pos = data_len;
+    }
+    if (before_initial && before_initial_len > 0) {
+        int pos = find_substr(data, data_len, before_initial, before_initial_len);
+        if (pos >= 0) end_pos = (unsigned int)pos;
+    }
+    if (start_pos >= end_pos) return;
+
+    long long count = 0;
+    if (mode == 0) {
+        /* CHARACTERS */
+        count = (long long)(end_pos - start_pos);
+    } else if (mode == 1) {
+        /* ALL */
+        if (!search || search_len == 0) return;
+        unsigned int i = start_pos;
+        while (i + search_len <= end_pos) {
+            if (memcmp(data + i, search, search_len) == 0) {
+                count++;
+                i += search_len;
+            } else {
+                i++;
+            }
+        }
+    } else if (mode == 2) {
+        /* LEADING */
+        if (!search || search_len == 0) return;
+        unsigned int i = start_pos;
+        while (i + search_len <= end_pos) {
+            if (memcmp(data + i, search, search_len) == 0) {
+                count++;
+                i += search_len;
+            } else {
+                break;
+            }
+        }
+    }
+
+    tally_val += count;
+    int_to_display(tally_val, tally, tally_len);
+}
+
+void cobolrt_inspect_replacing(
+    char *data, unsigned int data_len,
+    unsigned int mode,
+    const char *search, unsigned int search_len,
+    const char *replacement, unsigned int replacement_len,
+    const char *before_initial, unsigned int before_initial_len,
+    const char *after_initial, unsigned int after_initial_len
+) {
+    if (!data || !replacement) return;
+
+    unsigned int start_pos = 0;
+    unsigned int end_pos = data_len;
+
+    if (after_initial && after_initial_len > 0) {
+        int pos = find_substr(data, data_len, after_initial, after_initial_len);
+        if (pos >= 0) start_pos = (unsigned int)pos + after_initial_len;
+        else start_pos = data_len;
+    }
+    if (before_initial && before_initial_len > 0) {
+        int pos = find_substr(data, data_len, before_initial, before_initial_len);
+        if (pos >= 0) end_pos = (unsigned int)pos;
+    }
+    if (start_pos >= end_pos) return;
+
+    if (mode == 0) {
+        /* CHARACTERS BY replacement */
+        char repl_byte = replacement[0];
+        for (unsigned int i = start_pos; i < end_pos; i++) {
+            data[i] = repl_byte;
+        }
+    } else if (mode == 1) {
+        /* ALL */
+        if (!search || search_len == 0) return;
+        unsigned int i = start_pos;
+        while (i + search_len <= end_pos) {
+            if (memcmp(data + i, search, search_len) == 0) {
+                unsigned int copy_len = search_len < replacement_len ? search_len : replacement_len;
+                memcpy(data + i, replacement, copy_len);
+                if (replacement_len < search_len) {
+                    memset(data + i + replacement_len, ' ', search_len - replacement_len);
+                }
+                i += search_len;
+            } else {
+                i++;
+            }
+        }
+    } else if (mode == 2) {
+        /* LEADING */
+        if (!search || search_len == 0) return;
+        unsigned int i = start_pos;
+        while (i + search_len <= end_pos) {
+            if (memcmp(data + i, search, search_len) == 0) {
+                unsigned int copy_len = search_len < replacement_len ? search_len : replacement_len;
+                memcpy(data + i, replacement, copy_len);
+                if (replacement_len < search_len) {
+                    memset(data + i + replacement_len, ' ', search_len - replacement_len);
+                }
+                i += search_len;
+            } else {
+                break;
+            }
+        }
+    } else if (mode == 3) {
+        /* FIRST */
+        if (!search || search_len == 0) return;
+        int pos = find_substr(data + start_pos, end_pos - start_pos, search, search_len);
+        if (pos >= 0) {
+            unsigned int abs_pos = start_pos + (unsigned int)pos;
+            unsigned int copy_len = search_len < replacement_len ? search_len : replacement_len;
+            memcpy(data + abs_pos, replacement, copy_len);
+            if (replacement_len < search_len) {
+                memset(data + abs_pos + replacement_len, ' ', search_len - replacement_len);
+            }
+        }
+    }
+}
+
+void cobolrt_inspect_converting(
+    char *data, unsigned int data_len,
+    const char *from_chars, unsigned int from_len,
+    const char *to_chars, unsigned int to_len,
+    const char *before_initial, unsigned int before_initial_len,
+    const char *after_initial, unsigned int after_initial_len
+) {
+    if (!data || !from_chars || !to_chars) return;
+
+    unsigned int start_pos = 0;
+    unsigned int end_pos = data_len;
+
+    if (after_initial && after_initial_len > 0) {
+        int pos = find_substr(data, data_len, after_initial, after_initial_len);
+        if (pos >= 0) start_pos = (unsigned int)pos + after_initial_len;
+        else start_pos = data_len;
+    }
+    if (before_initial && before_initial_len > 0) {
+        int pos = find_substr(data, data_len, before_initial, before_initial_len);
+        if (pos >= 0) end_pos = (unsigned int)pos;
+    }
+
+    for (unsigned int i = start_pos; i < end_pos; i++) {
+        for (unsigned int j = 0; j < from_len; j++) {
+            if (data[i] == from_chars[j]) {
+                if (j < to_len) data[i] = to_chars[j];
+                break;
+            }
+        }
+    }
+}
+
+/* ---- UNSTRING per-field runtime function ---- */
+
+void cobolrt_unstring_field(
+    const char *source, unsigned int source_len,
+    const char *delimiter, unsigned int delimiter_len,
+    unsigned int all_delim,
+    char *target, unsigned int target_len,
+    char *pointer, unsigned int pointer_len,
+    char *tally, unsigned int tally_len
+) {
+    if (!source || !target) return;
+
+    /* Read the pointer value (1-based, display-format) */
+    unsigned int start_pos = 0;
+    if (pointer && pointer_len > 0) {
+        long long pos = display_to_int(pointer, pointer_len);
+        if (pos < 1) pos = 1;
+        start_pos = (unsigned int)(pos - 1);
+    }
+
+    if (start_pos >= source_len) {
+        /* Overflow: space-fill target */
+        memset(target, ' ', target_len);
+        return;
+    }
+
+    /* Find delimiter in remaining source */
+    unsigned int field_end = source_len;
+    unsigned int delim_skip = 0;
+
+    if (delimiter && delimiter_len > 0) {
+        int pos = find_substr(source + start_pos, source_len - start_pos,
+                              delimiter, delimiter_len);
+        if (pos >= 0) {
+            field_end = start_pos + (unsigned int)pos;
+            delim_skip = delimiter_len;
+
+            /* If ALL, skip consecutive delimiters */
+            if (all_delim) {
+                unsigned int next = field_end + delimiter_len;
+                while (next + delimiter_len <= source_len &&
+                       memcmp(source + next, delimiter, delimiter_len) == 0) {
+                    next += delimiter_len;
+                    delim_skip += delimiter_len;
+                }
+            }
+        }
+    }
+
+    /* Copy field into target, space-padded */
+    unsigned int field_len = field_end - start_pos;
+    memset(target, ' ', target_len);
+    unsigned int copy_len = field_len < target_len ? field_len : target_len;
+    memcpy(target, source + start_pos, copy_len);
+
+    /* Update pointer */
+    if (pointer && pointer_len > 0) {
+        long long new_pos = (long long)(field_end + delim_skip + 1);
+        int_to_display(new_pos, pointer, pointer_len);
+    }
+
+    /* Update tally */
+    if (tally && tally_len > 0) {
+        long long t = display_to_int(tally, tally_len);
+        t++;
+        int_to_display(t, tally, tally_len);
+    }
+}
+
+/* ---- COMPUTE/PERFORM support: negate, decimal ops, counter support ---- */
+
+/* Negate a display-format numeric value. Returns pointer to thread-local buffer. */
+static char negate_buf[64];
+char* cobolrt_negate_numeric(const char *data, unsigned int data_len) {
+    if (!data || data_len == 0) return negate_buf;
+    unsigned int out_len = data_len + 1;
+    if (out_len > sizeof(negate_buf)) out_len = sizeof(negate_buf);
+    negate_buf[0] = '-';
+    unsigned int copy_len = out_len - 1 < data_len ? out_len - 1 : data_len;
+    memcpy(negate_buf + 1, data, copy_len);
+    return negate_buf;
+}
+
+/* Display-format decimal arithmetic for COMPUTE expressions.
+   These return a pointer to a thread-local result buffer. */
+static char decimal_result_buf[128];
+
+static long long parse_display_val(const char *data, unsigned int len, int *scale) {
+    long long val = 0;
+    int neg = 0;
+    *scale = 0;
+    int past_dot = 0;
+    for (unsigned int i = 0; i < len; i++) {
+        if (data[i] == '-') { neg = 1; continue; }
+        if (data[i] == '.') { past_dot = 1; continue; }
+        if (data[i] >= '0' && data[i] <= '9') {
+            val = val * 10 + (data[i] - '0');
+            if (past_dot) (*scale)++;
+        }
+    }
+    return neg ? -val : val;
+}
+
+static char* write_decimal_result(long long val, int scale) {
+    int neg = 0;
+    if (val < 0) { neg = 1; val = -val; }
+    /* Write digits right-to-left */
+    char tmp[64];
+    int pos = 63;
+    tmp[pos] = '\0';
+    if (val == 0) { tmp[--pos] = '0'; if (scale > 0) { for (int s = 0; s < scale; s++) tmp[--pos] = '0'; tmp[--pos] = '.'; } }
+    else {
+        int digit_count = 0;
+        long long v = val;
+        while (v > 0) { tmp[--pos] = '0' + (v % 10); v /= 10; digit_count++; }
+        /* Insert decimal point if needed */
+        if (scale > 0 && scale < digit_count) {
+            /* Shift digits to make room for dot */
+            int dot_pos_from_right = scale;
+            int result_len = digit_count + 1;
+            char tmp2[64];
+            int src = pos, dst = 0;
+            for (int i = 0; i < digit_count - scale; i++) tmp2[dst++] = tmp[src++];
+            tmp2[dst++] = '.';
+            for (int i = 0; i < scale; i++) tmp2[dst++] = tmp[src++];
+            tmp2[dst] = '\0';
+            pos = 0;
+            memcpy(tmp, tmp2, dst + 1);
+        } else if (scale >= digit_count) {
+            /* All digits are fractional: 0.00...digits */
+            char tmp2[64];
+            int dst = 0;
+            tmp2[dst++] = '0';
+            tmp2[dst++] = '.';
+            for (int i = 0; i < scale - digit_count; i++) tmp2[dst++] = '0';
+            int src = pos;
+            for (int i = 0; i < digit_count; i++) tmp2[dst++] = tmp[src++];
+            tmp2[dst] = '\0';
+            pos = 0;
+            memcpy(tmp, tmp2, dst + 1);
+        }
+    }
+    int result_start = 0;
+    if (neg) { decimal_result_buf[result_start++] = '-'; }
+    int len = strlen(tmp + pos);
+    memcpy(decimal_result_buf + result_start, tmp + pos, len);
+    decimal_result_buf[result_start + len] = '\0';
+    return decimal_result_buf;
+}
+
+char* cobolrt_decimal_add(const char *left, unsigned int left_len,
+                          const char *right, unsigned int right_len,
+                          unsigned int result_len) {
+    int ls = 0, rs = 0;
+    long long lv = parse_display_val(left, left_len, &ls);
+    long long rv = parse_display_val(right, right_len, &rs);
+    /* Align scales */
+    int max_scale = ls > rs ? ls : rs;
+    while (ls < max_scale) { lv *= 10; ls++; }
+    while (rs < max_scale) { rv *= 10; rs++; }
+    return write_decimal_result(lv + rv, max_scale);
+}
+
+char* cobolrt_decimal_sub(const char *left, unsigned int left_len,
+                          const char *right, unsigned int right_len,
+                          unsigned int result_len) {
+    int ls = 0, rs = 0;
+    long long lv = parse_display_val(left, left_len, &ls);
+    long long rv = parse_display_val(right, right_len, &rs);
+    int max_scale = ls > rs ? ls : rs;
+    while (ls < max_scale) { lv *= 10; ls++; }
+    while (rs < max_scale) { rv *= 10; rs++; }
+    return write_decimal_result(lv - rv, max_scale);
+}
+
+char* cobolrt_decimal_mul(const char *left, unsigned int left_len,
+                          const char *right, unsigned int right_len,
+                          unsigned int result_len) {
+    int ls = 0, rs = 0;
+    long long lv = parse_display_val(left, left_len, &ls);
+    long long rv = parse_display_val(right, right_len, &rs);
+    return write_decimal_result(lv * rv, ls + rs);
+}
+
+char* cobolrt_decimal_div(const char *left, unsigned int left_len,
+                          const char *right, unsigned int right_len,
+                          unsigned int result_len) {
+    int ls = 0, rs = 0;
+    long long lv = parse_display_val(left, left_len, &ls);
+    long long rv = parse_display_val(right, right_len, &rs);
+    if (rv == 0) return write_decimal_result(0, 0);
+    /* Add extra precision for division */
+    int extra = 4;
+    for (int i = 0; i < extra; i++) lv *= 10;
+    return write_decimal_result(lv / rv, ls - rs + extra);
+}
+
+char* cobolrt_decimal_pow(const char *base, unsigned int base_len,
+                          const char *exp, unsigned int exp_len,
+                          unsigned int result_len) {
+    int bs = 0, es = 0;
+    long long bv = parse_display_val(base, base_len, &bs);
+    long long ev = parse_display_val(exp, exp_len, &es);
+    /* Integer exponent only */
+    while (es > 0) { ev /= 10; es--; }
+    if (ev < 0) return write_decimal_result(0, 0);
+    long long result = 1;
+    int result_scale = 0;
+    for (long long i = 0; i < ev; i++) {
+        result *= bv;
+        result_scale += bs;
+    }
+    return write_decimal_result(result, result_scale);
+}
+
+/* Convert integer to display-format in a buffer */
+void cobolrt_int_to_display(long long val, char *dest) {
+    /* Write 8-byte zero-padded display */
+    if (val < 0) val = -val;
+    for (int i = 7; i >= 0; i--) {
+        dest[i] = '0' + (val % 10);
+        val /= 10;
+    }
+}
 "#;
 
 /// cobolc -- The World's Best Open-Source COBOL Compiler

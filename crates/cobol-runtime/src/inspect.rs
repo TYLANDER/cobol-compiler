@@ -536,6 +536,113 @@ fn write_display_numeric(data: &mut [u8], value: i64) {
     }
 }
 
+/// Per-field UNSTRING: extracts one field from source starting at the position
+/// given by the POINTER field, and advances the POINTER past the delimiter.
+///
+/// Parameters:
+/// - `source`: pointer to the full source string
+/// - `source_len`: length of the source string
+/// - `delimiter`: pointer to the delimiter
+/// - `delimiter_len`: length of the delimiter
+/// - `all_delim`: 1 if ALL qualifier on delimiter, 0 otherwise
+/// - `target`: pointer to the target buffer
+/// - `target_len`: length of the target buffer
+/// - `pointer`: pointer to the POINTER field (display-format, 1-based) or NULL
+/// - `pointer_len`: length of the POINTER field
+/// - `tally`: pointer to the TALLYING field (display-format) or NULL
+/// - `tally_len`: length of the TALLYING field
+#[no_mangle]
+pub extern "C" fn cobolrt_unstring_field(
+    source: *const u8,
+    source_len: u32,
+    delimiter: *const u8,
+    delimiter_len: u32,
+    all_delim: u32,
+    target: *mut u8,
+    target_len: u32,
+    pointer: *mut u8,
+    pointer_len: u32,
+    tally: *mut u8,
+    tally_len: u32,
+) {
+    if source.is_null() || target.is_null() {
+        return;
+    }
+
+    let source_slice = unsafe { std::slice::from_raw_parts(source, source_len as usize) };
+    let target_slice = unsafe { std::slice::from_raw_parts_mut(target, target_len as usize) };
+
+    // Read pointer value (1-based)
+    let start_pos = if !pointer.is_null() && pointer_len > 0 {
+        let ptr_slice = unsafe { std::slice::from_raw_parts(pointer, pointer_len as usize) };
+        let val = read_display_numeric(ptr_slice);
+        if val < 1 { 0usize } else { (val - 1) as usize }
+    } else {
+        0
+    };
+
+    if start_pos >= source_slice.len() {
+        // Overflow: space-fill target
+        for b in target_slice.iter_mut() {
+            *b = b' ';
+        }
+        return;
+    }
+
+    let remaining = &source_slice[start_pos..];
+
+    // Find delimiter
+    let delim = if !delimiter.is_null() && delimiter_len > 0 {
+        Some(unsafe { std::slice::from_raw_parts(delimiter, delimiter_len as usize) })
+    } else {
+        None
+    };
+
+    let (field_end, delim_skip) = if let Some(d) = delim {
+        match find_substring(remaining, d) {
+            Some(pos) => {
+                let mut skip = d.len();
+                // If ALL, skip consecutive delimiters
+                if all_delim != 0 {
+                    let mut next = pos + d.len();
+                    while next + d.len() <= remaining.len()
+                        && &remaining[next..next + d.len()] == d
+                    {
+                        next += d.len();
+                        skip += d.len();
+                    }
+                }
+                (pos, skip)
+            }
+            None => (remaining.len(), 0),
+        }
+    } else {
+        (remaining.len(), 0)
+    };
+
+    // Copy field into target, space-padded
+    let field = &remaining[..field_end];
+    for b in target_slice.iter_mut() {
+        *b = b' ';
+    }
+    let copy_len = field.len().min(target_slice.len());
+    target_slice[..copy_len].copy_from_slice(&field[..copy_len]);
+
+    // Update pointer
+    if !pointer.is_null() && pointer_len > 0 {
+        let new_pos = (start_pos + field_end + delim_skip + 1) as i64;
+        let ptr_slice = unsafe { std::slice::from_raw_parts_mut(pointer, pointer_len as usize) };
+        write_display_numeric(ptr_slice, new_pos);
+    }
+
+    // Update tally
+    if !tally.is_null() && tally_len > 0 {
+        let tally_slice = unsafe { std::slice::from_raw_parts_mut(tally, tally_len as usize) };
+        let current = read_display_numeric(tally_slice);
+        write_display_numeric(tally_slice, current + 1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -2196,21 +2196,27 @@ impl<'t> Parser<'t> {
         self.parse_arithmetic_expr();
 
         // Optional ON SIZE ERROR / NOT ON SIZE ERROR
+        // Only enter handler if we see ON/SIZE/NOT keywords.  Otherwise the
+        // next statement (e.g. IF) should be parsed at sentence level.
         self.skip_ws();
-        while !self.at_end()
-            && self.current_kind() != cobol_lexer::TokenKind::Period
-            && !self.at_word("END-COMPUTE")
-            && !self.at_kind(cobol_lexer::TokenKind::EndCompute)
-            && !self.at_scope_terminator()
-            && !self.at_division()
+        if !self.at_end()
+            && (self.at_word("ON") || self.at_word("SIZE") || self.at_word("NOT"))
         {
-            if self.at_statement_start() {
-                // Statements inside SIZE ERROR handler
-                self.parse_statement();
-            } else {
-                self.bump();
+            while !self.at_end()
+                && self.current_kind() != cobol_lexer::TokenKind::Period
+                && !self.at_word("END-COMPUTE")
+                && !self.at_kind(cobol_lexer::TokenKind::EndCompute)
+                && !self.at_scope_terminator()
+                && !self.at_division()
+            {
+                if self.at_statement_start() {
+                    // Statements inside SIZE ERROR handler
+                    self.parse_statement();
+                } else {
+                    self.bump();
+                }
+                self.skip_ws();
             }
-            self.skip_ws();
         }
 
         // Optional END-COMPUTE

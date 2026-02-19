@@ -1179,9 +1179,9 @@ impl<'a> HirLowerer<'a> {
             if !pic_str.is_empty() {
                 match parse_picture(&pic_str) {
                     Ok(pt) => {
-                        let byte_size = pt.size;
-                        let encoding = DataEncoding::Display;
-                        let usage = UsageType::Display;
+                        let usage = Self::extract_usage_type(item);
+                        let encoding = Self::usage_to_encoding(usage);
+                        let byte_size = Self::compute_byte_size(usage, &pt);
                         let sd = StorageDescriptor {
                             byte_size,
                             encoding,
@@ -1196,31 +1196,45 @@ impl<'a> HirLowerer<'a> {
                             span: self.dummy_span(),
                             severity: DiagnosticSeverity::Error,
                         });
+                        let usage = Self::extract_usage_type(item);
+                        let encoding = Self::usage_to_encoding(usage);
                         let sd = StorageDescriptor {
                             byte_size: 0,
-                            encoding: DataEncoding::Display,
+                            encoding,
                             picture: None,
-                            usage: UsageType::Display,
+                            usage,
                         };
                         (sd, None)
                     }
                 }
             } else {
+                let usage = Self::extract_usage_type(item);
+                let encoding = Self::usage_to_encoding(usage);
                 let sd = StorageDescriptor {
                     byte_size: 0,
-                    encoding: DataEncoding::Display,
+                    encoding,
                     picture: None,
-                    usage: UsageType::Display,
+                    usage,
                 };
                 (sd, None)
             }
         } else {
-            // Group item or item without PIC
+            // Group item or item without PIC — check for USAGE clause anyway
+            // (e.g. COMP-1, COMP-2 items have no PIC)
+            let usage = Self::extract_usage_type(item);
+            let encoding = Self::usage_to_encoding(usage);
+            let byte_size = match usage {
+                UsageType::Comp1 => 4,
+                UsageType::Comp2 => 8,
+                UsageType::Index => 4,
+                UsageType::Pointer | UsageType::FunctionPointer => 4,
+                _ => 0,
+            };
             let sd = StorageDescriptor {
-                byte_size: 0,
-                encoding: DataEncoding::Display,
+                byte_size,
+                encoding,
                 picture: None,
-                usage: UsageType::Display,
+                usage,
             };
             (sd, None)
         };
@@ -1278,6 +1292,105 @@ impl<'a> HirLowerer<'a> {
         }
 
         Some(item_id)
+    }
+
+    /// Extract the USAGE type from a data item's USAGE clause CST node.
+    ///
+    /// Walks the USAGE_CLAUSE child node's tokens, skips USAGE and IS keywords,
+    /// and parses the remaining WORD token as a usage type keyword.
+    fn extract_usage_type(item: &cobol_ast::DataItem) -> UsageType {
+        let uc = match item.usage_clause() {
+            Some(uc) => uc,
+            None => return UsageType::Display,
+        };
+        // Walk tokens in the USAGE_CLAUSE node, skip USAGE and IS keywords,
+        // take the first non-keyword, non-whitespace WORD as the usage type.
+        for tok in uc.syntax().children_with_tokens().filter_map(|el| el.into_token()) {
+            let kind = tok.kind();
+            if kind == SyntaxKind::WHITESPACE || kind == SyntaxKind::NEWLINE
+                || kind == SyntaxKind::COMMENT
+            {
+                continue;
+            }
+            let text_upper = tok.text().to_ascii_uppercase();
+            // Skip the USAGE and IS keywords
+            if text_upper == "USAGE" || text_upper == "IS" {
+                continue;
+            }
+            // Parse the usage type keyword
+            return match text_upper.as_str() {
+                "COMP" | "COMPUTATIONAL" => UsageType::Comp,
+                "COMP-1" | "COMPUTATIONAL-1" => UsageType::Comp1,
+                "COMP-2" | "COMPUTATIONAL-2" => UsageType::Comp2,
+                "COMP-3" | "COMPUTATIONAL-3" => UsageType::Comp3,
+                "COMP-4" | "COMPUTATIONAL-4" => UsageType::Comp4,
+                "COMP-5" | "COMPUTATIONAL-5" => UsageType::Comp5,
+                "BINARY" => UsageType::Binary,
+                "PACKED-DECIMAL" => UsageType::PackedDecimal,
+                "INDEX" => UsageType::Index,
+                "POINTER" => UsageType::Pointer,
+                "FUNCTION-POINTER" => UsageType::FunctionPointer,
+                "DISPLAY" => UsageType::Display,
+                _ => UsageType::Display, // unknown usage, default to Display
+            };
+        }
+        UsageType::Display
+    }
+
+    /// Map a [`UsageType`] to its corresponding [`DataEncoding`].
+    fn usage_to_encoding(usage: UsageType) -> DataEncoding {
+        match usage {
+            UsageType::Display => DataEncoding::Display,
+            UsageType::Comp
+            | UsageType::Comp4
+            | UsageType::Comp5
+            | UsageType::Binary => DataEncoding::Binary,
+            UsageType::Comp1 => DataEncoding::FloatSingle,
+            UsageType::Comp2 => DataEncoding::FloatDouble,
+            UsageType::Comp3 | UsageType::PackedDecimal => DataEncoding::PackedDecimal,
+            UsageType::Index => DataEncoding::Index,
+            UsageType::Pointer | UsageType::FunctionPointer => DataEncoding::Pointer,
+        }
+    }
+
+    /// Compute the byte size for a data item given its usage type and PIC info.
+    ///
+    /// - DISPLAY: 1 byte per character/digit position (= `PictureType::size`)
+    /// - COMP / COMP-4 / COMP-5 / BINARY: sized by digit count
+    ///   - 1..=4 digits  -> 2 bytes (i16)
+    ///   - 5..=9 digits  -> 4 bytes (i32)
+    ///   - 10..=18 digits -> 8 bytes (i64)
+    /// - COMP-1: 4 bytes (f32), independent of PIC
+    /// - COMP-2: 8 bytes (f64), independent of PIC
+    /// - COMP-3 / PACKED-DECIMAL: (digits + 1) / 2 bytes (packed BCD)
+    /// - INDEX: 4 bytes
+    /// - POINTER / FUNCTION-POINTER: 4 bytes
+    fn compute_byte_size(usage: UsageType, pic: &PictureType) -> u32 {
+        match usage {
+            UsageType::Display => {
+                // 1 byte per character/digit position
+                pic.size
+            }
+            UsageType::Comp | UsageType::Comp4 | UsageType::Comp5 | UsageType::Binary => {
+                // Binary integer sized by digit count
+                let digits = pic.size;
+                if digits <= 4 {
+                    2
+                } else if digits <= 9 {
+                    4
+                } else {
+                    8
+                }
+            }
+            UsageType::Comp1 => 4,
+            UsageType::Comp2 => 8,
+            UsageType::Comp3 | UsageType::PackedDecimal => {
+                // Packed BCD: each byte holds 2 digits, last nibble is sign
+                (pic.size + 1) / 2
+            }
+            UsageType::Index => 4,
+            UsageType::Pointer | UsageType::FunctionPointer => 4,
+        }
     }
 
     fn lower_value_clause(&mut self, item: &cobol_ast::DataItem) -> Option<InitialValue> {
@@ -3190,16 +3303,6 @@ impl<'a> HirLowerer<'a> {
         }
     }
 
-    /// Stub for INSPECT lowering (not yet implemented).
-    fn lower_inspect_stmt(&mut self, _node: &cobol_ast::SyntaxNode) -> Option<HirStatement> {
-        None
-    }
-
-    /// Stub for UNSTRING lowering (not yet implemented).
-    fn lower_unstring_stmt(&mut self, _node: &cobol_ast::SyntaxNode) -> Option<HirStatement> {
-        None
-    }
-
     fn parse_condition_tokens(&mut self, tokens: &[(SyntaxKind, String)]) -> Option<HirExpr> {
         // Simple condition: expr OP expr
         // e.g., WS-SUM = 55, WS-I > 10, WS-RECORD(1:13) = "HELLO FILE IO"
@@ -3373,8 +3476,142 @@ impl<'a> HirLowerer<'a> {
                 inline_body: body,
             }))
         } else {
-            // Simple PERFORM or PERFORM...TIMES/UNTIL
-            None // TODO: implement other PERFORM variants
+            // Non-VARYING: could be TIMES, UNTIL, THRU, or simple out-of-line/inline
+            // Skip the initial "PERFORM" token
+            let mut idx = 0;
+            if idx < tokens.len() && tokens[idx].1.eq_ignore_ascii_case("PERFORM") {
+                idx += 1;
+            }
+
+            // Check if we have inline body (END-PERFORM present or statement children)
+            let has_end_perform = tokens.iter().any(|(_, t)| t.eq_ignore_ascii_case("END-PERFORM"));
+            let has_times = tokens.iter().any(|(_, t)| t.eq_ignore_ascii_case("TIMES"));
+            let has_until = tokens.iter().any(|(_, t)| t.eq_ignore_ascii_case("UNTIL"));
+
+            if has_times && idx < tokens.len() {
+                // PERFORM target [THRU thru] expr TIMES
+                let target_name = tokens[idx].1.to_ascii_uppercase();
+                let target = self.interner.intern(&target_name);
+                idx += 1;
+
+                // Optional THRU
+                let mut thru = None;
+                if idx < tokens.len() && (tokens[idx].1.eq_ignore_ascii_case("THRU")
+                    || tokens[idx].1.eq_ignore_ascii_case("THROUGH")) {
+                    idx += 1;
+                    if idx < tokens.len() {
+                        let thru_name = tokens[idx].1.to_ascii_uppercase();
+                        thru = Some(self.interner.intern(&thru_name));
+                        idx += 1;
+                    }
+                }
+
+                // Parse the TIMES expression (number or data reference before TIMES keyword)
+                let times_expr = if idx < tokens.len() {
+                    self.token_to_expr(tokens[idx].0, &tokens[idx].1)
+                } else {
+                    HirExpr::Literal(LiteralValue::Integer(1))
+                };
+
+                Some(HirStatement::Perform(PerformType::Times {
+                    target,
+                    thru,
+                    times: times_expr,
+                }))
+            } else if has_until && idx < tokens.len() {
+                // PERFORM target [THRU thru] [WITH TEST BEFORE|AFTER] UNTIL condition
+                let target_name = tokens[idx].1.to_ascii_uppercase();
+                let target = self.interner.intern(&target_name);
+                idx += 1;
+
+                // Optional THRU
+                let mut thru = None;
+                if idx < tokens.len() && (tokens[idx].1.eq_ignore_ascii_case("THRU")
+                    || tokens[idx].1.eq_ignore_ascii_case("THROUGH")) {
+                    idx += 1;
+                    if idx < tokens.len() {
+                        let thru_name = tokens[idx].1.to_ascii_uppercase();
+                        thru = Some(self.interner.intern(&thru_name));
+                        idx += 1;
+                    }
+                }
+
+                // Optional WITH TEST BEFORE|AFTER
+                let mut test_before = true;
+                if idx < tokens.len() && tokens[idx].1.eq_ignore_ascii_case("WITH") {
+                    idx += 1;
+                    if idx < tokens.len() && tokens[idx].1.eq_ignore_ascii_case("TEST") {
+                        idx += 1;
+                    }
+                    if idx < tokens.len() {
+                        if tokens[idx].1.eq_ignore_ascii_case("AFTER") {
+                            test_before = false;
+                        }
+                        idx += 1;
+                    }
+                }
+
+                // Skip UNTIL keyword
+                if idx < tokens.len() && tokens[idx].1.eq_ignore_ascii_case("UNTIL") {
+                    idx += 1;
+                }
+
+                // Parse condition from remaining tokens or CONDITION_EXPR child
+                let mut condition = HirExpr::Literal(LiteralValue::Integer(0));
+                for child in node.children() {
+                    if child.kind() == SyntaxKind::CONDITION_EXPR {
+                        let cond_tokens = self.collect_all_tokens(&child);
+                        if let Some(cond) = self.parse_condition_tokens(&cond_tokens) {
+                            condition = cond;
+                        }
+                    }
+                }
+                // Also try to parse condition from the remaining flat tokens
+                if idx < tokens.len() {
+                    let cond_tokens: Vec<(SyntaxKind, String)> = tokens[idx..].to_vec();
+                    if let Some(cond) = self.parse_condition_tokens(&cond_tokens) {
+                        condition = cond;
+                    }
+                }
+
+                Some(HirStatement::Perform(PerformType::Until {
+                    target,
+                    thru,
+                    condition,
+                    test_before,
+                }))
+            } else if idx < tokens.len() && !has_end_perform {
+                // Simple out-of-line PERFORM: PERFORM target [THRU thru]
+                let target_name = tokens[idx].1.to_ascii_uppercase();
+                let target = self.interner.intern(&target_name);
+                idx += 1;
+
+                let mut thru = None;
+                if idx < tokens.len() && (tokens[idx].1.eq_ignore_ascii_case("THRU")
+                    || tokens[idx].1.eq_ignore_ascii_case("THROUGH")) {
+                    idx += 1;
+                    if idx < tokens.len() {
+                        let thru_name = tokens[idx].1.to_ascii_uppercase();
+                        thru = Some(self.interner.intern(&thru_name));
+                    }
+                }
+
+                Some(HirStatement::Perform(PerformType::OutOfLine {
+                    target,
+                    thru,
+                }))
+            } else if has_end_perform {
+                // Inline PERFORM: PERFORM ... END-PERFORM
+                let mut inline_stmts = Vec::new();
+                for child in node.children() {
+                    self.lower_child_statement(&child, &mut inline_stmts);
+                }
+                Some(HirStatement::Perform(PerformType::Inline {
+                    statements: inline_stmts,
+                }))
+            } else {
+                None
+            }
         }
     }
 
@@ -3566,5 +3803,276 @@ mod tests {
         let mode = CallArgMode::ByReference;
         let mode2 = mode;
         assert_eq!(mode, mode2);
+    }
+
+    // ------------------------------------------------------------------
+    // USAGE clause lowering helpers (unit tests)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn compute_byte_size_display() {
+        let pic = parse_picture("9(5)").unwrap();
+        assert_eq!(HirLowerer::compute_byte_size(UsageType::Display, &pic), 5);
+    }
+
+    #[test]
+    fn compute_byte_size_comp_small() {
+        // PIC 9(4) COMP -> 2 bytes (i16)
+        let pic = parse_picture("9(4)").unwrap();
+        assert_eq!(HirLowerer::compute_byte_size(UsageType::Comp, &pic), 2);
+    }
+
+    #[test]
+    fn compute_byte_size_comp_medium() {
+        // PIC 9(5) COMP -> 4 bytes (i32)
+        let pic = parse_picture("9(5)").unwrap();
+        assert_eq!(HirLowerer::compute_byte_size(UsageType::Comp, &pic), 4);
+    }
+
+    #[test]
+    fn compute_byte_size_comp_large() {
+        // PIC 9(10) COMP -> 8 bytes (i64)
+        let pic = parse_picture("9(10)").unwrap();
+        assert_eq!(HirLowerer::compute_byte_size(UsageType::Comp, &pic), 8);
+    }
+
+    #[test]
+    fn compute_byte_size_binary() {
+        let pic = parse_picture("9(7)").unwrap();
+        assert_eq!(HirLowerer::compute_byte_size(UsageType::Binary, &pic), 4);
+    }
+
+    #[test]
+    fn compute_byte_size_comp4() {
+        let pic = parse_picture("9(3)").unwrap();
+        assert_eq!(HirLowerer::compute_byte_size(UsageType::Comp4, &pic), 2);
+    }
+
+    #[test]
+    fn compute_byte_size_comp5() {
+        let pic = parse_picture("9(18)").unwrap();
+        assert_eq!(HirLowerer::compute_byte_size(UsageType::Comp5, &pic), 8);
+    }
+
+    #[test]
+    fn compute_byte_size_comp1() {
+        // COMP-1 is always 4 bytes regardless of PIC
+        let pic = parse_picture("9(5)").unwrap();
+        assert_eq!(HirLowerer::compute_byte_size(UsageType::Comp1, &pic), 4);
+    }
+
+    #[test]
+    fn compute_byte_size_comp2() {
+        // COMP-2 is always 8 bytes regardless of PIC
+        let pic = parse_picture("9(5)").unwrap();
+        assert_eq!(HirLowerer::compute_byte_size(UsageType::Comp2, &pic), 8);
+    }
+
+    #[test]
+    fn compute_byte_size_comp3() {
+        // COMP-3: (digits + 1) / 2
+        // PIC 9(5) -> (5 + 1) / 2 = 3 bytes
+        let pic = parse_picture("9(5)").unwrap();
+        assert_eq!(HirLowerer::compute_byte_size(UsageType::Comp3, &pic), 3);
+    }
+
+    #[test]
+    fn compute_byte_size_packed_decimal() {
+        // PACKED-DECIMAL: (digits + 1) / 2
+        // PIC 9(7) -> (7 + 1) / 2 = 4 bytes
+        let pic = parse_picture("9(7)").unwrap();
+        assert_eq!(HirLowerer::compute_byte_size(UsageType::PackedDecimal, &pic), 4);
+    }
+
+    #[test]
+    fn compute_byte_size_comp3_even_digits() {
+        // COMP-3: (digits + 1) / 2
+        // PIC 9(4) -> (4 + 1) / 2 = 2 bytes (integer division)
+        let pic = parse_picture("9(4)").unwrap();
+        assert_eq!(HirLowerer::compute_byte_size(UsageType::Comp3, &pic), 2);
+    }
+
+    #[test]
+    fn usage_to_encoding_mappings() {
+        assert_eq!(HirLowerer::usage_to_encoding(UsageType::Display), DataEncoding::Display);
+        assert_eq!(HirLowerer::usage_to_encoding(UsageType::Comp), DataEncoding::Binary);
+        assert_eq!(HirLowerer::usage_to_encoding(UsageType::Comp1), DataEncoding::FloatSingle);
+        assert_eq!(HirLowerer::usage_to_encoding(UsageType::Comp2), DataEncoding::FloatDouble);
+        assert_eq!(HirLowerer::usage_to_encoding(UsageType::Comp3), DataEncoding::PackedDecimal);
+        assert_eq!(HirLowerer::usage_to_encoding(UsageType::Comp4), DataEncoding::Binary);
+        assert_eq!(HirLowerer::usage_to_encoding(UsageType::Comp5), DataEncoding::Binary);
+        assert_eq!(HirLowerer::usage_to_encoding(UsageType::Binary), DataEncoding::Binary);
+        assert_eq!(HirLowerer::usage_to_encoding(UsageType::PackedDecimal), DataEncoding::PackedDecimal);
+        assert_eq!(HirLowerer::usage_to_encoding(UsageType::Index), DataEncoding::Index);
+        assert_eq!(HirLowerer::usage_to_encoding(UsageType::Pointer), DataEncoding::Pointer);
+        assert_eq!(HirLowerer::usage_to_encoding(UsageType::FunctionPointer), DataEncoding::Pointer);
+    }
+
+    // ------------------------------------------------------------------
+    // End-to-end USAGE clause lowering (parse -> lower -> check)
+    // ------------------------------------------------------------------
+
+    /// Helper: find the first working-storage data item by name (case-insensitive).
+    fn find_ws_item<'a>(module: &'a HirModule, interner: &cobol_intern::Interner, name: &str) -> &'a DataItemData {
+        for &id in &module.working_storage {
+            let item = &module.data_items[id.into_raw()];
+            if let Some(n) = item.name {
+                if interner.resolve(n).eq_ignore_ascii_case(name) {
+                    return item;
+                }
+            }
+        }
+        panic!("data item '{}' not found in working storage", name);
+    }
+
+    /// Builds a minimal COBOL program with a single WORKING-STORAGE item.
+    fn make_cobol_source(data_entry: &str) -> String {
+        format!(
+            "IDENTIFICATION DIVISION.\n\
+             PROGRAM-ID. TEST-USAGE.\n\
+             DATA DIVISION.\n\
+             WORKING-STORAGE SECTION.\n\
+             {}\n\
+             PROCEDURE DIVISION.\n\
+             STOP RUN.\n",
+            data_entry
+        )
+    }
+
+    #[test]
+    fn lower_usage_display_explicit() {
+        let src = make_cobol_source("01 WS-ITEM PIC 9(5) USAGE DISPLAY.");
+        let file_id = cobol_span::FileId::new(0);
+        let tokens = cobol_lexer::lex(&src, file_id, cobol_lexer::SourceFormat::Free);
+        let parse_result = cobol_parser::parse(&tokens);
+        let root = parse_result.syntax();
+        let sf = cobol_ast::SourceFile::cast(root).unwrap();
+        let mut interner = cobol_intern::Interner::default();
+        let module = lower(&sf, &mut interner);
+
+        let item = find_ws_item(&module, &interner, "WS-ITEM");
+        assert_eq!(item.storage.usage, UsageType::Display);
+        assert_eq!(item.storage.encoding, DataEncoding::Display);
+        assert_eq!(item.storage.byte_size, 5);
+    }
+
+    #[test]
+    fn lower_usage_comp() {
+        let src = make_cobol_source("01 WS-COMP PIC 9(5) USAGE COMP.");
+        let file_id = cobol_span::FileId::new(0);
+        let tokens = cobol_lexer::lex(&src, file_id, cobol_lexer::SourceFormat::Free);
+        let parse_result = cobol_parser::parse(&tokens);
+        let root = parse_result.syntax();
+        let sf = cobol_ast::SourceFile::cast(root).unwrap();
+        let mut interner = cobol_intern::Interner::default();
+        let module = lower(&sf, &mut interner);
+
+        let item = find_ws_item(&module, &interner, "WS-COMP");
+        assert_eq!(item.storage.usage, UsageType::Comp);
+        assert_eq!(item.storage.encoding, DataEncoding::Binary);
+        assert_eq!(item.storage.byte_size, 4); // 5 digits -> 4 bytes
+    }
+
+    #[test]
+    fn lower_usage_comp3() {
+        let src = make_cobol_source("01 WS-PACKED PIC 9(7) USAGE COMP-3.");
+        let file_id = cobol_span::FileId::new(0);
+        let tokens = cobol_lexer::lex(&src, file_id, cobol_lexer::SourceFormat::Free);
+        let parse_result = cobol_parser::parse(&tokens);
+        let root = parse_result.syntax();
+        let sf = cobol_ast::SourceFile::cast(root).unwrap();
+        let mut interner = cobol_intern::Interner::default();
+        let module = lower(&sf, &mut interner);
+
+        let item = find_ws_item(&module, &interner, "WS-PACKED");
+        assert_eq!(item.storage.usage, UsageType::Comp3);
+        assert_eq!(item.storage.encoding, DataEncoding::PackedDecimal);
+        assert_eq!(item.storage.byte_size, 4); // (7 + 1) / 2 = 4
+    }
+
+    #[test]
+    fn lower_usage_binary() {
+        let src = make_cobol_source("01 WS-BIN PIC 9(4) USAGE BINARY.");
+        let file_id = cobol_span::FileId::new(0);
+        let tokens = cobol_lexer::lex(&src, file_id, cobol_lexer::SourceFormat::Free);
+        let parse_result = cobol_parser::parse(&tokens);
+        let root = parse_result.syntax();
+        let sf = cobol_ast::SourceFile::cast(root).unwrap();
+        let mut interner = cobol_intern::Interner::default();
+        let module = lower(&sf, &mut interner);
+
+        let item = find_ws_item(&module, &interner, "WS-BIN");
+        assert_eq!(item.storage.usage, UsageType::Binary);
+        assert_eq!(item.storage.encoding, DataEncoding::Binary);
+        assert_eq!(item.storage.byte_size, 2); // 4 digits -> 2 bytes
+    }
+
+    #[test]
+    fn lower_usage_packed_decimal() {
+        let src = make_cobol_source("01 WS-PKD PIC 9(5) USAGE PACKED-DECIMAL.");
+        let file_id = cobol_span::FileId::new(0);
+        let tokens = cobol_lexer::lex(&src, file_id, cobol_lexer::SourceFormat::Free);
+        let parse_result = cobol_parser::parse(&tokens);
+        let root = parse_result.syntax();
+        let sf = cobol_ast::SourceFile::cast(root).unwrap();
+        let mut interner = cobol_intern::Interner::default();
+        let module = lower(&sf, &mut interner);
+
+        let item = find_ws_item(&module, &interner, "WS-PKD");
+        assert_eq!(item.storage.usage, UsageType::PackedDecimal);
+        assert_eq!(item.storage.encoding, DataEncoding::PackedDecimal);
+        assert_eq!(item.storage.byte_size, 3); // (5 + 1) / 2 = 3
+    }
+
+    #[test]
+    fn lower_usage_comp_large_pic() {
+        let src = make_cobol_source("01 WS-BIG PIC 9(18) USAGE COMP.");
+        let file_id = cobol_span::FileId::new(0);
+        let tokens = cobol_lexer::lex(&src, file_id, cobol_lexer::SourceFormat::Free);
+        let parse_result = cobol_parser::parse(&tokens);
+        let root = parse_result.syntax();
+        let sf = cobol_ast::SourceFile::cast(root).unwrap();
+        let mut interner = cobol_intern::Interner::default();
+        let module = lower(&sf, &mut interner);
+
+        let item = find_ws_item(&module, &interner, "WS-BIG");
+        assert_eq!(item.storage.usage, UsageType::Comp);
+        assert_eq!(item.storage.encoding, DataEncoding::Binary);
+        assert_eq!(item.storage.byte_size, 8); // 18 digits -> 8 bytes
+    }
+
+    #[test]
+    fn lower_usage_no_clause_defaults_display() {
+        let src = make_cobol_source("01 WS-DEFAULT PIC X(10).");
+        let file_id = cobol_span::FileId::new(0);
+        let tokens = cobol_lexer::lex(&src, file_id, cobol_lexer::SourceFormat::Free);
+        let parse_result = cobol_parser::parse(&tokens);
+        let root = parse_result.syntax();
+        let sf = cobol_ast::SourceFile::cast(root).unwrap();
+        let mut interner = cobol_intern::Interner::default();
+        let module = lower(&sf, &mut interner);
+
+        let item = find_ws_item(&module, &interner, "WS-DEFAULT");
+        assert_eq!(item.storage.usage, UsageType::Display);
+        assert_eq!(item.storage.encoding, DataEncoding::Display);
+        assert_eq!(item.storage.byte_size, 10);
+    }
+
+    #[test]
+    fn lower_usage_is_comp() {
+        // USAGE IS COMP (with IS keyword)
+        let src = make_cobol_source("01 WS-ISCOMP PIC 9(9) USAGE IS COMP.");
+        let file_id = cobol_span::FileId::new(0);
+        let tokens = cobol_lexer::lex(&src, file_id, cobol_lexer::SourceFormat::Free);
+        let parse_result = cobol_parser::parse(&tokens);
+        let root = parse_result.syntax();
+        let sf = cobol_ast::SourceFile::cast(root).unwrap();
+        let mut interner = cobol_intern::Interner::default();
+        let module = lower(&sf, &mut interner);
+
+        let item = find_ws_item(&module, &interner, "WS-ISCOMP");
+        assert_eq!(item.storage.usage, UsageType::Comp);
+        assert_eq!(item.storage.encoding, DataEncoding::Binary);
+        assert_eq!(item.storage.byte_size, 4); // 9 digits -> 4 bytes
     }
 }

@@ -12,3 +12,6 @@ cobol-ast = { workspace = true }
 cobol-parser = { workspace = true }
 la-arena = { workspace = true }
 smol_str = { workspace = true }
+
+[dev-dependencies]
+cobol-lexer = { workspace = true }
