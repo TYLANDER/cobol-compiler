@@ -170,6 +170,13 @@ impl CraneliftCodegen {
 
     fn declare_globals(&mut self, globals: &[MirGlobal]) -> Result<(), CodegenError> {
         for g in globals {
+            if let Some(ref redef_target) = g.redefines {
+                // REDEFINES: share the same DataId as the redefined item
+                if let Some(&target_id) = self.data_ids.get(redef_target) {
+                    self.data_ids.insert(g.name.clone(), target_id);
+                    continue;
+                }
+            }
             let data_id = self
                 .module
                 .declare_data(&g.name, Linkage::Local, true /* writable */, false /* tls */)
@@ -181,6 +188,10 @@ impl CraneliftCodegen {
 
     fn define_globals(&mut self, globals: &[MirGlobal]) -> Result<(), CodegenError> {
         for g in globals {
+            // Skip REDEFINES items — they share the data section of the redefined item
+            if g.redefines.is_some() {
+                continue;
+            }
             let data_id = self.data_ids[&g.name];
             let mut desc = DataDescription::new();
 
@@ -277,6 +288,7 @@ impl CraneliftCodegen {
                 sig.params.push(AbiParam::new(types::I32)); // dest_len
                 sig.params.push(AbiParam::new(types::I32)); // dest_scale
                 sig.params.push(AbiParam::new(types::I32)); // dest_dot_pos
+                sig.params.push(AbiParam::new(types::I32)); // rounded
             }
             "cobolrt_move_num_to_alpha" => {
                 sig.params.push(AbiParam::new(ptr));        // src
@@ -377,6 +389,12 @@ impl CraneliftCodegen {
             "cobolrt_int_to_display" => {
                 sig.params.push(AbiParam::new(types::I64)); // value
                 sig.params.push(AbiParam::new(ptr));        // dest ptr
+            }
+            "cobolrt_format_numeric_edited" => {
+                sig.params.push(AbiParam::new(ptr));        // data ptr
+                sig.params.push(AbiParam::new(types::I32)); // data_len
+                sig.params.push(AbiParam::new(ptr));        // pic string ptr
+                sig.params.push(AbiParam::new(types::I32)); // pic_len
             }
             _ => {
                 // Unknown function (likely a subprogram call).
@@ -1117,6 +1135,7 @@ mod tests {
                 ty: MirType::Bytes(13),
                 initial_value: Some(MirConst::Str("HELLO, WORLD!".into())),
                 offset: 0,
+                redefines: None,
             }],
             file_descriptors: vec![],
         };

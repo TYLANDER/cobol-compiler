@@ -64,6 +64,7 @@ pub extern "C" fn cobolrt_move_numeric(
     dest_len: u32,
     dest_scale: i32,
     dest_dot_pos: i32,
+    rounded: i32,
 ) {
     if src.is_null() || dest.is_null() {
         return;
@@ -79,7 +80,7 @@ pub extern "C" fn cobolrt_move_numeric(
     }
 
     // Adjust scale: if dest has more decimal places than src, multiply;
-    // if fewer, divide (truncating)
+    // if fewer, divide (truncating or rounding)
     let scale_diff = dest_scale - src_scale;
     let mut adjusted = src_val;
     if scale_diff > 0 {
@@ -87,8 +88,20 @@ pub extern "C" fn cobolrt_move_numeric(
             adjusted *= 10;
         }
     } else if scale_diff < 0 {
-        for _ in 0..(-scale_diff) {
+        if rounded != 0 {
+            // Round: truncate all but the last digit, check the last, then finish
+            for _ in 0..((-scale_diff) - 1) {
+                adjusted /= 10;
+            }
+            let remainder = adjusted % 10;
             adjusted /= 10;
+            if remainder >= 5 {
+                adjusted += 1;
+            }
+        } else {
+            for _ in 0..(-scale_diff) {
+                adjusted /= 10;
+            }
         }
     }
 

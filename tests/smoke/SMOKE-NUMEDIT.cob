@@ -1,0 +1,14 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. SMOKE-NUMEDIT.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 WS-AMOUNT PIC 9(5)V99 VALUE 1234.56.
+       01 WS-EDITED PIC Z(4)9.99.
+       PROCEDURE DIVISION.
+           MOVE WS-AMOUNT TO WS-EDITED.
+           IF WS-EDITED = " 1234.56"
+               DISPLAY "PASS"
+           ELSE
+               DISPLAY "FAIL: [" WS-EDITED "]"
+           END-IF
+           STOP RUN.

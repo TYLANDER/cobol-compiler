@@ -1,0 +1,15 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. SMOKE-SIGNED.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 WS-A PIC S9(4) VALUE -5.
+       01 WS-B PIC S9(4) VALUE 10.
+       01 WS-RESULT PIC S9(4) VALUE 0.
+       PROCEDURE DIVISION.
+           ADD WS-A WS-B GIVING WS-RESULT.
+           IF WS-RESULT = 5
+               DISPLAY "PASS"
+           ELSE
+               DISPLAY "FAIL: " WS-RESULT
+           END-IF
+           STOP RUN.

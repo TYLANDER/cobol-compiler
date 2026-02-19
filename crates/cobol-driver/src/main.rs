@@ -122,25 +122,46 @@ void cobolrt_initialize_numeric(char *data, unsigned int len) {
     memset(data, '0', len);
 }
 
-/* Convert display-format numeric (ASCII digits) to a 64-bit integer. */
+/* Convert display-format numeric (ASCII digits) to a 64-bit integer.
+ * Supports signed fields using trailing overpunch encoding:
+ *   Positive: last byte '0'-'9' (0x30-0x39) or '{','A'-'I' (0x7B,0x41-0x49)
+ *   Negative: last byte 'p'-'y' (0x70-0x79) — digit + 0x40
+ * For unsigned fields, all bytes are plain digits. */
 static long long display_to_int(const char *data, unsigned int len) {
     long long result = 0;
+    int negative = 0;
     for (unsigned int i = 0; i < len; i++) {
-        char c = data[i];
+        unsigned char c = (unsigned char)data[i];
         if (c >= '0' && c <= '9') {
             result = result * 10 + (c - '0');
+        } else if (c >= 'p' && c <= 'y') {
+            /* Trailing overpunch: negative sign, digit = c - 0x40 */
+            result = result * 10 + (c - 'p');
+            negative = 1;
+        } else if (c == '{') {
+            /* Positive overpunch for 0 (some conventions) */
+            result = result * 10 + 0;
+        } else if (c >= 'A' && c <= 'I') {
+            /* Positive overpunch for 1-9 (some conventions) */
+            result = result * 10 + (c - 'A' + 1);
         }
     }
-    return result;
+    return negative ? -result : result;
 }
 
-/* Write a 64-bit integer into display format (ASCII digits, right-justified, zero-padded). */
+/* Write a 64-bit integer into display format (ASCII digits, right-justified, zero-padded).
+ * Negative values are encoded using trailing overpunch: last digit + 0x40. */
 static void int_to_display(long long value, char *data, unsigned int len) {
-    if (value < 0) value = -value; /* handle sign elsewhere */
+    int negative = (value < 0);
+    if (value < 0) value = -value;
     memset(data, '0', len);
     for (int i = (int)len - 1; i >= 0 && value > 0; i--) {
         data[i] = '0' + (char)(value % 10);
         value /= 10;
+    }
+    if (negative && len > 0) {
+        /* Apply trailing overpunch to the last byte: add 0x40 */
+        data[len - 1] = (char)(data[len - 1] + 0x40);
     }
 }
 
@@ -204,16 +225,26 @@ long long cobolrt_display_to_int(const char *data, unsigned int len) {
     return display_to_int(data, len);
 }
 
-/* Read digits from a display buffer, skipping non-digit chars (e.g. '.'). */
+/* Read digits from a display buffer, skipping non-digit chars (e.g. '.').
+ * Handles trailing overpunch for signed fields. */
 static long long display_to_int_skip(const char *data, unsigned int len) {
     long long result = 0;
+    int negative = 0;
     for (unsigned int i = 0; i < len; i++) {
-        char c = data[i];
+        unsigned char c = (unsigned char)data[i];
         if (c >= '0' && c <= '9') {
             result = result * 10 + (c - '0');
+        } else if (c >= 'p' && c <= 'y') {
+            result = result * 10 + (c - 'p');
+            negative = 1;
+        } else if (c == '{') {
+            result = result * 10 + 0;
+        } else if (c >= 'A' && c <= 'I') {
+            result = result * 10 + (c - 'A' + 1);
         }
+        /* skip '.', spaces, etc. */
     }
-    return result;
+    return negative ? -result : result;
 }
 
 /* Write digits to a display buffer, inserting '.' at dot_pos if >= 0. */
@@ -433,7 +464,8 @@ void cobolrt_string_append(
  */
 void cobolrt_move_numeric(
     const char *src, unsigned int src_len, int src_scale, int src_dot_pos,
-    char *dest, unsigned int dest_len, int dest_scale, int dest_dot_pos
+    char *dest, unsigned int dest_len, int dest_scale, int dest_dot_pos,
+    int rounded
 ) {
     /* Extract the integer value from source, skipping any '.' */
     long long src_val = display_to_int_skip(src, src_len);
@@ -445,8 +477,22 @@ void cobolrt_move_numeric(
         for (int i = 0; i < scale_diff; i++)
             adjusted *= 10;
     } else if (scale_diff < 0) {
-        for (int i = 0; i < -scale_diff; i++)
+        if (rounded && scale_diff == -1) {
+            /* Round: check the last digit before truncating */
+            long long remainder = adjusted % 10;
             adjusted /= 10;
+            if (remainder >= 5) adjusted++;
+        } else if (rounded && scale_diff < -1) {
+            /* Round: compute one extra digit, check, then truncate */
+            for (int i = 0; i < (-scale_diff) - 1; i++)
+                adjusted /= 10;
+            long long remainder = adjusted % 10;
+            adjusted /= 10;
+            if (remainder >= 5) adjusted++;
+        } else {
+            for (int i = 0; i < -scale_diff; i++)
+                adjusted /= 10;
+        }
     }
 
     /* Write the result into the destination */
@@ -948,6 +994,174 @@ void cobolrt_int_to_display(long long val, char *dest) {
     for (int i = 7; i >= 0; i--) {
         dest[i] = '0' + (val % 10);
         val /= 10;
+    }
+}
+
+/*
+ * Format a numeric-edited field in-place.
+ *
+ * `data` already contains the raw numeric digits (with '.' inserted at the
+ * correct position by cobolrt_move_numeric / int_to_display_edited).
+ * This function walks the PIC string and applies editing:
+ *   Z -> zero suppress (replace leading '0' with ' ')
+ *   , -> insert comma (but suppress to ' ' if in zero-suppress zone)
+ *   . -> keep literal decimal point (already present)
+ *   $ -> insert dollar sign
+ *   - -> insert '-' for negative, ' ' for positive
+ *   + -> insert '+' for positive, '-' for negative
+ *   9 -> keep digit as-is
+ *
+ * The PIC string and the data buffer have a 1:1 positional correspondence
+ * (after expanding repetition counts).
+ */
+void cobolrt_format_numeric_edited(
+    char *data, unsigned int data_len,
+    const char *pic, unsigned int pic_len
+) {
+    if (!data || !pic || data_len == 0 || pic_len == 0) return;
+
+    /* Step 1: Expand PIC string into individual characters.
+     * E.g. "Z(4)9.99" -> "ZZZZ9.99" */
+    char expanded[256];
+    unsigned int exp_len = 0;
+    for (unsigned int i = 0; i < pic_len && exp_len < sizeof(expanded); ) {
+        char ch = pic[i];
+        /* Uppercase the character */
+        if (ch >= 'a' && ch <= 'z') ch = ch - 32;
+        if (i + 1 < pic_len && pic[i + 1] == '(') {
+            /* Parse repetition count */
+            unsigned int start = i + 2;
+            unsigned int end = start;
+            while (end < pic_len && pic[end] != ')') end++;
+            int count = 0;
+            for (unsigned int k = start; k < end; k++) {
+                count = count * 10 + (pic[k] - '0');
+            }
+            for (int k = 0; k < count && exp_len < sizeof(expanded); k++) {
+                expanded[exp_len++] = ch;
+            }
+            i = end + 1;
+        } else {
+            expanded[exp_len++] = ch;
+            i++;
+        }
+    }
+
+    /* Skip 'S' characters (sign indicator, no storage) and 'V' (implied decimal) */
+    char pic_chars[256];
+    unsigned int pic_chars_len = 0;
+    for (unsigned int i = 0; i < exp_len && pic_chars_len < sizeof(pic_chars); i++) {
+        if (expanded[i] != 'S' && expanded[i] != 'V') {
+            pic_chars[pic_chars_len++] = expanded[i];
+        }
+    }
+
+    /* The pic_chars array should now have length == data_len.
+     * Walk left-to-right. Track whether we are in the "zero suppress" zone.
+     * Zero suppression is active from the start until we hit a significant
+     * (non-zero) digit or pass the last Z position. */
+
+    /* First, find the rightmost Z (or * or floating $+-) position.
+     * Everything from position 0 to that position is the suppress zone. */
+    int last_z_pos = -1;
+    for (int i = (int)pic_chars_len - 1; i >= 0; i--) {
+        if (pic_chars[i] == 'Z' || pic_chars[i] == '*') {
+            last_z_pos = i;
+            break;
+        }
+    }
+
+    /* Determine if the value is zero (all digit positions are '0') */
+    int is_all_zero = 1;
+    int is_negative = 0;
+    for (unsigned int i = 0; i < data_len; i++) {
+        if (data[i] >= '1' && data[i] <= '9') {
+            is_all_zero = 0;
+        }
+        /* Check for trailing overpunch negative indicators */
+        if (data[i] >= 'p' && data[i] <= 'y') {
+            is_negative = 1;
+            is_all_zero = 0;
+        }
+    }
+
+    /* Now walk left-to-right applying the edit */
+    int suppressing = 1;  /* start in suppress mode */
+    unsigned int d = 0;   /* index into data */
+
+    for (unsigned int p = 0; p < pic_chars_len && d < data_len; p++) {
+        char pc = pic_chars[p];
+        switch (pc) {
+            case '9':
+                /* Always show digit, end suppression */
+                suppressing = 0;
+                d++;
+                break;
+            case 'Z':
+                if (suppressing && data[d] == '0' && (int)p <= last_z_pos) {
+                    data[d] = ' ';
+                } else {
+                    suppressing = 0;
+                }
+                d++;
+                break;
+            case '*':
+                if (suppressing && data[d] == '0') {
+                    data[d] = '*';
+                } else {
+                    suppressing = 0;
+                }
+                d++;
+                break;
+            case '.':
+                /* Literal decimal point - already in data */
+                d++;
+                break;
+            case ',':
+                /* Comma insertion: if in suppress zone, replace with space */
+                if (suppressing) {
+                    data[d] = ' ';
+                } else {
+                    data[d] = ',';
+                }
+                d++;
+                break;
+            case '$':
+                data[d] = '$';
+                d++;
+                break;
+            case '-':
+                if (is_negative) {
+                    data[d] = '-';
+                } else {
+                    data[d] = ' ';
+                }
+                d++;
+                break;
+            case '+':
+                if (is_negative) {
+                    data[d] = '-';
+                } else {
+                    data[d] = '+';
+                }
+                d++;
+                break;
+            case 'B':
+                data[d] = ' ';
+                d++;
+                break;
+            case '/':
+                data[d] = '/';
+                d++;
+                break;
+            case '0':
+                data[d] = '0';
+                d++;
+                break;
+            default:
+                d++;
+                break;
+        }
     }
 }
 "#;

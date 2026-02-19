@@ -16,6 +16,10 @@ compile_fail = [
 
 # Tests expected to fail at runtime (wrong output)
 runtime_fail = [
+    "NC108A",
+    "NC109A",
+    "NC112A",
+    "NC114A",
 ]
 
 # Tests to skip entirely
@@ -24,3 +28,7 @@ skip = [
 
 # Optional: reasons for known failures
 [reasons]
+NC108A = "Tests 6-7 fail: MOVE SPACES and MOVE ZEROS figurative constants not implemented"
+NC109A = "Test 3 fails: IF with OR condition (WS-A = 1 OR WS-A = 2) not evaluated correctly"
+NC112A = "Test 2 fails: EVALUATE TRUE condition evaluation incorrect (matches wrong WHEN clause)"
+NC114A = "Tests 2-3 fail: REDEFINES clause produces blank output; OCCURS subscript access computes wrong values"

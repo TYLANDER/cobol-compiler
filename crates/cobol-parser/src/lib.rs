@@ -1285,8 +1285,23 @@ impl<'t> Parser<'t> {
         // The value literal(s)
         self.skip_ws();
         if !self.at_end() && self.current_kind() != cobol_lexer::TokenKind::Period {
-            // Consume the value expression (could be literal, figurative, identifier)
-            self.bump();
+            // Handle negative numeric literals: VALUE -5 or VALUE -123
+            if self.current_kind() == cobol_lexer::TokenKind::Minus {
+                self.bump(); // consume '-'
+                self.skip_ws();
+                if !self.at_end() && self.current_kind() != cobol_lexer::TokenKind::Period {
+                    self.bump(); // consume the number after '-'
+                }
+            } else if self.current_kind() == cobol_lexer::TokenKind::Plus {
+                self.bump(); // consume '+'
+                self.skip_ws();
+                if !self.at_end() && self.current_kind() != cobol_lexer::TokenKind::Period {
+                    self.bump(); // consume the number after '+'
+                }
+            } else {
+                // Consume the value expression (could be literal, figurative, identifier)
+                self.bump();
+            }
         }
 
         self.finish_node();
@@ -1613,6 +1628,7 @@ impl<'t> Parser<'t> {
                     "STRING" => self.parse_generic_stmt(SyntaxKind::STRING_STMT),
                     "UNSTRING" => self.parse_unstring_stmt(),
                     "INSPECT" => self.parse_inspect_stmt(),
+                    "SEARCH" => self.parse_search_stmt(),
                     _ => self.parse_generic_stmt(SyntaxKind::STATEMENT),
                 }
             }
@@ -3237,6 +3253,113 @@ impl<'t> Parser<'t> {
             && !self.at_statement_start()
             && !self.at_scope_terminator()
             && !self.at_else()
+        {
+            self.bump();
+        }
+
+        self.finish_node();
+    }
+
+    // ------------------------------------------------------------------
+    // SEARCH statement
+    // ------------------------------------------------------------------
+
+    fn parse_search_stmt(&mut self) {
+        self.start_node(SyntaxKind::SEARCH_STMT);
+        self.skip_ws();
+        self.bump(); // SEARCH
+
+        // Consume the table identifier (tokens until AT, WHEN, END-SEARCH, or period)
+        self.skip_ws();
+        while !self.at_end()
+            && self.current_kind() != cobol_lexer::TokenKind::Period
+            && !self.at_word("AT")
+            && !self.at_word("WHEN")
+            && !self.at_word("END-SEARCH")
+            && !self.at_kind(cobol_lexer::TokenKind::EndSearch)
+            && !self.at_division()
+        {
+            self.bump();
+            self.skip_ws();
+        }
+
+        // Parse optional AT END clause
+        if self.at_word("AT") {
+            self.bump(); // AT
+            self.skip_ws();
+            if self.at_word("END") {
+                self.bump(); // END
+                self.skip_ws();
+            }
+            // Parse AT END body statements until WHEN or END-SEARCH
+            while !self.at_end()
+                && self.current_kind() != cobol_lexer::TokenKind::Period
+                && !self.at_word("WHEN")
+                && !self.at_word("END-SEARCH")
+                && !self.at_kind(cobol_lexer::TokenKind::EndSearch)
+                && !self.at_division()
+            {
+                if self.at_statement_start() {
+                    self.parse_statement();
+                } else {
+                    self.bump();
+                }
+                self.skip_ws();
+            }
+        }
+
+        // Parse WHEN clauses
+        while !self.at_end()
+            && self.current_kind() != cobol_lexer::TokenKind::Period
+            && !self.at_word("END-SEARCH")
+            && !self.at_kind(cobol_lexer::TokenKind::EndSearch)
+            && !self.at_division()
+        {
+            if self.at_word("WHEN") || self.at_kind(cobol_lexer::TokenKind::When) {
+                self.bump(); // WHEN
+                self.skip_ws();
+
+                // Consume condition tokens until statement start, next WHEN, or END-SEARCH
+                while !self.at_end()
+                    && self.current_kind() != cobol_lexer::TokenKind::Period
+                    && !self.at_statement_start()
+                    && !self.at_word("WHEN")
+                    && !self.at_kind(cobol_lexer::TokenKind::When)
+                    && !self.at_word("END-SEARCH")
+                    && !self.at_kind(cobol_lexer::TokenKind::EndSearch)
+                    && !self.at_division()
+                {
+                    self.bump();
+                    self.skip_ws();
+                }
+
+                // Parse statements in this WHEN clause body
+                while !self.at_end()
+                    && self.current_kind() != cobol_lexer::TokenKind::Period
+                    && !self.at_word("WHEN")
+                    && !self.at_kind(cobol_lexer::TokenKind::When)
+                    && !self.at_word("END-SEARCH")
+                    && !self.at_kind(cobol_lexer::TokenKind::EndSearch)
+                    && !self.at_division()
+                {
+                    if self.at_statement_start() {
+                        self.parse_statement();
+                    } else {
+                        self.bump();
+                    }
+                    self.skip_ws();
+                }
+            } else {
+                self.bump();
+                self.skip_ws();
+            }
+        }
+
+        // Consume END-SEARCH if present
+        self.skip_ws();
+        if !self.at_end()
+            && (self.at_word("END-SEARCH")
+                || self.at_kind(cobol_lexer::TokenKind::EndSearch))
         {
             self.bump();
         }

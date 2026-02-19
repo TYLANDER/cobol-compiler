@@ -387,6 +387,38 @@ pub enum HirStatement {
         pointer: Option<HirDataRef>,
         tallying: Option<HirDataRef>,
     },
+    Initialize {
+        targets: Vec<HirDataRef>,
+    },
+    Search {
+        table: HirDataRef,
+        at_end: Vec<HirStatement>,
+        whens: Vec<SearchWhen>,
+    },
+    Set {
+        target: HirDataRef,
+        action: SetAction,
+    },
+}
+
+/// A WHEN clause inside a SEARCH statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchWhen {
+    /// The condition for this WHEN branch.
+    pub condition: HirExpr,
+    /// Statements executed when the condition matches.
+    pub body: Vec<HirStatement>,
+}
+
+/// The action to take on the target index in a SET statement.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SetAction {
+    /// SET target TO value
+    To(HirExpr),
+    /// SET target UP BY value
+    UpBy(HirExpr),
+    /// SET target DOWN BY value
+    DownBy(HirExpr),
 }
 
 /// The different forms of the INSPECT statement.
@@ -725,6 +757,7 @@ pub fn parse_picture(pic_string: &str) -> Result<PictureType, String> {
     let mut has_alpha = false;
     let mut has_numeric = false;
     let mut has_x = false;
+    let mut has_edited = false;
     let mut sign_pos = SignPosition::None;
 
     while i < len {
@@ -783,6 +816,7 @@ pub fn parse_picture(pic_string: &str) -> Result<PictureType, String> {
             }
             'Z' | '*' | '$' | '+' | '-' | ',' | '/' | 'B' | '0' | 'C' | 'R' | 'D' => {
                 // Edited characters
+                has_edited = true;
                 total_digits += count;
                 if has_v && matches!(ch, 'Z' | '*' | '9') {
                     scale += count as i32;
@@ -800,6 +834,10 @@ pub fn parse_picture(pic_string: &str) -> Result<PictureType, String> {
         } else {
             PictureCategory::Alphanumeric
         }
+    } else if has_edited && !has_alpha && !has_x {
+        // Edited characters (Z, *, $, +, -, comma, etc.) with optional 9
+        // indicate a numeric-edited picture.
+        PictureCategory::NumericEdited
     } else if has_alpha && !has_numeric {
         PictureCategory::Alphabetic
     } else if has_numeric && !has_alpha {
@@ -907,6 +945,9 @@ impl<'a> HirLowerer<'a> {
         if let Some(data_div) = ast.data_division() {
             self.lower_data_division(&data_div);
         }
+
+        // Compute group item sizes based on their children
+        self.compute_group_sizes();
 
         // Build file descriptors from SELECT + FD info
         self.build_file_descriptors();
@@ -1076,6 +1117,80 @@ impl<'a> HirLowerer<'a> {
             for item in ls.items() {
                 if let Some(id) = self.lower_data_item(&item) {
                     self.linkage_items.push(id);
+                }
+            }
+        }
+    }
+
+    /// Compute sizes for group items by summing their subordinate elementary items.
+    /// Also accounts for OCCURS by multiplying the element size.
+    fn compute_group_sizes(&mut self) {
+        // Build a list of (level, index_into_data_items, byte_size, occurs_max)
+        // for all working_storage items, then walk to compute group sizes.
+        let ws_ids: Vec<DataItemId> = self.working_storage.clone();
+        if ws_ids.is_empty() {
+            return;
+        }
+
+        // Gather info
+        let items: Vec<(u8, DataItemId, u32, u32)> = ws_ids
+            .iter()
+            .map(|&id| {
+                let it = &self.data_items[id.into_raw()];
+                let occurs = it.occurs.as_ref().map(|o| o.max).unwrap_or(1);
+                (it.level, id, it.storage.byte_size, occurs)
+            })
+            .collect();
+
+        // Walk bottom-up: for each group item (byte_size == 0 and level < 88),
+        // compute its size as the sum of all immediate children's effective sizes.
+        let n = items.len();
+        let mut effective_sizes: Vec<u32> = items.iter().map(|&(_, _, sz, occ)| {
+            if sz > 0 { sz * occ } else { 0 }
+        }).collect();
+
+        // Multiple passes: walk from the end to compute group sizes
+        for _pass in 0..5 {
+            for i in 0..n {
+                let (level, _, sz, occurs) = items[i];
+                if sz > 0 || level >= 88 {
+                    continue; // elementary item or 88-level, skip
+                }
+                // Sum sizes of subordinate items (higher level numbers)
+                let mut group_sum = 0u32;
+                for j in (i + 1)..n {
+                    let (child_level, _, _, _) = items[j];
+                    if child_level <= level {
+                        break; // no longer subordinate
+                    }
+                    // Only count direct children (next level down, skip grandchildren)
+                    // Actually, for correct COBOL layout, we count all items at the
+                    // next subordinate level, which accounts for nested groups.
+                    // But the simplest correct approach: sum only items at the
+                    // immediate child level (skip items nested deeper).
+                    // We need to count direct children only:
+                    let is_direct_child = {
+                        let mut direct = true;
+                        for k in (i + 1)..j {
+                            let (intermediate_level, _, _, _) = items[k];
+                            if intermediate_level <= level {
+                                break;
+                            }
+                            if intermediate_level < child_level {
+                                direct = false; // child_level is nested under an intermediate group
+                                break;
+                            }
+                        }
+                        direct
+                    };
+                    if is_direct_child {
+                        group_sum += effective_sizes[j];
+                    }
+                }
+                if group_sum > 0 {
+                    effective_sizes[i] = group_sum * occurs;
+                    // Update the data item's byte_size
+                    self.data_items[items[i].1.into_raw()].storage.byte_size = group_sum;
                 }
             }
         }
@@ -1395,10 +1510,15 @@ impl<'a> HirLowerer<'a> {
 
     fn lower_value_clause(&mut self, item: &cobol_ast::DataItem) -> Option<InitialValue> {
         let vc = item.value_clause()?;
-        // Walk the value clause tokens to find the literal
+        // Walk the value clause tokens to find the literal.
+        // Track whether a MINUS sign preceded the numeric literal.
+        let mut negate = false;
         for el in vc.syntax().children_with_tokens() {
             if let Some(tok) = el.into_token() {
                 match tok.kind() {
+                    SyntaxKind::MINUS => {
+                        negate = true;
+                    }
                     SyntaxKind::STRING_LITERAL => {
                         let text = tok.text().to_string();
                         // Strip quotes
@@ -1414,7 +1534,8 @@ impl<'a> HirLowerer<'a> {
                     SyntaxKind::INTEGER_LITERAL => {
                         let text = tok.text().to_string();
                         if let Ok(n) = text.parse::<i64>() {
-                            return Some(InitialValue::Numeric(n, 0));
+                            let value = if negate { -n } else { n };
+                            return Some(InitialValue::Numeric(value, 0));
                         }
                     }
                     SyntaxKind::DECIMAL_LITERAL => {
@@ -1423,7 +1544,8 @@ impl<'a> HirLowerer<'a> {
                         if let Some(dot_pos) = text.find('.') {
                             let scale = (text.len() - dot_pos - 1) as i32;
                             if let Ok(n) = text.replace('.', "").parse::<i64>() {
-                                return Some(InitialValue::Numeric(n, scale));
+                                let value = if negate { -n } else { n };
+                                return Some(InitialValue::Numeric(value, scale));
                             }
                         }
                     }
@@ -1764,6 +1886,21 @@ impl<'a> HirLowerer<'a> {
                         stmts.push(s);
                     }
                 }
+                SyntaxKind::INITIALIZE_STMT => {
+                    if let Some(s) = self.lower_initialize_stmt(&child) {
+                        stmts.push(s);
+                    }
+                }
+                SyntaxKind::SEARCH_STMT => {
+                    if let Some(s) = self.lower_search_stmt(&child) {
+                        stmts.push(s);
+                    }
+                }
+                SyntaxKind::SET_STMT => {
+                    if let Some(s) = self.lower_set_stmt(&child) {
+                        stmts.push(s);
+                    }
+                }
                 _ => {
                     // Other statements: not yet implemented
                 }
@@ -1862,28 +1999,90 @@ impl<'a> HirLowerer<'a> {
                     }
                 }
                 _ => {
-                    let name = self.interner.intern(&text.to_ascii_uppercase());
-                    HirExpr::DataRef(Box::new(HirDataRef {
-                        name,
-                        qualifiers: Vec::new(),
-                        subscripts: Vec::new(),
-                        ref_mod: None,
-                        resolved: None,
-                    }))
+                    let upper = text.to_ascii_uppercase();
+                    match upper.as_str() {
+                        "ZERO" | "ZEROS" | "ZEROES" => {
+                            HirExpr::Literal(LiteralValue::Figurative(FigurativeConstant::Zero))
+                        }
+                        "SPACE" | "SPACES" => {
+                            HirExpr::Literal(LiteralValue::Figurative(FigurativeConstant::Space))
+                        }
+                        "HIGH-VALUE" | "HIGH-VALUES" => {
+                            HirExpr::Literal(LiteralValue::Figurative(FigurativeConstant::HighValue))
+                        }
+                        "LOW-VALUE" | "LOW-VALUES" => {
+                            HirExpr::Literal(LiteralValue::Figurative(FigurativeConstant::LowValue))
+                        }
+                        "QUOTE" | "QUOTES" => {
+                            HirExpr::Literal(LiteralValue::Figurative(FigurativeConstant::Quote))
+                        }
+                        _ => {
+                            let name = self.interner.intern(&upper);
+                            // Check for subscripts: look for '(' after the name
+                            let mut subscripts = Vec::new();
+                            let src_start = 2; // token after MOVE and name
+                            if src_start < to_idx && tokens[src_start].1 == "(" {
+                                let mut si = src_start + 1;
+                                while si < to_idx && tokens[si].1 != ")" {
+                                    let (sub_kind, ref sub_text) = tokens[si];
+                                    if sub_text != "," {
+                                        let sub_expr = self.token_to_expr(sub_kind, sub_text);
+                                        subscripts.push(sub_expr);
+                                    }
+                                    si += 1;
+                                }
+                            }
+                            HirExpr::DataRef(Box::new(HirDataRef {
+                                name,
+                                qualifiers: Vec::new(),
+                                subscripts,
+                                ref_mod: None,
+                                resolved: None,
+                            }))
+                        }
+                    }
                 }
             }
         } else {
             return None;
         };
 
-        // Targets are after TO
+        // Targets are after TO — parse with subscripts
         let mut targets = Vec::new();
-        for (_, text) in &tokens[to_idx + 1..] {
-            let name = self.interner.intern(&text.to_ascii_uppercase());
+        let target_tokens = &tokens[to_idx + 1..];
+        let mut t = 0;
+        while t < target_tokens.len() {
+            let (kind, ref text) = target_tokens[t];
+            // Skip parentheses, commas, and period tokens that aren't part of a name
+            if text == "(" || text == ")" || text == "," || kind == SyntaxKind::PERIOD {
+                t += 1;
+                continue;
+            }
+            // This should be a data name
+            let upper = text.to_ascii_uppercase();
+            let name = self.interner.intern(&upper);
+            let mut subscripts = Vec::new();
+            // Check if next token is '(' for subscripts
+            if t + 1 < target_tokens.len() && target_tokens[t + 1].1 == "(" {
+                t += 2; // skip name and '('
+                while t < target_tokens.len() && target_tokens[t].1 != ")" {
+                    let (sub_kind, ref sub_text) = target_tokens[t];
+                    if sub_text != "," {
+                        let sub_expr = self.token_to_expr(sub_kind, sub_text);
+                        subscripts.push(sub_expr);
+                    }
+                    t += 1;
+                }
+                if t < target_tokens.len() && target_tokens[t].1 == ")" {
+                    t += 1; // skip ')'
+                }
+            } else {
+                t += 1;
+            }
             targets.push(HirDataRef {
                 name,
                 qualifiers: Vec::new(),
-                subscripts: Vec::new(),
+                subscripts,
                 ref_mod: None,
                 resolved: None,
             });
@@ -1893,6 +2092,49 @@ impl<'a> HirLowerer<'a> {
             from: source,
             to: targets,
         })
+    }
+
+    fn lower_initialize_stmt(&mut self, node: &cobol_ast::SyntaxNode) -> Option<HirStatement> {
+        let mut tokens: Vec<(SyntaxKind, String)> = Vec::new();
+        for el in node.children_with_tokens() {
+            if let Some(tok) = el.into_token() {
+                let kind = tok.kind();
+                if kind == SyntaxKind::WHITESPACE || kind == SyntaxKind::NEWLINE {
+                    continue;
+                }
+                tokens.push((kind, tok.text().to_string()));
+            }
+        }
+
+        // tokens[0] is INITIALIZE keyword, remaining are target identifiers
+        // (ignoring REPLACING clause for now - basic form only)
+        let mut targets = Vec::new();
+        let mut i = 1; // skip INITIALIZE keyword
+        while i < tokens.len() {
+            let (kind, ref text) = tokens[i];
+            let upper = text.to_ascii_uppercase();
+            // Stop if we hit REPLACING keyword (not yet supported)
+            if upper == "REPLACING" {
+                break;
+            }
+            if kind == SyntaxKind::WORD || kind == SyntaxKind::KEYWORD {
+                let name = self.interner.intern(&upper);
+                targets.push(HirDataRef {
+                    name,
+                    qualifiers: Vec::new(),
+                    subscripts: Vec::new(),
+                    ref_mod: None,
+                    resolved: None,
+                });
+            }
+            i += 1;
+        }
+
+        if targets.is_empty() {
+            return None;
+        }
+
+        Some(HirStatement::Initialize { targets })
     }
 
     /// Helper: collect non-whitespace tokens from a CST node.
@@ -1958,10 +2200,19 @@ impl<'a> HirLowerer<'a> {
                 let upper = text.to_ascii_uppercase();
                 match upper.as_str() {
                     "ZERO" | "ZEROS" | "ZEROES" => {
-                        HirExpr::Literal(LiteralValue::Integer(0))
+                        HirExpr::Literal(LiteralValue::Figurative(FigurativeConstant::Zero))
                     }
                     "SPACE" | "SPACES" => {
-                        HirExpr::Literal(LiteralValue::String_(" ".to_string()))
+                        HirExpr::Literal(LiteralValue::Figurative(FigurativeConstant::Space))
+                    }
+                    "HIGH-VALUE" | "HIGH-VALUES" => {
+                        HirExpr::Literal(LiteralValue::Figurative(FigurativeConstant::HighValue))
+                    }
+                    "LOW-VALUE" | "LOW-VALUES" => {
+                        HirExpr::Literal(LiteralValue::Figurative(FigurativeConstant::LowValue))
+                    }
+                    "QUOTE" | "QUOTES" => {
+                        HirExpr::Literal(LiteralValue::Figurative(FigurativeConstant::Quote))
                     }
                     _ => {
                         let name = self.interner.intern(&upper);
@@ -3133,6 +3384,10 @@ impl<'a> HirLowerer<'a> {
         }
 
         // Parse subject expression
+        let is_evaluate_true = subject_tokens.len() == 1
+            && subject_tokens[0].1.eq_ignore_ascii_case("TRUE");
+        let is_evaluate_false = subject_tokens.len() == 1
+            && subject_tokens[0].1.eq_ignore_ascii_case("FALSE");
         let subject = if subject_tokens.len() >= 1 {
             self.token_to_expr(subject_tokens[0].0, &subject_tokens[0].1)
         } else {
@@ -3148,6 +3403,7 @@ impl<'a> HirLowerer<'a> {
         let mut seen_evaluate = false;
         let mut past_subject = false;
         let mut need_condition_value = false;
+        let mut in_when_cond_tokens: Option<Vec<(SyntaxKind, String)>> = None;
 
         for el in node.children_with_tokens() {
             if let Some(tok) = el.as_token() {
@@ -3167,6 +3423,26 @@ impl<'a> HirLowerer<'a> {
                     break;
                 }
                 if text_upper == "WHEN" {
+                    // Flush any pending EVALUATE TRUE/FALSE condition tokens
+                    if let Some(cond_toks) = in_when_cond_tokens.take() {
+                        if !cond_toks.is_empty() {
+                            if let Some(cond_expr) = self.parse_condition_tokens(&cond_toks) {
+                                let final_cond = if is_evaluate_false {
+                                    HirExpr::Condition(Box::new(HirCondition::Not(
+                                        Box::new(match cond_expr {
+                                            HirExpr::Condition(c) => *c,
+                                            _ => HirCondition::Comparison {
+                                                left: cond_expr, op: BinaryOp::Ne, right: HirExpr::Literal(LiteralValue::Integer(0)),
+                                            },
+                                        })
+                                    )))
+                                } else {
+                                    cond_expr
+                                };
+                                current_conditions.push(final_cond);
+                            }
+                        }
+                    }
                     // Save previous WHEN clause if any
                     if in_when {
                         whens.push(WhenClause {
@@ -3180,11 +3456,25 @@ impl<'a> HirLowerer<'a> {
                     continue;
                 }
                 if need_condition_value {
-                    need_condition_value = false;
                     if text_upper == "OTHER" {
+                        need_condition_value = false;
                         // WHEN OTHER: empty conditions vector signals default
                         continue;
                     }
+                    if is_evaluate_true || is_evaluate_false {
+                        // EVALUATE TRUE/FALSE: collect all tokens until
+                        // the next statement node, then parse as condition.
+                        // We accumulate condition tokens into a buffer and
+                        // defer parsing until we see the first statement node.
+                        if !in_when_cond_tokens.is_some() {
+                            in_when_cond_tokens = Some(Vec::new());
+                        }
+                        if let Some(ref mut cond_toks) = in_when_cond_tokens {
+                            cond_toks.push((kind, tok.text().to_string()));
+                        }
+                        continue;
+                    }
+                    need_condition_value = false;
                     // This is the WHEN value — build an equality comparison
                     let cond_expr = self.token_to_expr(kind, tok.text());
                     current_conditions.push(HirExpr::Condition(Box::new(
@@ -3206,6 +3496,27 @@ impl<'a> HirLowerer<'a> {
                     // Could be part of subject; skip
                     continue;
                 }
+                // Flush any pending EVALUATE TRUE/FALSE condition tokens
+                if let Some(cond_toks) = in_when_cond_tokens.take() {
+                    if !cond_toks.is_empty() {
+                        if let Some(cond_expr) = self.parse_condition_tokens(&cond_toks) {
+                            let final_cond = if is_evaluate_false {
+                                HirExpr::Condition(Box::new(HirCondition::Not(
+                                    Box::new(match cond_expr {
+                                        HirExpr::Condition(c) => *c,
+                                        _ => HirCondition::Comparison {
+                                            left: cond_expr, op: BinaryOp::Ne, right: HirExpr::Literal(LiteralValue::Integer(0)),
+                                        },
+                                    })
+                                )))
+                            } else {
+                                cond_expr
+                            };
+                            current_conditions.push(final_cond);
+                        }
+                        need_condition_value = false;
+                    }
+                }
                 if in_when {
                     let mut child_stmts = Vec::new();
                     self.lower_child_statement(&child, &mut child_stmts);
@@ -3214,6 +3525,26 @@ impl<'a> HirLowerer<'a> {
             }
         }
 
+        // Flush any pending EVALUATE TRUE/FALSE condition tokens
+        if let Some(cond_toks) = in_when_cond_tokens.take() {
+            if !cond_toks.is_empty() {
+                if let Some(cond_expr) = self.parse_condition_tokens(&cond_toks) {
+                    let final_cond = if is_evaluate_false {
+                        HirExpr::Condition(Box::new(HirCondition::Not(
+                            Box::new(match cond_expr {
+                                HirExpr::Condition(c) => *c,
+                                _ => HirCondition::Comparison {
+                                    left: cond_expr, op: BinaryOp::Ne, right: HirExpr::Literal(LiteralValue::Integer(0)),
+                                },
+                            })
+                        )))
+                    } else {
+                        cond_expr
+                    };
+                    current_conditions.push(final_cond);
+                }
+            }
+        }
         // Push the last WHEN clause
         if in_when {
             whens.push(WhenClause {
@@ -3223,6 +3554,201 @@ impl<'a> HirLowerer<'a> {
         }
 
         Some(HirStatement::Evaluate { subject, whens })
+    }
+
+    fn lower_search_stmt(&mut self, node: &cobol_ast::SyntaxNode) -> Option<HirStatement> {
+        // SEARCH table-name AT END stmts... WHEN condition stmts... END-SEARCH
+        let tokens = self.collect_all_tokens(node);
+        if tokens.is_empty() {
+            return None;
+        }
+
+        let mut idx = 0;
+        // Skip "SEARCH" keyword
+        if idx < tokens.len() && tokens[idx].1.to_ascii_uppercase() == "SEARCH" {
+            idx += 1;
+        }
+
+        // Get the table name
+        if idx >= tokens.len() {
+            return None;
+        }
+        let table_name_str = tokens[idx].1.to_ascii_uppercase();
+        let table_ref = self.make_data_ref(&table_name_str);
+
+        // Walk CST children to build AT END / WHEN clauses with proper statement bodies
+        let mut at_end_stmts: Vec<HirStatement> = Vec::new();
+        let mut search_whens: Vec<SearchWhen> = Vec::new();
+        let mut in_at_end = false;
+        let mut in_when = false;
+        let mut current_when_cond: Option<HirExpr> = None;
+        let mut current_when_stmts: Vec<HirStatement> = Vec::new();
+        let mut seen_search = false;
+        let mut seen_table = false;
+        let mut collecting_condition = false;
+        let mut condition_tokens: Vec<(SyntaxKind, String)> = Vec::new();
+
+        for el in node.children_with_tokens() {
+            if let Some(tok) = el.as_token() {
+                let kind = tok.kind();
+                if kind == SyntaxKind::WHITESPACE || kind == SyntaxKind::NEWLINE
+                    || kind == SyntaxKind::COMMENT || kind == SyntaxKind::PERIOD
+                {
+                    continue;
+                }
+                let text_upper = tok.text().to_ascii_uppercase();
+
+                if !seen_search && text_upper == "SEARCH" {
+                    seen_search = true;
+                    continue;
+                }
+                if seen_search && !seen_table {
+                    seen_table = true;
+                    continue;
+                }
+                if text_upper == "END-SEARCH" {
+                    break;
+                }
+                if text_upper == "AT" {
+                    if in_when {
+                        if let Some(cond) = current_when_cond.take() {
+                            search_whens.push(SearchWhen {
+                                condition: cond,
+                                body: std::mem::take(&mut current_when_stmts),
+                            });
+                        }
+                        in_when = false;
+                    }
+                    in_at_end = true;
+                    continue;
+                }
+                if text_upper == "END" && in_at_end {
+                    continue;
+                }
+                if text_upper == "WHEN" {
+                    if in_when {
+                        if let Some(cond) = current_when_cond.take() {
+                            search_whens.push(SearchWhen {
+                                condition: cond,
+                                body: std::mem::take(&mut current_when_stmts),
+                            });
+                        }
+                    }
+                    in_at_end = false;
+                    in_when = true;
+                    collecting_condition = true;
+                    condition_tokens.clear();
+                    continue;
+                }
+                if collecting_condition {
+                    condition_tokens.push((kind, tok.text().to_string()));
+                    continue;
+                }
+            } else if let Some(child) = el.as_node() {
+                if !seen_table {
+                    continue;
+                }
+                if collecting_condition && !condition_tokens.is_empty() {
+                    current_when_cond = self.parse_condition_tokens(&condition_tokens);
+                    condition_tokens.clear();
+                    collecting_condition = false;
+                }
+                if in_at_end {
+                    let mut child_stmts = Vec::new();
+                    self.lower_child_statement(&child, &mut child_stmts);
+                    at_end_stmts.extend(child_stmts);
+                } else if in_when {
+                    let mut child_stmts = Vec::new();
+                    self.lower_child_statement(&child, &mut child_stmts);
+                    current_when_stmts.extend(child_stmts);
+                }
+            }
+        }
+
+        // Push the last WHEN clause
+        if in_when {
+            if collecting_condition && !condition_tokens.is_empty() {
+                current_when_cond = self.parse_condition_tokens(&condition_tokens);
+            }
+            if let Some(cond) = current_when_cond.take() {
+                search_whens.push(SearchWhen {
+                    condition: cond,
+                    body: std::mem::take(&mut current_when_stmts),
+                });
+            }
+        }
+
+        Some(HirStatement::Search {
+            table: table_ref,
+            at_end: at_end_stmts,
+            whens: search_whens,
+        })
+    }
+
+    fn lower_set_stmt(&mut self, node: &cobol_ast::SyntaxNode) -> Option<HirStatement> {
+        let tokens = self.collect_all_tokens(node);
+        if tokens.len() < 3 {
+            return None;
+        }
+
+        let mut idx = 0;
+        if idx < tokens.len() && tokens[idx].1.to_ascii_uppercase() == "SET" {
+            idx += 1;
+        }
+
+        if idx >= tokens.len() {
+            return None;
+        }
+        let target = self.make_data_ref(&tokens[idx].1);
+        idx += 1;
+
+        if idx >= tokens.len() {
+            return None;
+        }
+
+        let action_word = tokens[idx].1.to_ascii_uppercase();
+        match action_word.as_str() {
+            "TO" => {
+                idx += 1;
+                if idx >= tokens.len() {
+                    return None;
+                }
+                let value = self.token_to_expr(tokens[idx].0, &tokens[idx].1);
+                Some(HirStatement::Set {
+                    target,
+                    action: SetAction::To(value),
+                })
+            }
+            "UP" => {
+                idx += 1;
+                if idx < tokens.len() && tokens[idx].1.eq_ignore_ascii_case("BY") {
+                    idx += 1;
+                }
+                if idx >= tokens.len() {
+                    return None;
+                }
+                let value = self.token_to_expr(tokens[idx].0, &tokens[idx].1);
+                Some(HirStatement::Set {
+                    target,
+                    action: SetAction::UpBy(value),
+                })
+            }
+            "DOWN" => {
+                idx += 1;
+                if idx < tokens.len() && tokens[idx].1.eq_ignore_ascii_case("BY") {
+                    idx += 1;
+                }
+                if idx >= tokens.len() {
+                    return None;
+                }
+                let value = self.token_to_expr(tokens[idx].0, &tokens[idx].1);
+                Some(HirStatement::Set {
+                    target,
+                    action: SetAction::DownBy(value),
+                })
+            }
+            _ => None,
+        }
     }
 
     fn lower_child_statement(
@@ -3293,6 +3819,15 @@ impl<'a> HirLowerer<'a> {
             SyntaxKind::UNSTRING_STMT => {
                 if let Some(s) = self.lower_unstring_stmt(node) { stmts.push(s); }
             }
+            SyntaxKind::INITIALIZE_STMT => {
+                if let Some(s) = self.lower_initialize_stmt(node) { stmts.push(s); }
+            }
+            SyntaxKind::SEARCH_STMT => {
+                if let Some(s) = self.lower_search_stmt(node) { stmts.push(s); }
+            }
+            SyntaxKind::SET_STMT => {
+                if let Some(s) = self.lower_set_stmt(node) { stmts.push(s); }
+            }
             SyntaxKind::SENTENCE => {
                 // Sentence wrapping statements
                 for child in node.children() {
@@ -3304,9 +3839,125 @@ impl<'a> HirLowerer<'a> {
     }
 
     fn parse_condition_tokens(&mut self, tokens: &[(SyntaxKind, String)]) -> Option<HirExpr> {
-        // Simple condition: expr OP expr
-        // e.g., WS-SUM = 55, WS-I > 10, WS-RECORD(1:13) = "HELLO FILE IO"
+        // Handle compound conditions with AND/OR by splitting at logical operators.
+        // Precedence: AND binds tighter than OR.
+
         if tokens.len() < 3 {
+            // Check for single-token condition name (level 88)
+            if tokens.len() == 1 {
+                let name = self.interner.intern(&tokens[0].1.to_ascii_uppercase());
+                return Some(HirExpr::Condition(Box::new(HirCondition::ConditionName(HirDataRef {
+                    name,
+                    qualifiers: Vec::new(),
+                    subscripts: Vec::new(),
+                    ref_mod: None,
+                    resolved: None,
+                }))));
+            }
+            return None;
+        }
+
+        // Split at OR (lowest precedence) respecting parentheses
+        let or_parts = self.split_condition_at_keyword(tokens, "OR");
+        if or_parts.len() > 1 {
+            let mut result: Option<HirExpr> = None;
+            for part in &or_parts {
+                if let Some(cond) = self.parse_condition_tokens(part) {
+                    result = Some(match result {
+                        None => cond,
+                        Some(left) => {
+                            let left_cond = self.expr_to_condition(left);
+                            let right_cond = self.expr_to_condition(cond);
+                            HirExpr::Condition(Box::new(HirCondition::Or(
+                                Box::new(left_cond),
+                                Box::new(right_cond),
+                            )))
+                        }
+                    });
+                }
+            }
+            return result;
+        }
+
+        // Split at AND (higher precedence than OR)
+        let and_parts = self.split_condition_at_keyword(tokens, "AND");
+        if and_parts.len() > 1 {
+            let mut result: Option<HirExpr> = None;
+            for part in &and_parts {
+                if let Some(cond) = self.parse_condition_tokens(part) {
+                    result = Some(match result {
+                        None => cond,
+                        Some(left) => {
+                            let left_cond = self.expr_to_condition(left);
+                            let right_cond = self.expr_to_condition(cond);
+                            HirExpr::Condition(Box::new(HirCondition::And(
+                                Box::new(left_cond),
+                                Box::new(right_cond),
+                            )))
+                        }
+                    });
+                }
+            }
+            return result;
+        }
+
+        // No AND/OR: parse as simple comparison
+        self.parse_simple_condition(tokens)
+    }
+
+    /// Split a condition token stream at a logical keyword (AND/OR),
+    /// respecting parentheses.
+    fn split_condition_at_keyword<'b>(
+        &self,
+        tokens: &'b [(SyntaxKind, String)],
+        keyword: &str,
+    ) -> Vec<&'b [(SyntaxKind, String)]> {
+        let mut parts = Vec::new();
+        let mut start = 0;
+        let mut paren_depth = 0;
+        for (i, (_, t)) in tokens.iter().enumerate() {
+            if t == "(" { paren_depth += 1; }
+            if t == ")" { paren_depth -= 1; }
+            if paren_depth == 0 && t.eq_ignore_ascii_case(keyword) {
+                if i > start {
+                    parts.push(&tokens[start..i]);
+                }
+                start = i + 1;
+            }
+        }
+        if start < tokens.len() {
+            parts.push(&tokens[start..]);
+        }
+        parts
+    }
+
+    /// Convert an HirExpr to HirCondition (extract from Condition wrapper
+    /// or wrap a comparison).
+    fn expr_to_condition(&self, expr: HirExpr) -> HirCondition {
+        match expr {
+            HirExpr::Condition(c) => *c,
+            other => HirCondition::Comparison {
+                left: other,
+                op: BinaryOp::Ne,
+                right: HirExpr::Literal(LiteralValue::Integer(0)),
+            },
+        }
+    }
+
+    /// Parse a simple condition (no AND/OR): expr OP expr
+    fn parse_simple_condition(&mut self, tokens: &[(SyntaxKind, String)]) -> Option<HirExpr> {
+        if tokens.len() < 3 {
+            // Single-token condition name
+            if tokens.len() == 1 {
+                let name = self.interner.intern(&tokens[0].1.to_ascii_uppercase());
+                return Some(HirExpr::Condition(Box::new(HirCondition::ConditionName(HirDataRef {
+                    name,
+                    qualifiers: Vec::new(),
+                    subscripts: Vec::new(),
+                    ref_mod: None,
+                    resolved: None,
+                }))));
+            }
             return None;
         }
 
@@ -3329,29 +3980,26 @@ impl<'a> HirLowerer<'a> {
         let op_idx = op_idx?;
 
         // Build left-side expression from tokens[0..op_idx]
-        // Check for reference modification: NAME(offset:length)
-        let left = if op_idx >= 6
+        // Check for subscript or reference modification: NAME(subscript) or NAME(offset:length)
+        let left = if op_idx >= 4
             && tokens[1].1 == "("
             && tokens[op_idx - 1].1 == ")"
         {
-            // Check if there's a colon inside => reference modification
-            let has_colon = tokens[2..op_idx - 1].iter().any(|(_, t)| t == ":");
+            let inner_tokens = &tokens[2..op_idx - 1];
+            let has_colon = inner_tokens.iter().any(|(_, t)| t == ":");
             if has_colon {
+                // Reference modification: NAME(offset:length)
                 let name = self.interner.intern(&tokens[0].1.to_ascii_uppercase());
-                // Find colon position
-                let colon_pos = tokens[2..op_idx - 1].iter()
+                let colon_pos = inner_tokens.iter()
                     .position(|(_, t)| t == ":")
-                    .map(|p| p + 2)
                     .unwrap();
-                // offset is tokens from index 2 to colon_pos
-                let offset_expr = if colon_pos > 2 {
-                    self.token_to_expr(tokens[2].0, &tokens[2].1)
+                let offset_expr = if colon_pos > 0 {
+                    self.token_to_expr(inner_tokens[0].0, &inner_tokens[0].1)
                 } else {
                     HirExpr::Literal(LiteralValue::Integer(1))
                 };
-                // length is tokens from colon_pos+1 to op_idx-1
-                let length_expr = if colon_pos + 1 < op_idx - 1 {
-                    Some(Box::new(self.token_to_expr(tokens[colon_pos + 1].0, &tokens[colon_pos + 1].1)))
+                let length_expr = if colon_pos + 1 < inner_tokens.len() {
+                    Some(Box::new(self.token_to_expr(inner_tokens[colon_pos + 1].0, &inner_tokens[colon_pos + 1].1)))
                 } else {
                     None
                 };
@@ -3363,7 +4011,20 @@ impl<'a> HirLowerer<'a> {
                     resolved: None,
                 }))
             } else {
-                self.token_to_expr(tokens[0].0, &tokens[0].1)
+                // Subscript: NAME(subscript-expr)
+                let name = self.interner.intern(&tokens[0].1.to_ascii_uppercase());
+                let subscript = if inner_tokens.len() == 1 {
+                    self.token_to_expr(inner_tokens[0].0, &inner_tokens[0].1)
+                } else {
+                    self.token_to_expr(inner_tokens[0].0, &inner_tokens[0].1)
+                };
+                HirExpr::DataRef(Box::new(HirDataRef {
+                    name,
+                    qualifiers: Vec::new(),
+                    subscripts: vec![subscript],
+                    ref_mod: None,
+                    resolved: None,
+                }))
             }
         } else {
             self.token_to_expr(tokens[0].0, &tokens[0].1)
