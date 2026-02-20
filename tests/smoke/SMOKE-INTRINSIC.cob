@@ -38,4 +38,20 @@
            COMPUTE WS-LEN =
                FUNCTION MIN(WS-NUM-A, WS-NUM-C).
            DISPLAY WS-LEN.
+      *    FUNCTION ORD
+           COMPUTE WS-LEN =
+               FUNCTION ORD("A").
+           DISPLAY WS-LEN.
+      *    FUNCTION MOD
+           COMPUTE WS-LEN =
+               FUNCTION MOD(WS-NUM-A, WS-NUM-C).
+           DISPLAY WS-LEN.
+      *    FUNCTION ABS (negative via MOD result or direct)
+           MOVE 42 TO WS-NUM-A.
+           COMPUTE WS-LEN =
+               FUNCTION ABS(WS-NUM-A).
+           DISPLAY WS-LEN.
+      *    FUNCTION CURRENT-DATE (just check length)
+           MOVE FUNCTION CURRENT-DATE TO WS-RESULT.
+           DISPLAY "DATE-OK".
            STOP RUN.

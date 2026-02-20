@@ -6703,6 +6703,241 @@ impl<'a> MirLowerer<'a> {
 
                 Some((best_addr, best_size))
             }
+            "ORD" => {
+                // FUNCTION ORD(char) returns ordinal position (1-based).
+                // cobolrt_ord returns a display-format string pointer.
+                if let Some(arg) = args.first() {
+                    let (src_addr, src_size) = match arg {
+                        cobol_hir::HirExpr::DataRef(_) => {
+                            self.emit_expr_addr(arg, func, instructions)?
+                        }
+                        cobol_hir::HirExpr::Literal(cobol_hir::LiteralValue::String_(s)) => {
+                            let str_val = func.new_value();
+                            instructions.push(MirInst::Const {
+                                dest: str_val,
+                                value: MirConst::Str(s.clone()),
+                            });
+                            (str_val, s.len() as u32)
+                        }
+                        _ => return None,
+                    };
+                    let src_len_val = func.new_value();
+                    instructions.push(MirInst::Const {
+                        dest: src_len_val,
+                        value: MirConst::Int(src_size as i64),
+                    });
+                    let result_size = 3u32; // 3 digits for 0-256
+                    let dest_len = func.new_value();
+                    instructions.push(MirInst::Const {
+                        dest: dest_len,
+                        value: MirConst::Int(result_size as i64),
+                    });
+                    let result_addr = func.new_value();
+                    instructions.push(MirInst::CallRuntime {
+                        dest: Some(result_addr),
+                        func: "cobolrt_ord".to_string(),
+                        args: vec![src_addr, src_len_val, dest_len],
+                    });
+                    Some((result_addr, result_size))
+                } else {
+                    None
+                }
+            }
+            "CHAR" => {
+                // FUNCTION CHAR(n) returns the character at ordinal position n.
+                // Argument is numeric; result is a 1-byte string.
+                if let Some(arg) = args.first() {
+                    let (src_addr, src_size) =
+                        self.emit_arithmetic_expr(arg, func, instructions)?;
+                    // Convert display-format to integer, then call cobolrt_char
+                    let src_len_val = func.new_value();
+                    instructions.push(MirInst::Const {
+                        dest: src_len_val,
+                        value: MirConst::Int(src_size as i64),
+                    });
+                    let int_val = func.new_value();
+                    instructions.push(MirInst::CallRuntime {
+                        dest: Some(int_val),
+                        func: "cobolrt_display_to_int".to_string(),
+                        args: vec![src_addr, src_len_val],
+                    });
+                    let result_addr = func.new_value();
+                    instructions.push(MirInst::CallRuntime {
+                        dest: Some(result_addr),
+                        func: "cobolrt_char".to_string(),
+                        args: vec![int_val],
+                    });
+                    Some((result_addr, 1))
+                } else {
+                    None
+                }
+            }
+            "MOD" | "REM" => {
+                // FUNCTION MOD(a, b) / FUNCTION REM(a, b)
+                if args.len() >= 2 {
+                    let (a_addr, a_size) =
+                        self.emit_arithmetic_expr(&args[0], func, instructions)?;
+                    let (b_addr, b_size) =
+                        self.emit_arithmetic_expr(&args[1], func, instructions)?;
+                    let a_len = func.new_value();
+                    instructions.push(MirInst::Const {
+                        dest: a_len,
+                        value: MirConst::Int(a_size as i64),
+                    });
+                    let b_len = func.new_value();
+                    instructions.push(MirInst::Const {
+                        dest: b_len,
+                        value: MirConst::Int(b_size as i64),
+                    });
+                    let rt_func = if func_name == "MOD" {
+                        "cobolrt_mod"
+                    } else {
+                        "cobolrt_rem"
+                    };
+                    let result_addr = func.new_value();
+                    instructions.push(MirInst::CallRuntime {
+                        dest: Some(result_addr),
+                        func: rt_func.to_string(),
+                        args: vec![a_addr, a_len, b_addr, b_len],
+                    });
+                    Some((result_addr, a_size))
+                } else {
+                    None
+                }
+            }
+            "ABS" => {
+                // FUNCTION ABS(n) returns absolute value
+                if let Some(arg) = args.first() {
+                    let (src_addr, src_size) =
+                        self.emit_arithmetic_expr(arg, func, instructions)?;
+                    let src_len = func.new_value();
+                    instructions.push(MirInst::Const {
+                        dest: src_len,
+                        value: MirConst::Int(src_size as i64),
+                    });
+                    let result_addr = func.new_value();
+                    instructions.push(MirInst::CallRuntime {
+                        dest: Some(result_addr),
+                        func: "cobolrt_abs".to_string(),
+                        args: vec![src_addr, src_len],
+                    });
+                    Some((result_addr, src_size))
+                } else {
+                    None
+                }
+            }
+            "SIGN" => {
+                // FUNCTION SIGN(n) returns +1, 0, or -1
+                if let Some(arg) = args.first() {
+                    let (src_addr, src_size) =
+                        self.emit_arithmetic_expr(arg, func, instructions)?;
+                    let src_len = func.new_value();
+                    instructions.push(MirInst::Const {
+                        dest: src_len,
+                        value: MirConst::Int(src_size as i64),
+                    });
+                    let result_size = src_size.max(2); // need room for sign
+                    let dest_len = func.new_value();
+                    instructions.push(MirInst::Const {
+                        dest: dest_len,
+                        value: MirConst::Int(result_size as i64),
+                    });
+                    let result_addr = func.new_value();
+                    instructions.push(MirInst::CallRuntime {
+                        dest: Some(result_addr),
+                        func: "cobolrt_sign".to_string(),
+                        args: vec![src_addr, src_len, dest_len],
+                    });
+                    Some((result_addr, result_size))
+                } else {
+                    None
+                }
+            }
+            "INTEGER" | "INTEGER-PART" => {
+                // For integer display values these are identity.
+                if let Some(arg) = args.first() {
+                    let (src_addr, src_size) =
+                        self.emit_arithmetic_expr(arg, func, instructions)?;
+                    let src_len = func.new_value();
+                    instructions.push(MirInst::Const {
+                        dest: src_len,
+                        value: MirConst::Int(src_size as i64),
+                    });
+                    let rt = if func_name == "INTEGER" {
+                        "cobolrt_integer"
+                    } else {
+                        "cobolrt_integer_part"
+                    };
+                    let result_addr = func.new_value();
+                    instructions.push(MirInst::CallRuntime {
+                        dest: Some(result_addr),
+                        func: rt.to_string(),
+                        args: vec![src_addr, src_len],
+                    });
+                    Some((result_addr, src_size))
+                } else {
+                    None
+                }
+            }
+            "NUMVAL" => {
+                // FUNCTION NUMVAL(string) converts alphanumeric to numeric
+                if let Some(arg) = args.first() {
+                    let (src_addr, src_size) = match arg {
+                        cobol_hir::HirExpr::DataRef(_) => {
+                            self.emit_expr_addr(arg, func, instructions)?
+                        }
+                        cobol_hir::HirExpr::Literal(cobol_hir::LiteralValue::String_(s)) => {
+                            let str_val = func.new_value();
+                            instructions.push(MirInst::Const {
+                                dest: str_val,
+                                value: MirConst::Str(s.clone()),
+                            });
+                            (str_val, s.len() as u32)
+                        }
+                        _ => return None,
+                    };
+                    let src_len_val = func.new_value();
+                    instructions.push(MirInst::Const {
+                        dest: src_len_val,
+                        value: MirConst::Int(src_size as i64),
+                    });
+                    let result_size = 18u32; // enough for most COBOL numerics
+                    let dest_len = func.new_value();
+                    instructions.push(MirInst::Const {
+                        dest: dest_len,
+                        value: MirConst::Int(result_size as i64),
+                    });
+                    let result_addr = func.new_value();
+                    instructions.push(MirInst::CallRuntime {
+                        dest: Some(result_addr),
+                        func: "cobolrt_numval".to_string(),
+                        args: vec![src_addr, src_len_val, dest_len],
+                    });
+                    Some((result_addr, result_size))
+                } else {
+                    None
+                }
+            }
+            "CURRENT-DATE" => {
+                // FUNCTION CURRENT-DATE returns a 21-character date string
+                let result_addr = func.new_value();
+                instructions.push(MirInst::CallRuntime {
+                    dest: Some(result_addr),
+                    func: "cobolrt_current_date".to_string(),
+                    args: vec![],
+                });
+                Some((result_addr, 21))
+            }
+            "WHEN-COMPILED" => {
+                // FUNCTION WHEN-COMPILED returns a 21-character timestamp
+                let result_addr = func.new_value();
+                instructions.push(MirInst::CallRuntime {
+                    dest: Some(result_addr),
+                    func: "cobolrt_when_compiled".to_string(),
+                    args: vec![],
+                });
+                Some((result_addr, 21))
+            }
             _ => {
                 // Unknown function -- return None
                 None

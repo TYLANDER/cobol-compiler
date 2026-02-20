@@ -2061,6 +2061,246 @@ char* cobolrt_min_numeric(
     return (char*)a;
 }
 
+/* FUNCTION ORD: return ordinal position of the first character (1-based).
+ * In COBOL, ORD('A') returns 66 (ASCII 65 + 1).
+ * Returns a display-format string in the intrinsic temp buffer. */
+char* cobolrt_ord(const char *src, unsigned int src_len, unsigned int dest_len) {
+    int ordinal = 1;
+    if (src_len > 0) ordinal = (unsigned char)src[0] + 1;
+    int_to_display_ex((long long)ordinal, _intrinsic_temp, dest_len, 0);
+    return _intrinsic_temp;
+}
+
+/* FUNCTION CHAR: return the character at ordinal position n (1-based).
+ * CHAR(66) returns 'A' (ordinal 66 - 1 = ASCII 65). */
+char* cobolrt_char(int ordinal) {
+    _intrinsic_temp[0] = (char)(ordinal - 1);
+    _intrinsic_temp[1] = '\0';
+    return _intrinsic_temp;
+}
+
+/* FUNCTION MOD: modulo function.
+ * MOD(a, b) = a - (b * FUNCTION INTEGER(a / b))
+ * Result has the same sign as b. */
+char* cobolrt_mod(const char *a, unsigned int a_len,
+                  const char *b, unsigned int b_len) {
+    long long va = display_to_int(a, a_len);
+    long long vb = display_to_int(b, b_len);
+    if (vb == 0) {
+        /* Division by zero — return 0 */
+        memset(_intrinsic_temp, '0', a_len);
+        return _intrinsic_temp;
+    }
+    /* COBOL MOD: a - b * floor(a/b) */
+    long long q = va / vb;
+    if ((va % vb != 0) && ((va ^ vb) < 0)) q--; /* floor toward negative infinity */
+    long long result = va - vb * q;
+    int_to_display_ex(result, _intrinsic_temp, a_len, 1);
+    return _intrinsic_temp;
+}
+
+/* FUNCTION REM: remainder function.
+ * REM(a, b) = a - (b * FUNCTION INTEGER-PART(a / b))
+ * Result has the same sign as a. */
+char* cobolrt_rem(const char *a, unsigned int a_len,
+                  const char *b, unsigned int b_len) {
+    long long va = display_to_int(a, a_len);
+    long long vb = display_to_int(b, b_len);
+    if (vb == 0) {
+        memset(_intrinsic_temp, '0', a_len);
+        return _intrinsic_temp;
+    }
+    long long result = va % vb; /* C remainder has sign of dividend */
+    int_to_display_ex(result, _intrinsic_temp, a_len, 1);
+    return _intrinsic_temp;
+}
+
+/* FUNCTION NUMVAL: convert alphanumeric string to numeric value.
+ * Handles leading/trailing spaces, optional sign, decimal point. */
+char* cobolrt_numval(const char *src, unsigned int src_len, unsigned int dest_len) {
+    /* Skip leading spaces */
+    int i = 0;
+    while (i < (int)src_len && src[i] == ' ') i++;
+    /* Check for sign */
+    int negative = 0;
+    if (i < (int)src_len && (src[i] == '-' || src[i] == '+')) {
+        if (src[i] == '-') negative = 1;
+        i++;
+    }
+    /* Parse integer and fractional parts */
+    long long int_part = 0;
+    long long frac_part = 0;
+    int frac_digits = 0;
+    int saw_decimal = 0;
+    while (i < (int)src_len && src[i] != ' ') {
+        if (src[i] == '.') {
+            saw_decimal = 1;
+        } else if (src[i] >= '0' && src[i] <= '9') {
+            if (saw_decimal) {
+                frac_part = frac_part * 10 + (src[i] - '0');
+                frac_digits++;
+            } else {
+                int_part = int_part * 10 + (src[i] - '0');
+            }
+        }
+        i++;
+    }
+    /* Check for trailing sign */
+    while (i < (int)src_len) {
+        if (src[i] == '-') negative = 1;
+        else if (src[i] == '+') negative = 0;
+        i++;
+    }
+    /* Combine into scaled integer for display format */
+    long long combined = int_part;
+    for (int d = 0; d < frac_digits; d++) combined *= 10;
+    combined += frac_part;
+    if (negative) combined = -combined;
+    /* If dest has implicit decimal places, we need to scale accordingly.
+     * For simplicity, output as display format. */
+    int_to_display_ex(combined, _intrinsic_temp, dest_len, 1);
+    return _intrinsic_temp;
+}
+
+/* FUNCTION ABS: absolute value. */
+char* cobolrt_abs(const char *src, unsigned int src_len) {
+    long long val = display_to_int(src, src_len);
+    if (val < 0) val = -val;
+    int_to_display_ex(val, _intrinsic_temp, src_len, 0);
+    return _intrinsic_temp;
+}
+
+/* FUNCTION SIGN: return +1 for positive, 0 for zero, -1 for negative.
+ * Result is a display-format 1-digit value: positive=1 ('1'), zero=0 ('0'),
+ * negative=-1 (we use 2 chars with leading sign). Actually COBOL defines
+ * SIGN as returning 1, 0, or -1, so we use dest_len for formatting. */
+char* cobolrt_sign(const char *src, unsigned int src_len, unsigned int dest_len) {
+    long long val = display_to_int(src, src_len);
+    long long result;
+    if (val > 0) result = 1;
+    else if (val < 0) result = -1;
+    else result = 0;
+    int_to_display_ex(result, _intrinsic_temp, dest_len, 1);
+    return _intrinsic_temp;
+}
+
+/* FUNCTION INTEGER: greatest integer <= argument (floor).
+ * For display-format integers this is identity. */
+char* cobolrt_integer(const char *src, unsigned int src_len) {
+    /* For integer display values, this is a no-op */
+    memcpy(_intrinsic_temp, src, src_len);
+    return _intrinsic_temp;
+}
+
+/* FUNCTION INTEGER-PART: truncate toward zero.
+ * For display-format integers this is identity. */
+char* cobolrt_integer_part(const char *src, unsigned int src_len) {
+    memcpy(_intrinsic_temp, src, src_len);
+    return _intrinsic_temp;
+}
+
+/* FUNCTION CURRENT-DATE: return 21-char string YYYYMMDDHHMMSSFF+HHMM.
+ * Two char for century, two for year, etc. Last 5 are timezone offset. */
+char* cobolrt_current_date(void) {
+    time_t now = time(NULL);
+    struct tm tm_buf;
+    localtime_r(&now, &tm_buf);
+    snprintf(_intrinsic_temp, 22,
+             "%04d%02d%02d%02d%02d%02d00+0000",
+             tm_buf.tm_year + 1900,
+             tm_buf.tm_mon + 1,
+             tm_buf.tm_mday,
+             tm_buf.tm_hour,
+             tm_buf.tm_min,
+             tm_buf.tm_sec);
+    /* Compute timezone offset */
+    long tz_offset = tm_buf.tm_gmtoff;
+    char tz_sign = tz_offset >= 0 ? '+' : '-';
+    if (tz_offset < 0) tz_offset = -tz_offset;
+    int tz_hours = (int)(tz_offset / 3600);
+    int tz_mins = (int)((tz_offset % 3600) / 60);
+    snprintf(_intrinsic_temp + 16, 6, "%c%02d%02d", tz_sign, tz_hours, tz_mins);
+    return _intrinsic_temp;
+}
+
+/* FUNCTION WHEN-COMPILED: compile-time timestamp (placeholder). */
+char* cobolrt_when_compiled(void) {
+    memcpy(_intrinsic_temp, "20260219120000000000", 21);
+    _intrinsic_temp[21] = '\0';
+    return _intrinsic_temp;
+}
+
+/* FUNCTION SUM: sum of multiple numeric display values.
+ * Arguments arrive as pairs of (ptr, len). We pass count separately. */
+char* cobolrt_sum(const char **ptrs, const int *lens, int count, unsigned int dest_len) {
+    long long total = 0;
+    for (int i = 0; i < count; i++) {
+        total += display_to_int(ptrs[i], lens[i]);
+    }
+    int_to_display_ex(total, _intrinsic_temp, dest_len, 1);
+    return _intrinsic_temp;
+}
+
+/* FUNCTION MEAN: arithmetic mean of numeric values. */
+char* cobolrt_mean(const char **ptrs, const int *lens, int count, unsigned int dest_len) {
+    long long total = 0;
+    for (int i = 0; i < count; i++) {
+        total += display_to_int(ptrs[i], lens[i]);
+    }
+    if (count > 0) total /= count;
+    int_to_display_ex(total, _intrinsic_temp, dest_len, 1);
+    return _intrinsic_temp;
+}
+
+/* FUNCTION RANGE: max - min of numeric values. */
+char* cobolrt_range(const char **ptrs, const int *lens, int count, unsigned int dest_len) {
+    if (count == 0) {
+        memset(_intrinsic_temp, '0', dest_len);
+        return _intrinsic_temp;
+    }
+    long long min_val = display_to_int(ptrs[0], lens[0]);
+    long long max_val = min_val;
+    for (int i = 1; i < count; i++) {
+        long long v = display_to_int(ptrs[i], lens[i]);
+        if (v < min_val) min_val = v;
+        if (v > max_val) max_val = v;
+    }
+    int_to_display_ex(max_val - min_val, _intrinsic_temp, dest_len, 1);
+    return _intrinsic_temp;
+}
+
+/* FUNCTION MEDIAN: middle value of sorted numeric values. */
+char* cobolrt_median(const char **ptrs, const int *lens, int count, unsigned int dest_len) {
+    if (count == 0) {
+        memset(_intrinsic_temp, '0', dest_len);
+        return _intrinsic_temp;
+    }
+    /* Sort values into temp array */
+    long long vals[64];
+    int n = count < 64 ? count : 64;
+    for (int i = 0; i < n; i++) {
+        vals[i] = display_to_int(ptrs[i], lens[i]);
+    }
+    /* Simple insertion sort */
+    for (int i = 1; i < n; i++) {
+        long long key = vals[i];
+        int j = i - 1;
+        while (j >= 0 && vals[j] > key) {
+            vals[j + 1] = vals[j];
+            j--;
+        }
+        vals[j + 1] = key;
+    }
+    long long result;
+    if (n % 2 == 1) {
+        result = vals[n / 2];
+    } else {
+        result = (vals[n / 2 - 1] + vals[n / 2]) / 2;
+    }
+    int_to_display_ex(result, _intrinsic_temp, dest_len, 1);
+    return _intrinsic_temp;
+}
+
 /* ---- SORT USING GIVING implementation ----
  *
  * cobolrt_sort_using_giving reads all records from the input file,

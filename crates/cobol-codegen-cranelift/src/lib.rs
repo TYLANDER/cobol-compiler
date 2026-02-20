@@ -637,6 +637,13 @@ impl CraneliftCodegen {
                 sig.params.push(AbiParam::new(types::I32)); // dest_len
                 sig.returns.push(AbiParam::new(ptr)); // result ptr
             }
+            "cobolrt_numval" => {
+                // (src_ptr, src_len, dest_len) -> result_ptr
+                sig.params.push(AbiParam::new(ptr)); // src ptr
+                sig.params.push(AbiParam::new(types::I32)); // src_len
+                sig.params.push(AbiParam::new(types::I32)); // dest_len
+                sig.returns.push(AbiParam::new(ptr)); // result ptr
+            }
             "cobolrt_max_numeric" | "cobolrt_min_numeric" => {
                 // (a_ptr, a_len, b_ptr, b_len) -> result_ptr
                 sig.params.push(AbiParam::new(ptr)); // a ptr
@@ -644,6 +651,43 @@ impl CraneliftCodegen {
                 sig.params.push(AbiParam::new(ptr)); // b ptr
                 sig.params.push(AbiParam::new(types::I32)); // b_len
                 sig.returns.push(AbiParam::new(ptr)); // result ptr (points to a or b)
+            }
+            "cobolrt_mod" | "cobolrt_rem" => {
+                // (a_ptr, a_len, b_ptr, b_len) -> result_ptr
+                sig.params.push(AbiParam::new(ptr)); // a ptr
+                sig.params.push(AbiParam::new(types::I32)); // a_len
+                sig.params.push(AbiParam::new(ptr)); // b ptr
+                sig.params.push(AbiParam::new(types::I32)); // b_len
+                sig.returns.push(AbiParam::new(ptr)); // result ptr
+            }
+            "cobolrt_ord" => {
+                // (src_ptr, src_len, dest_len) -> result_ptr
+                sig.params.push(AbiParam::new(ptr)); // src ptr
+                sig.params.push(AbiParam::new(types::I32)); // src_len
+                sig.params.push(AbiParam::new(types::I32)); // dest_len
+                sig.returns.push(AbiParam::new(ptr)); // result ptr
+            }
+            "cobolrt_char" => {
+                // (ordinal) -> result_ptr
+                sig.params.push(AbiParam::new(types::I32)); // ordinal
+                sig.returns.push(AbiParam::new(ptr)); // result ptr
+            }
+            "cobolrt_abs" | "cobolrt_integer" | "cobolrt_integer_part" => {
+                // (src_ptr, src_len) -> result_ptr
+                sig.params.push(AbiParam::new(ptr)); // src ptr
+                sig.params.push(AbiParam::new(types::I32)); // src_len
+                sig.returns.push(AbiParam::new(ptr)); // result ptr
+            }
+            "cobolrt_sign" => {
+                // (src_ptr, src_len, dest_len) -> result_ptr
+                sig.params.push(AbiParam::new(ptr)); // src ptr
+                sig.params.push(AbiParam::new(types::I32)); // src_len
+                sig.params.push(AbiParam::new(types::I32)); // dest_len
+                sig.returns.push(AbiParam::new(ptr)); // result ptr
+            }
+            "cobolrt_current_date" | "cobolrt_when_compiled" => {
+                // () -> result_ptr
+                sig.returns.push(AbiParam::new(ptr)); // result ptr
             }
             "cobolrt_sort_using_giving" => {
                 // (input_ptr, input_len, output_ptr, output_len,
