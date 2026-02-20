@@ -486,6 +486,9 @@ impl CraneliftCodegen {
                 sig.params.push(AbiParam::new(ptr)); // filename ptr
                 sig.params.push(AbiParam::new(types::I32)); // filename len
                 sig.params.push(AbiParam::new(types::I32)); // mode (0=input,1=output,2=io,3=extend)
+                sig.params.push(AbiParam::new(types::I32)); // organization (0=seq,1=rel,2=idx,3=lineseq)
+                sig.params.push(AbiParam::new(types::I32)); // access mode (0=seq,1=random,2=dynamic)
+                sig.params.push(AbiParam::new(types::I32)); // record size
                 sig.returns.push(AbiParam::new(types::I32)); // file handle
             }
             "cobolrt_file_close" => {
@@ -501,6 +504,30 @@ impl CraneliftCodegen {
                 sig.params.push(AbiParam::new(ptr)); // buffer ptr
                 sig.params.push(AbiParam::new(types::I32)); // buffer len
                 sig.returns.push(AbiParam::new(types::I32)); // eof flag (0=ok, 1=eof)
+            }
+            "cobolrt_file_write_record" => {
+                sig.params.push(AbiParam::new(types::I32)); // file handle
+                sig.params.push(AbiParam::new(ptr)); // data ptr
+                sig.params.push(AbiParam::new(types::I32)); // data len
+            }
+            "cobolrt_file_read_record" => {
+                sig.params.push(AbiParam::new(types::I32)); // file handle
+                sig.params.push(AbiParam::new(ptr)); // buffer ptr
+                sig.params.push(AbiParam::new(types::I32)); // buffer len
+                sig.returns.push(AbiParam::new(types::I32)); // eof flag (0=ok, 1=eof)
+            }
+            "cobolrt_file_rewrite" => {
+                sig.params.push(AbiParam::new(types::I32)); // file handle
+                sig.params.push(AbiParam::new(ptr)); // data ptr
+                sig.params.push(AbiParam::new(types::I32)); // data len
+            }
+            "cobolrt_file_delete" => {
+                sig.params.push(AbiParam::new(types::I32)); // file handle
+            }
+            "cobolrt_file_start" => {
+                sig.params.push(AbiParam::new(types::I32)); // file handle
+                sig.params.push(AbiParam::new(ptr)); // key ptr
+                sig.params.push(AbiParam::new(types::I32)); // key len
             }
             "cobolrt_string_append" => {
                 sig.params.push(AbiParam::new(ptr)); // src

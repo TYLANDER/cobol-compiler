@@ -254,6 +254,10 @@ pub struct FileDescriptor {
     pub access_mode: AccessMode,
     /// ASSIGN TO path (e.g. "SMOKE-FILE.DAT").
     pub assign_to: String,
+    /// RELATIVE KEY data name (for ORGANIZATION IS RELATIVE).
+    pub relative_key: Option<String>,
+    /// FILE STATUS data name.
+    pub file_status: Option<String>,
     /// Source location.
     pub span: cobol_span::Span,
 }
@@ -413,6 +417,25 @@ pub enum HirStatement {
         file: cobol_intern::Name,
         into: Option<cobol_intern::Name>,
         at_end: Vec<HirStatement>,
+        not_at_end: Vec<HirStatement>,
+        invalid_key: Vec<HirStatement>,
+        not_invalid_key: Vec<HirStatement>,
+    },
+    Rewrite {
+        record: cobol_intern::Name,
+        invalid_key: Vec<HirStatement>,
+        not_invalid_key: Vec<HirStatement>,
+    },
+    Delete {
+        file: cobol_intern::Name,
+        invalid_key: Vec<HirStatement>,
+        not_invalid_key: Vec<HirStatement>,
+    },
+    Start {
+        file: cobol_intern::Name,
+        key_condition: Option<StartKeyCondition>,
+        invalid_key: Vec<HirStatement>,
+        not_invalid_key: Vec<HirStatement>,
     },
     Inspect {
         target: HirDataRef,
@@ -489,6 +512,19 @@ pub enum SetAction {
     DownBy(HirExpr),
     /// SET condition-name TO TRUE (move condition value to parent)
     ConditionTrue,
+}
+
+/// Key condition for the START statement.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StartKeyCondition {
+    /// KEY IS EQUAL TO (default)
+    Equal,
+    /// KEY IS GREATER THAN
+    Greater,
+    /// KEY IS NOT LESS THAN (equivalent to >=)
+    NotLess,
+    /// KEY IS GREATER THAN OR EQUAL TO
+    GreaterOrEqual,
 }
 
 /// The different forms of the INSPECT statement.
@@ -953,6 +989,12 @@ struct SelectInfo {
     assign_to: String,
     /// File organization.
     organization: FileOrganization,
+    /// Access mode (SEQUENTIAL, RANDOM, DYNAMIC).
+    access_mode: AccessMode,
+    /// RELATIVE KEY data name (for relative files).
+    relative_key: Option<String>,
+    /// FILE STATUS data name.
+    file_status: Option<String>,
 }
 
 struct HirLowerer<'a> {
@@ -1078,9 +1120,15 @@ impl<'a> HirLowerer<'a> {
         }
 
         // Parse: SELECT file-name ASSIGN TO "path" ORGANIZATION IS LINE SEQUENTIAL
+        //        [ACCESS MODE IS SEQUENTIAL|RANDOM|DYNAMIC]
+        //        [RELATIVE KEY IS data-name]
+        //        [FILE STATUS IS data-name]
         let mut file_name = String::new();
         let mut assign_to = String::new();
         let mut organization = FileOrganization::Sequential;
+        let mut access_mode = AccessMode::Sequential;
+        let mut relative_key = None;
+        let mut file_status = None;
 
         let mut i = 0;
         while i < tokens.len() {
@@ -1156,6 +1204,79 @@ impl<'a> HirLowerer<'a> {
                         }
                     }
                 }
+                "ACCESS" => {
+                    i += 1;
+                    // Skip optional MODE
+                    if i < tokens.len() && tokens[i].eq_ignore_ascii_case("MODE") {
+                        i += 1;
+                    }
+                    // Skip optional IS
+                    if i < tokens.len() && tokens[i].eq_ignore_ascii_case("IS") {
+                        i += 1;
+                    }
+                    if i < tokens.len() {
+                        let am_upper = tokens[i].to_ascii_uppercase();
+                        match am_upper.as_str() {
+                            "SEQUENTIAL" => {
+                                access_mode = AccessMode::Sequential;
+                                i += 1;
+                            }
+                            "RANDOM" => {
+                                access_mode = AccessMode::Random;
+                                i += 1;
+                            }
+                            "DYNAMIC" => {
+                                access_mode = AccessMode::Dynamic;
+                                i += 1;
+                            }
+                            _ => {
+                                i += 1;
+                            }
+                        }
+                    }
+                }
+                "RELATIVE" => {
+                    // RELATIVE KEY IS data-name
+                    i += 1;
+                    if i < tokens.len() && tokens[i].eq_ignore_ascii_case("KEY") {
+                        i += 1;
+                        // Skip optional IS
+                        if i < tokens.len() && tokens[i].eq_ignore_ascii_case("IS") {
+                            i += 1;
+                        }
+                        if i < tokens.len() {
+                            relative_key = Some(tokens[i].to_ascii_uppercase());
+                            i += 1;
+                        }
+                    }
+                }
+                "FILE" => {
+                    // FILE STATUS IS data-name
+                    i += 1;
+                    if i < tokens.len() && tokens[i].eq_ignore_ascii_case("STATUS") {
+                        i += 1;
+                        // Skip optional IS
+                        if i < tokens.len() && tokens[i].eq_ignore_ascii_case("IS") {
+                            i += 1;
+                        }
+                        if i < tokens.len() {
+                            file_status = Some(tokens[i].to_ascii_uppercase());
+                            i += 1;
+                        }
+                    }
+                }
+                "STATUS" => {
+                    // STATUS IS data-name (without FILE prefix)
+                    i += 1;
+                    // Skip optional IS
+                    if i < tokens.len() && tokens[i].eq_ignore_ascii_case("IS") {
+                        i += 1;
+                    }
+                    if i < tokens.len() && file_status.is_none() {
+                        file_status = Some(tokens[i].to_ascii_uppercase());
+                        i += 1;
+                    }
+                }
                 _ => {
                     i += 1;
                 }
@@ -1167,6 +1288,9 @@ impl<'a> HirLowerer<'a> {
                 file_name,
                 assign_to,
                 organization,
+                access_mode,
+                relative_key,
+                file_status,
             });
         }
     }
@@ -1191,8 +1315,10 @@ impl<'a> HirLowerer<'a> {
                 name,
                 record_items,
                 organization: sel.organization,
-                access_mode: AccessMode::Sequential,
+                access_mode: sel.access_mode,
                 assign_to: sel.assign_to.clone(),
+                relative_key: sel.relative_key.clone(),
+                file_status: sel.file_status.clone(),
                 span: self.dummy_span(),
             });
         }
@@ -2247,6 +2373,21 @@ impl<'a> HirLowerer<'a> {
                         stmts.push(s);
                     }
                 }
+                SyntaxKind::REWRITE_STMT => {
+                    if let Some(s) = self.lower_rewrite_stmt(&child) {
+                        stmts.push(s);
+                    }
+                }
+                SyntaxKind::DELETE_STMT => {
+                    if let Some(s) = self.lower_delete_stmt(&child) {
+                        stmts.push(s);
+                    }
+                }
+                SyntaxKind::START_STMT => {
+                    if let Some(s) = self.lower_start_stmt(&child) {
+                        stmts.push(s);
+                    }
+                }
                 SyntaxKind::EVALUATE_STMT => {
                     if let Some(s) = self.lower_evaluate_stmt(&child) {
                         stmts.push(s);
@@ -2962,7 +3103,8 @@ impl<'a> HirLowerer<'a> {
     }
 
     fn lower_read_stmt(&mut self, node: &cobol_ast::SyntaxNode) -> Option<HirStatement> {
-        // READ file-name [INTO ws-record] [AT END statements] [END-READ]
+        // READ file-name [INTO ws-record] [AT END statements] [NOT AT END stmts]
+        //   [INVALID KEY stmts] [NOT INVALID KEY stmts] [END-READ]
         let all_tokens = self.collect_all_tokens(node);
         let mut file_name = None;
         let mut into_name = None;
@@ -2992,8 +3134,7 @@ impl<'a> HirLowerer<'a> {
                         i += 1;
                     }
                 }
-                "AT" => {
-                    // AT [END] — stop parsing READ tokens here
+                "AT" | "INVALID" | "KEY" => {
                     break;
                 }
                 "END-READ" | "NOT" => break,
@@ -3003,7 +3144,7 @@ impl<'a> HirLowerer<'a> {
             }
         }
 
-        // Lower AT END statements from child nodes
+        // Lower AT END / INVALID KEY statements from child nodes
         for child in node.children() {
             let kind = child.kind();
             if kind == SyntaxKind::MOVE_STMT
@@ -3022,6 +3163,91 @@ impl<'a> HirLowerer<'a> {
             file: file_name?,
             into: into_name,
             at_end: at_end_stmts,
+            not_at_end: Vec::new(),
+            invalid_key: Vec::new(),
+            not_invalid_key: Vec::new(),
+        })
+    }
+
+    fn lower_rewrite_stmt(&mut self, node: &cobol_ast::SyntaxNode) -> Option<HirStatement> {
+        let tokens = self.collect_tokens(node);
+        // REWRITE record-name [FROM source] [INVALID KEY stmts] [END-REWRITE]
+        if tokens.len() < 2 {
+            return None;
+        }
+        let record = self.interner.intern(&tokens[1].1.to_ascii_uppercase());
+        Some(HirStatement::Rewrite {
+            record,
+            invalid_key: Vec::new(),
+            not_invalid_key: Vec::new(),
+        })
+    }
+
+    fn lower_delete_stmt(&mut self, node: &cobol_ast::SyntaxNode) -> Option<HirStatement> {
+        let tokens = self.collect_tokens(node);
+        // DELETE file-name [INVALID KEY stmts] [END-DELETE]
+        if tokens.len() < 2 {
+            return None;
+        }
+        let file = self.interner.intern(&tokens[1].1.to_ascii_uppercase());
+        Some(HirStatement::Delete {
+            file,
+            invalid_key: Vec::new(),
+            not_invalid_key: Vec::new(),
+        })
+    }
+
+    fn lower_start_stmt(&mut self, node: &cobol_ast::SyntaxNode) -> Option<HirStatement> {
+        let tokens = self.collect_tokens(node);
+        // START file-name [KEY IS EQUAL TO data-name] [INVALID KEY stmts] [END-START]
+        if tokens.len() < 2 {
+            return None;
+        }
+        let file = self.interner.intern(&tokens[1].1.to_ascii_uppercase());
+
+        // Parse optional KEY condition
+        let mut key_condition = None;
+        let mut i = 2;
+        while i < tokens.len() {
+            let upper = tokens[i].1.to_ascii_uppercase();
+            match upper.as_str() {
+                "KEY" => {
+                    i += 1;
+                    // Skip optional IS
+                    if i < tokens.len() && tokens[i].1.eq_ignore_ascii_case("IS") {
+                        i += 1;
+                    }
+                    if i < tokens.len() {
+                        let cond = tokens[i].1.to_ascii_uppercase();
+                        match cond.as_str() {
+                            "EQUAL" | "=" => {
+                                key_condition = Some(StartKeyCondition::Equal);
+                            }
+                            "GREATER" => {
+                                key_condition = Some(StartKeyCondition::Greater);
+                            }
+                            "NOT" => {
+                                i += 1;
+                                if i < tokens.len() && tokens[i].1.eq_ignore_ascii_case("LESS") {
+                                    key_condition = Some(StartKeyCondition::NotLess);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    break;
+                }
+                _ => {
+                    i += 1;
+                }
+            }
+        }
+
+        Some(HirStatement::Start {
+            file,
+            key_condition,
+            invalid_key: Vec::new(),
+            not_invalid_key: Vec::new(),
         })
     }
 
@@ -5552,6 +5778,21 @@ impl<'a> HirLowerer<'a> {
             }
             SyntaxKind::READ_STMT => {
                 if let Some(s) = self.lower_read_stmt(node) {
+                    stmts.push(s);
+                }
+            }
+            SyntaxKind::REWRITE_STMT => {
+                if let Some(s) = self.lower_rewrite_stmt(node) {
+                    stmts.push(s);
+                }
+            }
+            SyntaxKind::DELETE_STMT => {
+                if let Some(s) = self.lower_delete_stmt(node) {
+                    stmts.push(s);
+                }
+            }
+            SyntaxKind::START_STMT => {
+                if let Some(s) = self.lower_start_stmt(node) {
                     stmts.push(s);
                 }
             }

@@ -731,7 +731,17 @@ int cobolrt_compare_alphanumeric(
 #define MAX_OPEN_FILES 64
 static FILE *open_files[MAX_OPEN_FILES] = {0};
 
-int cobolrt_file_open(const char *filename, unsigned int filename_len, int mode) {
+/* File metadata per open file */
+typedef struct {
+    int organization;    /* 0=seq, 1=relative, 2=indexed, 3=line-seq */
+    int access_mode;     /* 0=sequential, 1=random, 2=dynamic */
+    unsigned int record_size; /* fixed record size in bytes */
+    long current_pos;    /* current record number (1-based) for sequential access */
+} FileMetadata;
+static FileMetadata file_meta[MAX_OPEN_FILES];
+
+int cobolrt_file_open(const char *filename, unsigned int filename_len,
+                      int mode, int org, int access, int rec_size) {
     /* Build null-terminated filename */
     char fname[1024];
     unsigned int copy_len = filename_len < sizeof(fname) - 1 ? filename_len : sizeof(fname) - 1;
@@ -739,21 +749,44 @@ int cobolrt_file_open(const char *filename, unsigned int filename_len, int mode)
     fname[copy_len] = '\0';
 
     const char *fmode;
-    switch (mode) {
-        case 0: fmode = "r";  break; /* INPUT */
-        case 1: fmode = "w";  break; /* OUTPUT */
-        case 2: fmode = "r+"; break; /* I-O */
-        case 3: fmode = "a";  break; /* EXTEND */
-        default: fmode = "r"; break;
+    if (org == 1) {
+        /* Relative files use binary mode */
+        switch (mode) {
+            case 0: fmode = "rb";   break; /* INPUT */
+            case 1: fmode = "wb";   break; /* OUTPUT */
+            case 2: fmode = "r+b";  break; /* I-O */
+            case 3: fmode = "ab";   break; /* EXTEND */
+            default: fmode = "rb";  break;
+        }
+    } else {
+        switch (mode) {
+            case 0: fmode = "r";  break; /* INPUT */
+            case 1: fmode = "w";  break; /* OUTPUT */
+            case 2: fmode = "r+"; break; /* I-O */
+            case 3: fmode = "a";  break; /* EXTEND */
+            default: fmode = "r"; break;
+        }
     }
 
     FILE *fp = fopen(fname, fmode);
+    if (!fp && mode == 2) {
+        /* I-O mode: if file doesn't exist, create it */
+        if (org == 1) {
+            fp = fopen(fname, "w+b");
+        } else {
+            fp = fopen(fname, "w+");
+        }
+    }
     if (!fp) return -1;
 
     /* Find a free slot */
     for (int i = 0; i < MAX_OPEN_FILES; i++) {
         if (open_files[i] == NULL) {
             open_files[i] = fp;
+            file_meta[i].organization = org;
+            file_meta[i].access_mode = access;
+            file_meta[i].record_size = (unsigned int)rec_size;
+            file_meta[i].current_pos = 0;
             return i;
         }
     }
@@ -801,6 +834,124 @@ int cobolrt_file_read_line(int handle, char *buffer, unsigned int buffer_len) {
     unsigned int copy_len = len < buffer_len ? (unsigned int)len : buffer_len;
     memcpy(buffer, line, copy_len);
     return 0; /* OK */
+}
+
+/* ---- Relative / Fixed-Record File I/O ---- */
+
+/* Write a fixed-length record.
+   For relative files in sequential mode, writes at current_pos and advances.
+   For random mode, the caller must set the relative key in the record area
+   before calling; here we just write at current_pos. */
+void cobolrt_file_write_record(int handle, const char *data, unsigned int data_len) {
+    if (handle < 0 || handle >= MAX_OPEN_FILES || !open_files[handle]) return;
+    unsigned int rec_size = file_meta[handle].record_size;
+    if (rec_size == 0) rec_size = data_len;
+
+    /* For sequential writes, just write at current position */
+    fwrite(data, 1, rec_size, open_files[handle]);
+    /* Pad if data_len < rec_size */
+    if (data_len < rec_size) {
+        unsigned int pad = rec_size - data_len;
+        char spaces[256];
+        memset(spaces, ' ', sizeof(spaces));
+        while (pad > 0) {
+            unsigned int chunk = pad < sizeof(spaces) ? pad : sizeof(spaces);
+            fwrite(spaces, 1, chunk, open_files[handle]);
+            pad -= chunk;
+        }
+    }
+    fflush(open_files[handle]);
+    file_meta[handle].current_pos++;
+}
+
+/* Read a fixed-length record.
+   Returns 0=success, 1=EOF/error. */
+int cobolrt_file_read_record(int handle, char *buffer, unsigned int buffer_len) {
+    if (handle < 0 || handle >= MAX_OPEN_FILES || !open_files[handle]) return 1;
+    unsigned int rec_size = file_meta[handle].record_size;
+    if (rec_size == 0) rec_size = buffer_len;
+
+    /* Space-fill buffer */
+    memset(buffer, ' ', buffer_len);
+
+    char temp[8192];
+    if (rec_size > sizeof(temp)) rec_size = sizeof(temp);
+    size_t nread = fread(temp, 1, rec_size, open_files[handle]);
+    if (nread == 0) return 1; /* EOF */
+
+    /* Copy into buffer */
+    unsigned int copy_len = nread < buffer_len ? (unsigned int)nread : buffer_len;
+    memcpy(buffer, temp, copy_len);
+    file_meta[handle].current_pos++;
+    return 0;
+}
+
+/* Rewrite (update) the most recently read record in place. */
+void cobolrt_file_rewrite(int handle, const char *data, unsigned int data_len) {
+    if (handle < 0 || handle >= MAX_OPEN_FILES || !open_files[handle]) return;
+    unsigned int rec_size = file_meta[handle].record_size;
+    if (rec_size == 0) rec_size = data_len;
+
+    /* Seek back to the start of the current record */
+    long pos = file_meta[handle].current_pos;
+    if (pos > 0) pos--;
+    fseek(open_files[handle], (long)pos * (long)rec_size, SEEK_SET);
+    fwrite(data, 1, rec_size > data_len ? data_len : rec_size, open_files[handle]);
+    /* Pad remainder */
+    if (data_len < rec_size) {
+        unsigned int pad = rec_size - data_len;
+        char spaces[256];
+        memset(spaces, ' ', sizeof(spaces));
+        while (pad > 0) {
+            unsigned int chunk = pad < sizeof(spaces) ? pad : sizeof(spaces);
+            fwrite(spaces, 1, chunk, open_files[handle]);
+            pad -= chunk;
+        }
+    }
+    fflush(open_files[handle]);
+    /* Re-seek past this record so sequential reading continues */
+    fseek(open_files[handle], (long)(pos + 1) * (long)rec_size, SEEK_SET);
+}
+
+/* Delete a record (fill with binary zeros for relative files). */
+void cobolrt_file_delete(int handle) {
+    if (handle < 0 || handle >= MAX_OPEN_FILES || !open_files[handle]) return;
+    unsigned int rec_size = file_meta[handle].record_size;
+    if (rec_size == 0) return;
+
+    long pos = file_meta[handle].current_pos;
+    if (pos > 0) pos--;
+    fseek(open_files[handle], (long)pos * (long)rec_size, SEEK_SET);
+    char zeros[256];
+    memset(zeros, 0, sizeof(zeros));
+    unsigned int remaining = rec_size;
+    while (remaining > 0) {
+        unsigned int chunk = remaining < sizeof(zeros) ? remaining : sizeof(zeros);
+        fwrite(zeros, 1, chunk, open_files[handle]);
+        remaining -= chunk;
+    }
+    fflush(open_files[handle]);
+    fseek(open_files[handle], (long)(pos + 1) * (long)rec_size, SEEK_SET);
+}
+
+/* START: position file to a specific relative record number.
+   key_ptr points to the numeric data item containing the record number.
+   key_len is the byte size of that data item. */
+void cobolrt_file_start(int handle, const char *key_ptr, unsigned int key_len) {
+    if (handle < 0 || handle >= MAX_OPEN_FILES || !open_files[handle]) return;
+    unsigned int rec_size = file_meta[handle].record_size;
+    if (rec_size == 0) return;
+
+    /* Convert the display-format key to an integer */
+    long long rec_num = 0;
+    if (key_ptr && key_len > 0) {
+        rec_num = display_to_int(key_ptr, key_len);
+    }
+    if (rec_num < 1) rec_num = 1;
+
+    /* Position to record rec_num (1-based) */
+    fseek(open_files[handle], (long)(rec_num - 1) * (long)rec_size, SEEK_SET);
+    file_meta[handle].current_pos = (long)(rec_num - 1);
 }
 
 void cobolrt_string_append(

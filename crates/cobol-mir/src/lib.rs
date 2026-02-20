@@ -476,8 +476,14 @@ pub struct MirFileDescriptor {
     pub name: String,
     /// File organization from the HIR.
     pub organization: cobol_hir::FileOrganization,
+    /// Access mode from the HIR.
+    pub access_mode: cobol_hir::AccessMode,
     /// Total record size in bytes.
     pub record_size: u32,
+    /// RELATIVE KEY data name (for ORGANIZATION IS RELATIVE).
+    pub relative_key: Option<String>,
+    /// FILE STATUS data name.
+    pub file_status: Option<String>,
 }
 
 /// The top-level MIR container for a single compilation unit.
@@ -573,6 +579,12 @@ struct MirLowerer<'a> {
     file_record_map: std::collections::HashMap<String, Vec<String>>,
     /// Maps SELECT file name to its organization.
     file_org_map: std::collections::HashMap<String, cobol_hir::FileOrganization>,
+    /// Maps SELECT file name to its access mode.
+    file_access_map: std::collections::HashMap<String, cobol_hir::AccessMode>,
+    /// Maps SELECT file name to its RELATIVE KEY data name.
+    file_relative_key_map: std::collections::HashMap<String, String>,
+    /// Maps SELECT file name to its FILE STATUS data name.
+    file_status_map: std::collections::HashMap<String, String>,
     /// Maps paragraph names to MIR block IDs for GO TO resolution.
     paragraph_block_map: std::collections::HashMap<String, BlockId>,
     /// Maps data item names to their OCCURS element size (single element, before multiplication).
@@ -607,6 +619,9 @@ impl<'a> MirLowerer<'a> {
             file_assign_map: std::collections::HashMap::new(),
             file_record_map: std::collections::HashMap::new(),
             file_org_map: std::collections::HashMap::new(),
+            file_access_map: std::collections::HashMap::new(),
+            file_relative_key_map: std::collections::HashMap::new(),
+            file_status_map: std::collections::HashMap::new(),
             paragraph_block_map: std::collections::HashMap::new(),
             occurs_element_size: std::collections::HashMap::new(),
             index_info: std::collections::HashMap::new(),
@@ -639,6 +654,16 @@ impl<'a> MirLowerer<'a> {
         for fd in &self.hir.file_items {
             let file_name = self.interner.resolve(fd.name).to_string();
             self.file_org_map.insert(file_name.clone(), fd.organization);
+            self.file_access_map
+                .insert(file_name.clone(), fd.access_mode);
+
+            if let Some(ref rk) = fd.relative_key {
+                self.file_relative_key_map
+                    .insert(file_name.clone(), rk.clone());
+            }
+            if let Some(ref fs) = fd.file_status {
+                self.file_status_map.insert(file_name.clone(), fs.clone());
+            }
 
             // Store the ASSIGN TO path from the file descriptor
             if !fd.assign_to.is_empty() {
@@ -648,13 +673,25 @@ impl<'a> MirLowerer<'a> {
 
             // Record items
             let mut records = Vec::new();
+            let mut record_size = 0u32;
             for &item_id in &fd.record_items {
                 let item = &self.hir.data_items[item_id.into_raw()];
                 if let Some(name) = item.name {
-                    records.push(self.interner.resolve(name).to_string());
+                    let rname = self.interner.resolve(name).to_string();
+                    records.push(rname);
                 }
+                record_size = record_size.max(item.storage.byte_size);
             }
-            self.file_record_map.insert(file_name, records);
+            self.file_record_map.insert(file_name.clone(), records);
+
+            self.module.file_descriptors.push(MirFileDescriptor {
+                name: file_name,
+                organization: fd.organization,
+                access_mode: fd.access_mode,
+                record_size,
+                relative_key: fd.relative_key.clone(),
+                file_status: fd.file_status.clone(),
+            });
         }
     }
 
@@ -1746,8 +1783,19 @@ impl<'a> MirLowerer<'a> {
             cobol_hir::HirStatement::Write { record } => {
                 self.lower_file_write(*record, func, instructions);
             }
-            cobol_hir::HirStatement::Read { file, into, at_end } => {
+            cobol_hir::HirStatement::Read {
+                file, into, at_end, ..
+            } => {
                 self.lower_file_read(*file, *into, at_end, func, current_block_id, instructions);
+            }
+            cobol_hir::HirStatement::Rewrite { record, .. } => {
+                self.lower_file_rewrite(*record, func, instructions);
+            }
+            cobol_hir::HirStatement::Delete { file, .. } => {
+                self.lower_file_delete(*file, func, instructions);
+            }
+            cobol_hir::HirStatement::Start { file, .. } => {
+                self.lower_file_start(*file, func, instructions);
             }
             cobol_hir::HirStatement::Evaluate { subjects, whens } => {
                 self.lower_evaluate(subjects, whens, func, current_block_id, instructions);
@@ -4156,7 +4204,38 @@ impl<'a> MirLowerer<'a> {
             .cloned()
             .unwrap_or_else(|| format!("{}.DAT", file_name));
 
-        // Emit: handle = cobolrt_file_open(filename_ptr, filename_len, mode)
+        // Get organization and record_size for this file
+        let org = self
+            .file_org_map
+            .get(&file_name)
+            .copied()
+            .unwrap_or(cobol_hir::FileOrganization::Sequential);
+        let org_int: i64 = match org {
+            cobol_hir::FileOrganization::Sequential => 0,
+            cobol_hir::FileOrganization::Relative => 1,
+            cobol_hir::FileOrganization::Indexed => 2,
+            cobol_hir::FileOrganization::LineSequential => 3,
+        };
+        let access = self
+            .file_access_map
+            .get(&file_name)
+            .copied()
+            .unwrap_or(cobol_hir::AccessMode::Sequential);
+        let access_int: i64 = match access {
+            cobol_hir::AccessMode::Sequential => 0,
+            cobol_hir::AccessMode::Random => 1,
+            cobol_hir::AccessMode::Dynamic => 2,
+        };
+        // Compute record size from file descriptor
+        let rec_size: i64 = self
+            .module
+            .file_descriptors
+            .iter()
+            .find(|fd| fd.name == file_name)
+            .map(|fd| fd.record_size as i64)
+            .unwrap_or(80);
+
+        // Emit: handle = cobolrt_file_open(filename_ptr, filename_len, mode, org, access, rec_size)
         let filename_val = func.new_value();
         instructions.push(MirInst::Const {
             dest: filename_val,
@@ -4178,12 +4257,34 @@ impl<'a> MirLowerer<'a> {
             dest: mode_val,
             value: MirConst::Int(mode_int),
         });
+        let org_val = func.new_value();
+        instructions.push(MirInst::Const {
+            dest: org_val,
+            value: MirConst::Int(org_int),
+        });
+        let access_val = func.new_value();
+        instructions.push(MirInst::Const {
+            dest: access_val,
+            value: MirConst::Int(access_int),
+        });
+        let rec_size_val = func.new_value();
+        instructions.push(MirInst::Const {
+            dest: rec_size_val,
+            value: MirConst::Int(rec_size),
+        });
 
         let handle_result = func.new_value();
         instructions.push(MirInst::CallRuntime {
             dest: Some(handle_result),
             func: "cobolrt_file_open".to_string(),
-            args: vec![filename_val, filename_len, mode_val],
+            args: vec![
+                filename_val,
+                filename_len,
+                mode_val,
+                org_val,
+                access_val,
+                rec_size_val,
+            ],
         });
 
         // Store handle to the global
@@ -4275,7 +4376,7 @@ impl<'a> MirLowerer<'a> {
             let handle_addr = func.new_value();
             instructions.push(MirInst::GlobalAddr {
                 dest: handle_addr,
-                name: handle_name,
+                name: handle_name.clone(),
             });
             let handle_val = func.new_value();
             instructions.push(MirInst::Load {
@@ -4288,9 +4389,21 @@ impl<'a> MirLowerer<'a> {
                 dest: size_val,
                 value: MirConst::Int(record_size as i64),
             });
+
+            let org = self
+                .file_org_map
+                .get(&file_name)
+                .copied()
+                .unwrap_or(cobol_hir::FileOrganization::Sequential);
+
+            let write_func = match org {
+                cobol_hir::FileOrganization::Relative => "cobolrt_file_write_record",
+                _ => "cobolrt_file_write_line",
+            };
+
             instructions.push(MirInst::CallRuntime {
                 dest: None,
-                func: "cobolrt_file_write_line".to_string(),
+                func: write_func.to_string(),
                 args: vec![handle_val, record_addr, size_val],
             });
         }
@@ -4357,15 +4470,56 @@ impl<'a> MirLowerer<'a> {
             value: MirConst::Int(record_size as i64),
         });
 
-        // Call cobolrt_file_read_line(handle, data_ptr, data_len) -> eof_flag (0=ok, 1=eof)
+        // Determine which runtime function to call based on organization
+        let org = self
+            .file_org_map
+            .get(&file_name)
+            .copied()
+            .unwrap_or(cobol_hir::FileOrganization::Sequential);
+        let read_func = match org {
+            cobol_hir::FileOrganization::Relative => "cobolrt_file_read_record",
+            _ => "cobolrt_file_read_line",
+        };
+
+        // Call read function -> eof_flag (0=ok, 1=eof)
         let eof_flag = func.new_value();
         instructions.push(MirInst::CallRuntime {
             dest: Some(eof_flag),
-            func: "cobolrt_file_read_line".to_string(),
+            func: read_func.to_string(),
             args: vec![handle_val, record_addr, size_val],
         });
 
-        // If INTO ws-record, copy file record to ws-record
+        // Branch on EOF: copy INTO only on success, execute AT END only on failure
+        let zero_val = func.new_value();
+        instructions.push(MirInst::Const {
+            dest: zero_val,
+            value: MirConst::Int(0),
+        });
+        let is_eof = func.new_value();
+        instructions.push(MirInst::ICmpNe {
+            dest: is_eof,
+            left: eof_flag,
+            right: zero_val,
+        });
+
+        let success_block = func.new_block();
+        let at_end_block = func.new_block();
+        let continue_block = func.new_block();
+
+        let current_insts = std::mem::take(instructions);
+        func.blocks.push(BasicBlock {
+            id: *current_block_id,
+            params: Vec::new(),
+            instructions: current_insts,
+            terminator: Terminator::Branch {
+                cond: is_eof,
+                then_block: at_end_block,
+                else_block: success_block,
+            },
+        });
+
+        // Success block: copy INTO, then jump to continue
+        let mut success_insts = Vec::new();
         if let Some(into_name) = into {
             let into_str = self.interner.resolve(into_name).to_string();
             if let Some(&idx) = self.global_map.get(&into_str) {
@@ -4375,77 +4529,217 @@ impl<'a> MirLowerer<'a> {
                     _ => 1,
                 };
                 let into_addr = func.new_value();
-                instructions.push(MirInst::GlobalAddr {
+                success_insts.push(MirInst::GlobalAddr {
                     dest: into_addr,
                     name: into_str,
                 });
                 let src_len = func.new_value();
-                instructions.push(MirInst::Const {
+                success_insts.push(MirInst::Const {
                     dest: src_len,
                     value: MirConst::Int(record_size as i64),
                 });
                 let dest_len = func.new_value();
-                instructions.push(MirInst::Const {
+                success_insts.push(MirInst::Const {
                     dest: dest_len,
                     value: MirConst::Int(into_size as i64),
                 });
-                // Re-get record address since previous addr was consumed
                 let record_addr2 = func.new_value();
-                instructions.push(MirInst::GlobalAddr {
+                success_insts.push(MirInst::GlobalAddr {
                     dest: record_addr2,
                     name: record_name.clone(),
                 });
-                instructions.push(MirInst::CallRuntime {
+                success_insts.push(MirInst::CallRuntime {
                     dest: None,
                     func: "cobolrt_move_alphanumeric".to_string(),
                     args: vec![record_addr2, src_len, into_addr, dest_len],
                 });
             }
         }
+        func.blocks.push(BasicBlock {
+            id: success_block,
+            params: Vec::new(),
+            instructions: success_insts,
+            terminator: Terminator::Goto(continue_block),
+        });
 
-        // Handle AT END: if eof_flag != 0, execute at_end statements
-        if !at_end.is_empty() {
+        // At-end block: execute AT END statements, then jump to continue
+        let mut at_end_insts = Vec::new();
+        let mut at_end_bid = at_end_block;
+        for stmt in at_end {
+            self.lower_statement_to_blocks(stmt, func, &mut at_end_bid, &mut at_end_insts);
+        }
+        func.blocks.push(BasicBlock {
+            id: at_end_bid,
+            params: Vec::new(),
+            instructions: at_end_insts,
+            terminator: Terminator::Goto(continue_block),
+        });
+
+        *current_block_id = continue_block;
+    }
+
+    /// Lower REWRITE statement — update current record in place.
+    fn lower_file_rewrite(
+        &self,
+        record: cobol_intern::Name,
+        func: &mut MirFunction,
+        instructions: &mut Vec<MirInst>,
+    ) {
+        let record_name = self.interner.resolve(record).to_string();
+
+        // Find which file this record belongs to
+        let mut file_name = None;
+        for (fname, records) in &self.file_record_map {
+            if records.contains(&record_name) {
+                file_name = Some(fname.clone());
+                break;
+            }
+        }
+        let file_name = match file_name {
+            Some(n) => n,
+            None => return,
+        };
+
+        let handle_name = format!("_FILE_HANDLE_{}", file_name);
+
+        // Get record address and size
+        let (record_addr, record_size) = if let Some(&idx) = self.global_map.get(&record_name) {
+            let global = &self.module.globals[idx];
+            let size = match &global.ty {
+                MirType::Bytes(n) => *n,
+                _ => 1,
+            };
+            let addr = func.new_value();
+            instructions.push(MirInst::GlobalAddr {
+                dest: addr,
+                name: record_name.clone(),
+            });
+            (addr, size)
+        } else {
+            return;
+        };
+
+        if self.global_map.contains_key(&handle_name) {
+            let handle_addr = func.new_value();
+            instructions.push(MirInst::GlobalAddr {
+                dest: handle_addr,
+                name: handle_name,
+            });
+            let handle_val = func.new_value();
+            instructions.push(MirInst::Load {
+                dest: handle_val,
+                addr: handle_addr,
+                ty: MirType::I32,
+            });
+            let size_val = func.new_value();
+            instructions.push(MirInst::Const {
+                dest: size_val,
+                value: MirConst::Int(record_size as i64),
+            });
+            instructions.push(MirInst::CallRuntime {
+                dest: None,
+                func: "cobolrt_file_rewrite".to_string(),
+                args: vec![handle_val, record_addr, size_val],
+            });
+        }
+    }
+
+    /// Lower DELETE statement — delete current record.
+    fn lower_file_delete(
+        &self,
+        file: cobol_intern::Name,
+        func: &mut MirFunction,
+        instructions: &mut Vec<MirInst>,
+    ) {
+        let file_name = self.interner.resolve(file).to_string();
+        let handle_name = format!("_FILE_HANDLE_{}", file_name);
+
+        if self.global_map.contains_key(&handle_name) {
+            let handle_addr = func.new_value();
+            instructions.push(MirInst::GlobalAddr {
+                dest: handle_addr,
+                name: handle_name,
+            });
+            let handle_val = func.new_value();
+            instructions.push(MirInst::Load {
+                dest: handle_val,
+                addr: handle_addr,
+                ty: MirType::I32,
+            });
+            instructions.push(MirInst::CallRuntime {
+                dest: None,
+                func: "cobolrt_file_delete".to_string(),
+                args: vec![handle_val],
+            });
+        }
+    }
+
+    /// Lower START statement — position file for sequential reading.
+    fn lower_file_start(
+        &self,
+        file: cobol_intern::Name,
+        func: &mut MirFunction,
+        instructions: &mut Vec<MirInst>,
+    ) {
+        let file_name = self.interner.resolve(file).to_string();
+        let handle_name = format!("_FILE_HANDLE_{}", file_name);
+
+        if self.global_map.contains_key(&handle_name) {
+            let handle_addr = func.new_value();
+            instructions.push(MirInst::GlobalAddr {
+                dest: handle_addr,
+                name: handle_name,
+            });
+            let handle_val = func.new_value();
+            instructions.push(MirInst::Load {
+                dest: handle_val,
+                addr: handle_addr,
+                ty: MirType::I32,
+            });
+
+            // Pass the relative key value if available
+            if let Some(rk_name) = self.file_relative_key_map.get(&file_name) {
+                if let Some(&idx) = self.global_map.get(rk_name) {
+                    let global = &self.module.globals[idx];
+                    let rk_size = match &global.ty {
+                        MirType::Bytes(n) => *n,
+                        _ => 4,
+                    };
+                    let rk_addr = func.new_value();
+                    instructions.push(MirInst::GlobalAddr {
+                        dest: rk_addr,
+                        name: rk_name.clone(),
+                    });
+                    let rk_size_val = func.new_value();
+                    instructions.push(MirInst::Const {
+                        dest: rk_size_val,
+                        value: MirConst::Int(rk_size as i64),
+                    });
+                    instructions.push(MirInst::CallRuntime {
+                        dest: None,
+                        func: "cobolrt_file_start".to_string(),
+                        args: vec![handle_val, rk_addr, rk_size_val],
+                    });
+                    return;
+                }
+            }
+
+            // No relative key — just call with zero
             let zero_val = func.new_value();
             instructions.push(MirInst::Const {
                 dest: zero_val,
                 value: MirConst::Int(0),
             });
-            let is_eof = func.new_value();
-            instructions.push(MirInst::ICmpNe {
-                dest: is_eof,
-                left: eof_flag,
-                right: zero_val,
+            let zero_val2 = func.new_value();
+            instructions.push(MirInst::Const {
+                dest: zero_val2,
+                value: MirConst::Int(0),
             });
-
-            let at_end_block = func.new_block();
-            let continue_block = func.new_block();
-
-            let current_insts = std::mem::take(instructions);
-            func.blocks.push(BasicBlock {
-                id: *current_block_id,
-                params: Vec::new(),
-                instructions: current_insts,
-                terminator: Terminator::Branch {
-                    cond: is_eof,
-                    then_block: at_end_block,
-                    else_block: continue_block,
-                },
+            instructions.push(MirInst::CallRuntime {
+                dest: None,
+                func: "cobolrt_file_start".to_string(),
+                args: vec![handle_val, zero_val, zero_val2],
             });
-
-            // At-end block
-            let mut at_end_insts = Vec::new();
-            let mut at_end_bid = at_end_block;
-            for stmt in at_end {
-                self.lower_statement_to_blocks(stmt, func, &mut at_end_bid, &mut at_end_insts);
-            }
-            func.blocks.push(BasicBlock {
-                id: at_end_bid,
-                params: Vec::new(),
-                instructions: at_end_insts,
-                terminator: Terminator::Goto(continue_block),
-            });
-
-            *current_block_id = continue_block;
         }
     }
 
@@ -10038,7 +10332,10 @@ mod tests {
         let fd = MirFileDescriptor {
             name: "INPUT-FILE".to_string(),
             organization: cobol_hir::FileOrganization::Sequential,
+            access_mode: cobol_hir::AccessMode::Sequential,
             record_size: 80,
+            relative_key: None,
+            file_status: None,
         };
         assert_eq!(fd.name, "INPUT-FILE");
         assert_eq!(fd.organization, cobol_hir::FileOrganization::Sequential);
@@ -10167,7 +10464,10 @@ mod tests {
             file_descriptors: vec![MirFileDescriptor {
                 name: "EMPLOYEE-FILE".to_string(),
                 organization: cobol_hir::FileOrganization::Indexed,
+                access_mode: cobol_hir::AccessMode::Sequential,
                 record_size: 200,
+                relative_key: None,
+                file_status: None,
             }],
             errors: Vec::new(),
         };

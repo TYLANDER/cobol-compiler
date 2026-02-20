@@ -121,6 +121,7 @@ run_test "SMOKE-CONTINUE"
 run_test "SMOKE-CLASS"
 run_test "SMOKE-SORT"
 run_test "SMOKE-INDEX"
+run_test "SMOKE-RELATIVE"
 
 echo ""
 echo "=== Results ==="
