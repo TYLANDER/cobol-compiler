@@ -348,6 +348,7 @@ fn find_sub_programs(source: &Path, test_name: &str) -> Vec<PathBuf> {
 
 /// Run a single NIST test: compile, execute, parse output, and optionally
 /// verify against expected output file.
+#[allow(clippy::too_many_arguments)]
 fn run_test(
     compiler: &Path,
     source: &Path,

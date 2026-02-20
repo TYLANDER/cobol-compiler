@@ -165,8 +165,8 @@ pub unsafe extern "C" fn cobolrt_inspect_replacing(
                 return;
             }
             let repl_byte = repl_slice[0];
-            for i in start_pos..end_pos {
-                data_slice[i] = repl_byte;
+            for byte in &mut data_slice[start_pos..end_pos] {
+                *byte = repl_byte;
             }
         }
         1 => {
@@ -186,8 +186,8 @@ pub unsafe extern "C" fn cobolrt_inspect_replacing(
                     data_slice[i..i + copy_len].copy_from_slice(&repl_slice[..copy_len]);
                     // If replacement is shorter, pad with spaces
                     if rlen < slen {
-                        for j in i + rlen..i + slen {
-                            data_slice[j] = b' ';
+                        for byte in &mut data_slice[i + rlen..i + slen] {
+                            *byte = b' ';
                         }
                     }
                     i += slen;
@@ -211,8 +211,8 @@ pub unsafe extern "C" fn cobolrt_inspect_replacing(
                     let copy_len = slen.min(rlen);
                     data_slice[i..i + copy_len].copy_from_slice(&repl_slice[..copy_len]);
                     if rlen < slen {
-                        for j in i + rlen..i + slen {
-                            data_slice[j] = b' ';
+                        for byte in &mut data_slice[i + rlen..i + slen] {
+                            *byte = b' ';
                         }
                     }
                     i += slen;
@@ -236,8 +236,8 @@ pub unsafe extern "C" fn cobolrt_inspect_replacing(
                 let copy_len = slen.min(rlen);
                 data_slice[abs_pos..abs_pos + copy_len].copy_from_slice(&repl_slice[..copy_len]);
                 if rlen < slen {
-                    for j in abs_pos + rlen..abs_pos + slen {
-                        data_slice[j] = b' ';
+                    for byte in &mut data_slice[abs_pos + rlen..abs_pos + slen] {
+                        *byte = b' ';
                     }
                 }
             }
@@ -299,10 +299,10 @@ pub unsafe extern "C" fn cobolrt_inspect_converting(
 
     // Build translation table from "from" and "to" characters
     // Each character in "from" maps to the corresponding character in "to"
-    for i in start_pos..end_pos {
-        if let Some(idx) = from_slice.iter().position(|&c| c == data_slice[i]) {
+    for byte in &mut data_slice[start_pos..end_pos] {
+        if let Some(idx) = from_slice.iter().position(|&c| c == *byte) {
             if idx < to_slice.len() {
-                data_slice[i] = to_slice[idx];
+                *byte = to_slice[idx];
             }
         }
     }
@@ -730,8 +730,7 @@ pub unsafe extern "C" fn cobolrt_unstring_field_or(
         (delim2, delim2_len, delim2_all),
         (delim3, delim3_len, delim3_all),
     ];
-    for i in 0..(num_delimiters as usize).min(3) {
-        let (ptr, len, all_flag) = slots[i];
+    for &(ptr, len, all_flag) in slots.iter().take((num_delimiters as usize).min(3)) {
         if !ptr.is_null() && len > 0 {
             delims.push(DelimInfo {
                 bytes: std::slice::from_raw_parts(ptr, len as usize),

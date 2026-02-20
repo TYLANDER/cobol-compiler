@@ -491,6 +491,8 @@ pub struct MirModule {
     pub globals: Vec<MirGlobal>,
     /// File descriptors.
     pub file_descriptors: Vec<MirFileDescriptor>,
+    /// Errors encountered during MIR lowering.
+    pub errors: Vec<String>,
 }
 
 impl MirModule {
@@ -501,6 +503,7 @@ impl MirModule {
             functions: Vec::new(),
             globals: Vec::new(),
             file_descriptors: Vec::new(),
+            errors: Vec::new(),
         }
     }
 }
@@ -883,13 +886,15 @@ impl<'a> MirLowerer<'a> {
             let pic_str = item.storage.picture.as_ref().map(|p| p.pic_string.as_str());
             let encoding = &item.storage.encoding;
             let pic_digits = item.storage.picture.as_ref().map(|p| p.size).unwrap_or(0);
-            let pic_is_signed = item.storage.picture.as_ref()
+            let pic_is_signed = item
+                .storage
+                .picture
+                .as_ref()
                 .map(|p| p.sign != cobol_hir::SignPosition::None)
                 .unwrap_or(false);
-            let initial_value = item
-                .value
-                .as_ref()
-                .map(|v| self.lower_initial_value(v, byte_size, pic_str, encoding, pic_digits, pic_is_signed));
+            let initial_value = item.value.as_ref().map(|v| {
+                self.lower_initial_value(v, byte_size, pic_str, encoding, pic_digits, pic_is_signed)
+            });
 
             let redefines_name = item.redefines.map(|redef_id| {
                 let redef_item = &self.hir.data_items[redef_id.into_raw()];
@@ -928,8 +933,7 @@ impl<'a> MirLowerer<'a> {
         // multi-item group OCCURS entries.
         {
             // Collect (level, handle_name, has_occurs, byte_size, is_group)
-            let ws_ids: Vec<cobol_hir::DataItemId> =
-                self.hir.working_storage.iter().copied().collect();
+            let ws_ids: Vec<cobol_hir::DataItemId> = self.hir.working_storage.to_vec();
             let ws_items: Vec<(u8, String, bool, u32, bool)> = ws_ids
                 .iter()
                 .enumerate()
@@ -960,8 +964,8 @@ impl<'a> MirLowerer<'a> {
                             // Check if this is a direct child of the OCCURS group
                             let is_direct_child = {
                                 let mut direct = true;
-                                for k in (i + 1)..j {
-                                    let (inter_level, _, _, _, inter_is_group) = &ws_items[k];
+                                for item in ws_items.iter().take(j).skip(i + 1) {
+                                    let (inter_level, _, _, _, inter_is_group) = item;
                                     if *inter_level <= parent_level {
                                         break;
                                     }
@@ -1063,8 +1067,8 @@ impl<'a> MirLowerer<'a> {
                     // Check if this is a direct child (not nested under an intermediate group)
                     let is_direct_child = {
                         let mut direct = true;
-                        for k in (i + 1)..j {
-                            let (inter_level, _, inter_is_group, _) = &ws_items[k];
+                        for item in ws_items.iter().take(j).skip(i + 1) {
+                            let (inter_level, _, inter_is_group, _) = item;
                             if *inter_level <= parent_level {
                                 break;
                             }
@@ -1218,10 +1222,8 @@ impl<'a> MirLowerer<'a> {
                         bytes[pos] = num_bytes[num_bytes.len() - 1 - j];
                     }
                 }
-                if is_signed && is_negative && !bytes.is_empty() {
-                    if bytes[0] == b'0' {
-                        bytes[0] = b'-';
-                    }
+                if is_signed && is_negative && !bytes.is_empty() && bytes[0] == b'0' {
+                    bytes[0] = b'-';
                 }
                 MirConst::Bytes(bytes)
             } else {
@@ -1236,10 +1238,8 @@ impl<'a> MirLowerer<'a> {
                         bytes[start + i] = *b;
                     }
                 }
-                if is_signed && is_negative && !bytes.is_empty() {
-                    if bytes[0] == b'0' {
-                        bytes[0] = b'-';
-                    }
+                if is_signed && is_negative && !bytes.is_empty() && bytes[0] == b'0' {
+                    bytes[0] = b'-';
                 }
                 MirConst::Bytes(bytes)
             }
@@ -1252,12 +1252,8 @@ impl<'a> MirLowerer<'a> {
                 bytes.resize(byte_size as usize, b' ');
                 MirConst::Bytes(bytes)
             }
-            cobol_hir::InitialValue::Numeric(n, _scale) => {
-                encode_numeric(*n)
-            }
-            cobol_hir::InitialValue::Zero => {
-                encode_numeric(0)
-            }
+            cobol_hir::InitialValue::Numeric(n, _scale) => encode_numeric(*n),
+            cobol_hir::InitialValue::Zero => encode_numeric(0),
             cobol_hir::InitialValue::Space => MirConst::Bytes(vec![b' '; byte_size as usize]),
             cobol_hir::InitialValue::HighValue => MirConst::Bytes(vec![0xFF; byte_size as usize]),
             cobol_hir::InitialValue::LowValue => MirConst::Bytes(vec![0x00; byte_size as usize]),
@@ -1710,11 +1706,11 @@ impl<'a> MirLowerer<'a> {
             cobol_hir::HirStatement::Call {
                 program,
                 using,
+                returning,
                 on_exception,
                 not_on_exception,
-                ..
             } => {
-                self.lower_call(program, using, func, instructions);
+                self.lower_call(program, using, returning, func, instructions);
                 // After the call, NOT ON EXCEPTION handlers execute (call succeeded).
                 // ON EXCEPTION handlers would execute only on call failure.
                 // Since our AOT compiler links all subprograms at compile time,
@@ -2158,8 +2154,7 @@ impl<'a> MirLowerer<'a> {
                 | cobol_hir::UsageType::Comp4
                 | cobol_hir::UsageType::Comp5
                 | cobol_hir::UsageType::Binary => 1,
-                cobol_hir::UsageType::Comp3
-                | cobol_hir::UsageType::PackedDecimal => 2,
+                cobol_hir::UsageType::Comp3 | cobol_hir::UsageType::PackedDecimal => 2,
                 _ => 0,
             }
         }
@@ -2206,12 +2201,19 @@ impl<'a> MirLowerer<'a> {
     /// Emit an encoding-aware arithmetic runtime call.
     /// If all encodings are 0 (display), uses the legacy function for backward compat.
     /// Otherwise, uses the _enc variant with per-field encoding flags.
+    #[allow(clippy::too_many_arguments)]
     fn emit_arith_call(
         &self,
         op_name: &str,
-        a_addr: Value, a_size: u32, a_enc: i64,
-        b_addr: Value, b_size: u32, b_enc: i64,
-        target_addr: Value, target_size: u32, target_enc: i64,
+        a_addr: Value,
+        a_size: u32,
+        a_enc: i64,
+        b_addr: Value,
+        b_size: u32,
+        b_enc: i64,
+        target_addr: Value,
+        target_size: u32,
+        target_enc: i64,
         target_is_signed: bool,
         func: &mut MirFunction,
         instructions: &mut Vec<MirInst>,
@@ -2219,32 +2221,72 @@ impl<'a> MirLowerer<'a> {
         let needs_enc = a_enc != 0 || b_enc != 0 || target_enc != 0;
 
         let a_len = func.new_value();
-        instructions.push(MirInst::Const { dest: a_len, value: MirConst::Int(a_size as i64) });
+        instructions.push(MirInst::Const {
+            dest: a_len,
+            value: MirConst::Int(a_size as i64),
+        });
         let b_len = func.new_value();
-        instructions.push(MirInst::Const { dest: b_len, value: MirConst::Int(b_size as i64) });
+        instructions.push(MirInst::Const {
+            dest: b_len,
+            value: MirConst::Int(b_size as i64),
+        });
         let t_len = func.new_value();
-        instructions.push(MirInst::Const { dest: t_len, value: MirConst::Int(target_size as i64) });
+        instructions.push(MirInst::Const {
+            dest: t_len,
+            value: MirConst::Int(target_size as i64),
+        });
         let signed_flag = func.new_value();
-        instructions.push(MirInst::Const { dest: signed_flag, value: MirConst::Int(if target_is_signed { 1 } else { 0 }) });
+        instructions.push(MirInst::Const {
+            dest: signed_flag,
+            value: MirConst::Int(if target_is_signed { 1 } else { 0 }),
+        });
 
         if needs_enc {
             let ae = func.new_value();
-            instructions.push(MirInst::Const { dest: ae, value: MirConst::Int(a_enc) });
+            instructions.push(MirInst::Const {
+                dest: ae,
+                value: MirConst::Int(a_enc),
+            });
             let be = func.new_value();
-            instructions.push(MirInst::Const { dest: be, value: MirConst::Int(b_enc) });
+            instructions.push(MirInst::Const {
+                dest: be,
+                value: MirConst::Int(b_enc),
+            });
             let te = func.new_value();
-            instructions.push(MirInst::Const { dest: te, value: MirConst::Int(target_enc) });
+            instructions.push(MirInst::Const {
+                dest: te,
+                value: MirConst::Int(target_enc),
+            });
 
             instructions.push(MirInst::CallRuntime {
                 dest: None,
                 func: format!("cobolrt_{}_numeric_enc", op_name),
-                args: vec![a_addr, a_len, ae, b_addr, b_len, be, target_addr, t_len, te, signed_flag],
+                args: vec![
+                    a_addr,
+                    a_len,
+                    ae,
+                    b_addr,
+                    b_len,
+                    be,
+                    target_addr,
+                    t_len,
+                    te,
+                    signed_flag,
+                ],
             });
         } else {
             instructions.push(MirInst::CallRuntime {
                 dest: None,
                 func: format!("cobolrt_{}_numeric", op_name),
-                args: vec![a_addr, a_len, b_addr, b_len, target_addr, t_len, signed_flag],
+                args: vec![
+                    a_addr,
+                    a_len,
+                    b_addr,
+                    b_len,
+                    target_addr,
+                    t_len,
+                    signed_flag,
+                ],
             });
         }
     }
@@ -2788,10 +2830,12 @@ impl<'a> MirLowerer<'a> {
                                     }
                                 }
                                 // For negative signed values, replace leading zero with '-'
-                                if is_negative && target_is_signed && !bytes.is_empty() {
-                                    if bytes[0] == b'0' {
-                                        bytes[0] = b'-';
-                                    }
+                                if is_negative
+                                    && target_is_signed
+                                    && !bytes.is_empty()
+                                    && bytes[0] == b'0'
+                                {
+                                    bytes[0] = b'-';
                                 }
                                 let src_val = func.new_value();
                                 instructions.push(MirInst::Const {
@@ -3777,7 +3821,7 @@ impl<'a> MirLowerer<'a> {
                             let is_index_subscript = matches!(subscript,
                                 cobol_hir::HirExpr::DataRef(sub_ref)
                                     if self.index_info.contains_key(
-                                        &self.interner.resolve(sub_ref.name).to_string()));
+                                        self.interner.resolve(sub_ref.name)));
 
                             if is_index_subscript {
                                 // Index name: load byte offset and add directly to base
@@ -3804,83 +3848,95 @@ impl<'a> MirLowerer<'a> {
                                 }
                                 elem_size
                             } else {
-                            let index_val = match subscript {
-                                cobol_hir::HirExpr::Literal(cobol_hir::LiteralValue::Integer(
-                                    n,
-                                )) => {
-                                    // Convert 1-based to 0-based at compile time
-                                    let v = func.new_value();
-                                    instructions.push(MirInst::Const {
-                                        dest: v,
-                                        value: MirConst::Int(*n - 1),
-                                    });
-                                    v
-                                }
-                                cobol_hir::HirExpr::DataRef(sub_ref) => {
-                                    // Load the subscript variable value and convert to integer
-                                    let sub_name = self.interner.resolve(sub_ref.name).to_string();
-                                    if let Some(sub_info) = self.linkage_map.get(&sub_name) {
-                                        // Linkage param
-                                        let sz = func.new_value();
+                                let index_val = match subscript {
+                                    cobol_hir::HirExpr::Literal(
+                                        cobol_hir::LiteralValue::Integer(n),
+                                    ) => {
+                                        // Convert 1-based to 0-based at compile time
+                                        let v = func.new_value();
                                         instructions.push(MirInst::Const {
-                                            dest: sz,
-                                            value: MirConst::Int(sub_info.byte_size as i64),
+                                            dest: v,
+                                            value: MirConst::Int(*n - 1),
                                         });
-                                        let raw_val = func.new_value();
-                                        instructions.push(MirInst::CallRuntime {
-                                            dest: Some(raw_val),
-                                            func: "cobolrt_display_to_int".to_string(),
-                                            args: vec![sub_info.param_value, sz],
-                                        });
-                                        // Subtract 1 for 0-based indexing
-                                        let one = func.new_value();
-                                        instructions.push(MirInst::Const {
-                                            dest: one,
-                                            value: MirConst::Int(1),
-                                        });
-                                        let idx = func.new_value();
-                                        instructions.push(MirInst::ISub {
-                                            dest: idx,
-                                            left: raw_val,
-                                            right: one,
-                                        });
-                                        idx
-                                    } else if let Some(&sub_idx) = self.global_map.get(&sub_name) {
-                                        let sub_global = &self.module.globals[sub_idx];
-                                        let sub_size = match &sub_global.ty {
-                                            MirType::Bytes(n) => *n,
-                                            _ => 1,
-                                        };
-                                        let sub_addr = func.new_value();
-                                        instructions.push(MirInst::GlobalAddr {
-                                            dest: sub_addr,
-                                            name: sub_name,
-                                        });
-                                        let sub_len = func.new_value();
-                                        instructions.push(MirInst::Const {
-                                            dest: sub_len,
-                                            value: MirConst::Int(sub_size as i64),
-                                        });
-                                        let raw_val = func.new_value();
-                                        instructions.push(MirInst::CallRuntime {
-                                            dest: Some(raw_val),
-                                            func: "cobolrt_display_to_int".to_string(),
-                                            args: vec![sub_addr, sub_len],
-                                        });
-                                        // Subtract 1 for 0-based indexing
-                                        let one = func.new_value();
-                                        instructions.push(MirInst::Const {
-                                            dest: one,
-                                            value: MirConst::Int(1),
-                                        });
-                                        let idx = func.new_value();
-                                        instructions.push(MirInst::ISub {
-                                            dest: idx,
-                                            left: raw_val,
-                                            right: one,
-                                        });
-                                        idx
-                                    } else {
+                                        v
+                                    }
+                                    cobol_hir::HirExpr::DataRef(sub_ref) => {
+                                        // Load the subscript variable value and convert to integer
+                                        let sub_name =
+                                            self.interner.resolve(sub_ref.name).to_string();
+                                        if let Some(sub_info) = self.linkage_map.get(&sub_name) {
+                                            // Linkage param
+                                            let sz = func.new_value();
+                                            instructions.push(MirInst::Const {
+                                                dest: sz,
+                                                value: MirConst::Int(sub_info.byte_size as i64),
+                                            });
+                                            let raw_val = func.new_value();
+                                            instructions.push(MirInst::CallRuntime {
+                                                dest: Some(raw_val),
+                                                func: "cobolrt_display_to_int".to_string(),
+                                                args: vec![sub_info.param_value, sz],
+                                            });
+                                            // Subtract 1 for 0-based indexing
+                                            let one = func.new_value();
+                                            instructions.push(MirInst::Const {
+                                                dest: one,
+                                                value: MirConst::Int(1),
+                                            });
+                                            let idx = func.new_value();
+                                            instructions.push(MirInst::ISub {
+                                                dest: idx,
+                                                left: raw_val,
+                                                right: one,
+                                            });
+                                            idx
+                                        } else if let Some(&sub_idx) =
+                                            self.global_map.get(&sub_name)
+                                        {
+                                            let sub_global = &self.module.globals[sub_idx];
+                                            let sub_size = match &sub_global.ty {
+                                                MirType::Bytes(n) => *n,
+                                                _ => 1,
+                                            };
+                                            let sub_addr = func.new_value();
+                                            instructions.push(MirInst::GlobalAddr {
+                                                dest: sub_addr,
+                                                name: sub_name,
+                                            });
+                                            let sub_len = func.new_value();
+                                            instructions.push(MirInst::Const {
+                                                dest: sub_len,
+                                                value: MirConst::Int(sub_size as i64),
+                                            });
+                                            let raw_val = func.new_value();
+                                            instructions.push(MirInst::CallRuntime {
+                                                dest: Some(raw_val),
+                                                func: "cobolrt_display_to_int".to_string(),
+                                                args: vec![sub_addr, sub_len],
+                                            });
+                                            // Subtract 1 for 0-based indexing
+                                            let one = func.new_value();
+                                            instructions.push(MirInst::Const {
+                                                dest: one,
+                                                value: MirConst::Int(1),
+                                            });
+                                            let idx = func.new_value();
+                                            instructions.push(MirInst::ISub {
+                                                dest: idx,
+                                                left: raw_val,
+                                                right: one,
+                                            });
+                                            idx
+                                        } else {
+                                            let v = func.new_value();
+                                            instructions.push(MirInst::Const {
+                                                dest: v,
+                                                value: MirConst::Int(0),
+                                            });
+                                            v
+                                        }
+                                    }
+                                    _ => {
                                         let v = func.new_value();
                                         instructions.push(MirInst::Const {
                                             dest: v,
@@ -3888,27 +3944,18 @@ impl<'a> MirLowerer<'a> {
                                         });
                                         v
                                     }
-                                }
-                                _ => {
-                                    let v = func.new_value();
-                                    instructions.push(MirInst::Const {
-                                        dest: v,
-                                        value: MirConst::Int(0),
-                                    });
-                                    v
-                                }
-                            };
+                                };
 
-                            // Compute element address: base + index * element_size
-                            let elem_addr = func.new_value();
-                            instructions.push(MirInst::GetElementAddr {
-                                dest: elem_addr,
-                                base: addr,
-                                index: index_val,
-                                element_size: elem_size,
-                            });
-                            addr = elem_addr;
-                            elem_size
+                                // Compute element address: base + index * element_size
+                                let elem_addr = func.new_value();
+                                instructions.push(MirInst::GetElementAddr {
+                                    dest: elem_addr,
+                                    base: addr,
+                                    index: index_val,
+                                    element_size: elem_size,
+                                });
+                                addr = elem_addr;
+                                elem_size
                             }
                         } else {
                             size
@@ -4576,9 +4623,10 @@ impl<'a> MirLowerer<'a> {
 
     /// Lower CALL statement: call an external subprogram.
     fn lower_call(
-        &self,
+        &mut self,
         program: &cobol_hir::HirExpr,
         using: &[cobol_hir::CallArg],
+        returning: &Option<cobol_hir::HirDataRef>,
         func: &mut MirFunction,
         instructions: &mut Vec<MirInst>,
     ) {
@@ -4613,11 +4661,11 @@ impl<'a> MirLowerer<'a> {
                 match initial {
                     Some(pname) => pname,
                     None => {
-                        eprintln!(
-                            "error: CALL via identifier '{}' cannot be resolved at compile time \
+                        self.module.errors.push(format!(
+                            "CALL via identifier '{}' cannot be resolved at compile time \
                              (no VALUE clause found). Runtime dynamic CALL is not yet supported.",
                             name
-                        );
+                        ));
                         return;
                     }
                 }
@@ -4648,6 +4696,13 @@ impl<'a> MirLowerer<'a> {
             func: prog_name,
             args: arg_values,
         });
+
+        // RETURNING: the target is preserved in HIR for future use.
+        // Currently all subprograms return void, so we cannot assign a
+        // return value yet. When subprogram RETURNING is implemented at
+        // the callee side, this will need to capture the return value
+        // and MOVE it into the RETURNING target.
+        let _ = returning;
     }
 
     /// Lower ADD statement: ADD op1 op2 ... GIVING target
@@ -4706,19 +4761,27 @@ impl<'a> MirLowerer<'a> {
             let (b_addr, b_size, b_enc) = operand_addrs[1];
 
             self.emit_arith_call(
-                "add", a_addr, a_size, a_enc, b_addr, b_size, b_enc,
-                target_addr, target_size, target_enc, target_is_signed,
-                func, instructions,
+                "add",
+                a_addr,
+                a_size,
+                a_enc,
+                b_addr,
+                b_size,
+                b_enc,
+                target_addr,
+                target_size,
+                target_enc,
+                target_is_signed,
+                func,
+                instructions,
             );
 
             // If more than 2 operands, accumulate: target = target + operands[i]
-            for i in 2..operand_addrs.len() {
+            for &(op_addr, op_size, op_enc) in operand_addrs.iter().skip(2) {
                 let target_expr_b = cobol_hir::HirExpr::DataRef(Box::new(target_ref.clone()));
                 let (target_addr2, _) = self
                     .emit_expr_addr(&target_expr_b, func, instructions)
                     .unwrap();
-
-                let (op_addr, op_size, op_enc) = operand_addrs[i];
 
                 let target_expr_c = cobol_hir::HirExpr::DataRef(Box::new(target_ref.clone()));
                 let (target_addr3, _) = self
@@ -4726,10 +4789,19 @@ impl<'a> MirLowerer<'a> {
                     .unwrap();
 
                 self.emit_arith_call(
-                    "add", target_addr2, target_size, target_enc,
-                    op_addr, op_size, op_enc,
-                    target_addr3, target_size, target_enc, target_is_signed,
-                    func, instructions,
+                    "add",
+                    target_addr2,
+                    target_size,
+                    target_enc,
+                    op_addr,
+                    op_size,
+                    op_enc,
+                    target_addr3,
+                    target_size,
+                    target_enc,
+                    target_is_signed,
+                    func,
+                    instructions,
                 );
             }
         }
@@ -4843,8 +4915,7 @@ impl<'a> MirLowerer<'a> {
 
                 // If more operands, subtract each from the target in place:
                 // target = target - operands[i]
-                for i in 1..operand_addrs.len() {
-                    let (opi_addr, opi_size) = operand_addrs[i];
+                for &(opi_addr, opi_size) in operand_addrs.iter().skip(1) {
                     let opi_len = func.new_value();
                     instructions.push(MirInst::Const {
                         dest: opi_len,
@@ -5126,6 +5197,7 @@ impl<'a> MirLowerer<'a> {
         *current_block_id = cont_block;
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn lower_divide(
         &self,
         operand_a: &cobol_hir::HirExpr,
@@ -5794,6 +5866,7 @@ impl<'a> MirLowerer<'a> {
     }
 
     /// Lower UNSTRING statement.
+    #[allow(clippy::too_many_arguments)]
     fn lower_unstring(
         &mut self,
         source: &cobol_hir::HirDataRef,
@@ -6581,6 +6654,19 @@ impl<'a> MirLowerer<'a> {
                         cobol_hir::HirExpr::Literal(cobol_hir::LiteralValue::String_(s)) => {
                             s.len() as u32
                         }
+                        cobol_hir::HirExpr::FunctionCall {
+                            name: inner_name,
+                            args: inner_args,
+                        } => {
+                            // Evaluate inner function to get result size
+                            if let Some((_addr, sz)) =
+                                self.emit_function_call(inner_name, inner_args, func, instructions)
+                            {
+                                sz
+                            } else {
+                                0
+                            }
+                        }
                         _ => 0,
                     };
                     // Return the length as a display-format numeric string
@@ -6616,6 +6702,10 @@ impl<'a> MirLowerer<'a> {
                             });
                             (str_val, s.len() as u32)
                         }
+                        cobol_hir::HirExpr::FunctionCall {
+                            name: inner_name,
+                            args: inner_args,
+                        } => self.emit_function_call(inner_name, inner_args, func, instructions)?,
                         _ => return None,
                     };
 
@@ -7235,9 +7325,15 @@ impl<'a> MirLowerer<'a> {
                                 let r_enc = self.operand_encoding(right);
                                 if l_enc != 0 || r_enc != 0 {
                                     let le = func.new_value();
-                                    instructions.push(MirInst::Const { dest: le, value: MirConst::Int(l_enc) });
+                                    instructions.push(MirInst::Const {
+                                        dest: le,
+                                        value: MirConst::Int(l_enc),
+                                    });
                                     let re = func.new_value();
-                                    instructions.push(MirInst::Const { dest: re, value: MirConst::Int(r_enc) });
+                                    instructions.push(MirInst::Const {
+                                        dest: re,
+                                        value: MirConst::Int(r_enc),
+                                    });
                                     instructions.push(MirInst::CallRuntime {
                                         dest: Some(cmp_result),
                                         func: "cobolrt_compare_numeric_enc".to_string(),
@@ -7861,8 +7957,8 @@ impl<'a> MirLowerer<'a> {
     /// Each WHEN clause becomes a comparison + conditional branch:
     ///   - If the condition matches, jump to the WHEN body block
     ///   - Otherwise, fall through to the next WHEN test
-    /// WHEN OTHER (indicated by empty conditions) is the default fallthrough.
-    /// After any body block, jump to the merge block.
+    ///     WHEN OTHER (indicated by empty conditions) is the default fallthrough.
+    ///     After any body block, jump to the merge block.
     fn lower_evaluate(
         &mut self,
         _subjects: &[cobol_hir::HirExpr],
@@ -9210,6 +9306,7 @@ impl<'a> MirLowerer<'a> {
     ///   body: perform target (out-of-line)
     ///         if condition goto exit else goto body
     ///   exit: (continuation)
+    #[allow(clippy::too_many_arguments)]
     fn lower_perform_until(
         &mut self,
         target: cobol_intern::Name,
@@ -9490,6 +9587,7 @@ impl<'a> MirLowerer<'a> {
             .unwrap_or(1)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn lower_perform_varying(
         &mut self,
         target: cobol_intern::Name,
@@ -9563,6 +9661,7 @@ impl<'a> MirLowerer<'a> {
     /// (i.e. the block entered when the parent condition is false).
     /// `parent_cond_id` is the condition-check block of the parent loop, which
     /// we jump back to after incrementing the parent variable.
+    #[allow(clippy::too_many_arguments)]
     fn lower_varying_body(
         &mut self,
         target: cobol_intern::Name,
@@ -9769,6 +9868,7 @@ mod tests {
             functions: vec![func],
             globals: Vec::new(),
             file_descriptors: Vec::new(),
+            errors: Vec::new(),
         }
     }
 
@@ -10069,6 +10169,7 @@ mod tests {
                 organization: cobol_hir::FileOrganization::Indexed,
                 record_size: 200,
             }],
+            errors: Vec::new(),
         };
 
         assert_eq!(module.name, "PAYROLL");

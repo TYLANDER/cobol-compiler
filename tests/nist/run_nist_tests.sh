@@ -149,6 +149,24 @@ for f in "$SCRIPT_DIR"/IC*.cob; do
 done
 echo ""
 
+# Run IF tests (Intrinsic Functions)
+if ls "$SCRIPT_DIR"/IF*.cob 1>/dev/null 2>&1; then
+    echo "--- Intrinsic Functions (IF) ---"
+    for f in "$SCRIPT_DIR"/IF*.cob; do
+        [ -f "$f" ] && run_nist_test "$f"
+    done
+    echo ""
+fi
+
+# Run ST tests (SORT/MERGE)
+if ls "$SCRIPT_DIR"/ST*.cob 1>/dev/null 2>&1; then
+    echo "--- SORT/MERGE (ST) ---"
+    for f in "$SCRIPT_DIR"/ST*.cob; do
+        [ -f "$f" ] && run_nist_test "$f"
+    done
+    echo ""
+fi
+
 # Summary
 echo "=== Program Results ==="
 echo "Pass: $PASS  Fail: $FAIL  Skip: $SKIP  Total: $((PASS + FAIL + SKIP))"

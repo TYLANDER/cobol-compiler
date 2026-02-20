@@ -210,8 +210,7 @@ impl CraneliftCodegen {
                     if let Some((ref parent_name, byte_offset)) = g.parent_offset {
                         let mut total_offset = byte_offset;
                         let mut current = parent_name.clone();
-                        while let Some((grandparent, gp_offset)) =
-                            raw_parent_offsets.get(&current)
+                        while let Some((grandparent, gp_offset)) = raw_parent_offsets.get(&current)
                         {
                             total_offset += gp_offset;
                             current = grandparent.clone();
@@ -1499,6 +1498,7 @@ mod tests {
             }],
             globals: vec![],
             file_descriptors: vec![],
+            errors: vec![],
         }
     }
 
@@ -1577,6 +1577,7 @@ mod tests {
                 parent_offset: None,
             }],
             file_descriptors: vec![],
+            errors: vec![],
         };
 
         let dir = std::env::temp_dir().join("cobol_cranelift_test");
@@ -1654,6 +1655,7 @@ mod tests {
             }],
             globals: vec![],
             file_descriptors: vec![],
+            errors: vec![],
         };
 
         let dir = std::env::temp_dir().join("cobol_cranelift_test");
@@ -1728,6 +1730,7 @@ mod tests {
             }],
             globals: vec![],
             file_descriptors: vec![],
+            errors: vec![],
         };
 
         let dir = std::env::temp_dir().join("cobol_cranelift_test");

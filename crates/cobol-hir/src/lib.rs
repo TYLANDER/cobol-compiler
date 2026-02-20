@@ -231,6 +231,7 @@ pub struct HirModule {
     /// Diagnostics produced during lowering.
     pub diagnostics: Vec<HirDiagnostic>,
     /// Maps 88-level condition names to (parent DataItemId, list of (value, optional THRU value) pairs).
+    #[allow(clippy::type_complexity)]
     pub condition_names: std::collections::HashMap<
         String,
         (
@@ -916,11 +917,7 @@ pub fn parse_picture(pic_string: &str) -> Result<PictureType, String> {
     }
 
     let category = if has_x {
-        if has_numeric || has_alpha {
-            PictureCategory::Alphanumeric
-        } else {
-            PictureCategory::Alphanumeric
-        }
+        PictureCategory::Alphanumeric
     } else if has_edited && !has_alpha && !has_x {
         // Edited characters (Z, *, $, +, -, comma, etc.) with optional 9
         // indicate a numeric-edited picture.
@@ -977,6 +974,7 @@ struct HirLowerer<'a> {
     /// File descriptors built from SELECT + FD.
     file_items: Vec<FileDescriptor>,
     /// Maps 88-level condition names to (parent DataItemId, list of (value, optional THRU value) pairs).
+    #[allow(clippy::type_complexity)]
     condition_names: std::collections::HashMap<
         String,
         (
@@ -1274,8 +1272,8 @@ impl<'a> HirLowerer<'a> {
                     // We need to count direct children only:
                     let is_direct_child = {
                         let mut direct = true;
-                        for k in (i + 1)..j {
-                            let (intermediate_level, _, _, _) = items[k];
+                        for item in items.iter().take(j).skip(i + 1) {
+                            let (intermediate_level, _, _, _) = *item;
                             if intermediate_level <= level {
                                 break;
                             }
@@ -2632,20 +2630,18 @@ impl<'a> HirLowerer<'a> {
         }
 
         // Handle leading minus sign: `-` followed by a numeric literal
-        if tokens[pos].0 == SyntaxKind::MINUS {
-            if pos + 1 < tokens.len() {
-                match tokens[pos + 1].0 {
-                    SyntaxKind::INTEGER_LITERAL => {
-                        if let Ok(n) = tokens[pos + 1].1.parse::<i64>() {
-                            return (HirExpr::Literal(LiteralValue::Integer(-n)), pos + 2);
-                        }
+        if tokens[pos].0 == SyntaxKind::MINUS && pos + 1 < tokens.len() {
+            match tokens[pos + 1].0 {
+                SyntaxKind::INTEGER_LITERAL => {
+                    if let Ok(n) = tokens[pos + 1].1.parse::<i64>() {
+                        return (HirExpr::Literal(LiteralValue::Integer(-n)), pos + 2);
                     }
-                    SyntaxKind::DECIMAL_LITERAL => {
-                        let neg = format!("-{}", tokens[pos + 1].1);
-                        return (HirExpr::Literal(LiteralValue::Decimal(neg)), pos + 2);
-                    }
-                    _ => {}
                 }
+                SyntaxKind::DECIMAL_LITERAL => {
+                    let neg = format!("-{}", tokens[pos + 1].1);
+                    return (HirExpr::Literal(LiteralValue::Decimal(neg)), pos + 2);
+                }
+                _ => {}
             }
         }
 
@@ -3762,7 +3758,6 @@ impl<'a> HirLowerer<'a> {
     /// Recursive descent parser for arithmetic expressions from token lists.
     /// Handles: +, -, *, /, ** (exponentiation), parentheses, unary minus.
     /// Precedence (low to high): +/-, *//, **
-
     /// additive = multiplicative (('+' | '-') multiplicative)*
     fn parse_arith_additive(
         &mut self,
@@ -4579,6 +4574,7 @@ impl<'a> HirLowerer<'a> {
 
         // Parse USING clause
         let mut using_args = Vec::new();
+        let mut returning_target: Option<HirDataRef> = None;
         let mut mode = CallArgMode::ByReference; // default
 
         while i < tokens.len() {
@@ -4603,14 +4599,12 @@ impl<'a> HirLowerer<'a> {
                     i += 1;
                     continue;
                 }
-                "RETURNING" => {
-                    i += 1; // skip RETURNING
-                            // Next token is the RETURNING target identifier
+                "RETURNING" | "GIVING" => {
+                    i += 1; // skip RETURNING/GIVING
                     if i < tokens.len() {
-                        let (_dr, _next) = self.parse_data_ref_at(&tokens, i);
-                        // Store returning but warn — not yet fully supported in codegen
-                        // (The MIR CALL will need to handle the return value)
-                        break; // done after RETURNING target
+                        let (dr, next) = self.parse_data_ref_at(&tokens, i);
+                        returning_target = Some(dr);
+                        i = next;
                     }
                     break;
                 }
@@ -4698,7 +4692,7 @@ impl<'a> HirLowerer<'a> {
         Some(HirStatement::Call {
             program: program_expr,
             using: using_args,
-            returning: None,
+            returning: returning_target,
             on_exception,
             not_on_exception,
         })
@@ -5874,10 +5868,9 @@ impl<'a> HirLowerer<'a> {
                                     // Check for ALPHABETIC-LOWER or ALPHABETIC-UPPER
                                     if pos + 1 < tokens.len() {
                                         let next = tokens[pos + 1].1.to_ascii_uppercase();
-                                        match next.as_str() {
-                                            // Handle hyphenated form split into separate tokens
-                                            _ => Some(ClassType::Alphabetic),
-                                        }
+                                        // Handle hyphenated form split into separate tokens
+                                        let _ = next.as_str();
+                                        Some(ClassType::Alphabetic)
                                     } else {
                                         Some(ClassType::Alphabetic)
                                     }
@@ -5953,6 +5946,7 @@ impl<'a> HirLowerer<'a> {
 
         // Re-find the operator starting from where the left expression ended
         // (the original op_idx may be wrong if qualifiers shifted things)
+        #[allow(clippy::needless_range_loop)]
         let actual_op_idx = {
             let mut found = None;
             let mut paren_depth = 0;

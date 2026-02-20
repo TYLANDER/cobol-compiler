@@ -1865,6 +1865,13 @@ impl<'t> Parser<'t> {
                     "UNSTRING" => self.parse_unstring_stmt(),
                     "INSPECT" => self.parse_inspect_stmt(),
                     "SEARCH" => self.parse_search_stmt(),
+                    "SORT" => self.parse_generic_stmt(SyntaxKind::SORT_STMT),
+                    "MERGE" => self.parse_generic_stmt(SyntaxKind::MERGE_STMT),
+                    "DELETE" => self.parse_generic_stmt(SyntaxKind::DELETE_STMT),
+                    "REWRITE" => self.parse_generic_stmt(SyntaxKind::REWRITE_STMT),
+                    "RELEASE" => self.parse_generic_stmt(SyntaxKind::RELEASE_STMT),
+                    "RETURN" => self.parse_generic_stmt(SyntaxKind::RETURN_STMT),
+                    "START" => self.parse_generic_stmt(SyntaxKind::START_STMT),
                     _ => self.parse_generic_stmt(SyntaxKind::STATEMENT),
                 }
             }
@@ -3150,25 +3157,7 @@ impl<'t> Parser<'t> {
                     if !self.at_end() && self.at_word("TO") {
                         self.bump();
                     }
-                } else if self.at_word("GREATER") {
-                    self.bump();
-                    self.skip_ws();
-                    if !self.at_end() && self.at_word("THAN") {
-                        self.bump();
-                        self.skip_ws();
-                    }
-                    if !self.at_end() && self.at_word("OR") {
-                        self.bump();
-                        self.skip_ws();
-                        if !self.at_end() && self.at_word("EQUAL") {
-                            self.bump();
-                            self.skip_ws();
-                            if !self.at_end() && self.at_word("TO") {
-                                self.bump();
-                            }
-                        }
-                    }
-                } else if self.at_word("LESS") {
+                } else if self.at_any_word(&["GREATER", "LESS"]) {
                     self.bump();
                     self.skip_ws();
                     if !self.at_end() && self.at_word("THAN") {
@@ -3634,14 +3623,13 @@ impl<'t> Parser<'t> {
         self.bump(); // EXIT
 
         self.skip_ws();
-        // Optional PROGRAM, SECTION, PARAGRAPH
-        if !self.at_end() && self.at_any_word(&["PROGRAM", "SECTION", "PARAGRAPH"]) {
-            self.bump();
-        } else if !self.at_end()
-            && matches!(
-                self.current_kind(),
-                cobol_lexer::TokenKind::SectionKw | cobol_lexer::TokenKind::ParagraphKw
-            )
+        // Optional PROGRAM, SECTION, PARAGRAPH (may appear as Word or keyword token)
+        if !self.at_end()
+            && (self.at_any_word(&["PROGRAM", "SECTION", "PARAGRAPH"])
+                || matches!(
+                    self.current_kind(),
+                    cobol_lexer::TokenKind::SectionKw | cobol_lexer::TokenKind::ParagraphKw
+                ))
         {
             self.bump();
         }

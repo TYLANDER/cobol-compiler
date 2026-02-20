@@ -781,12 +781,12 @@ void cobolrt_file_write_line(int handle, const char *data, unsigned int data_len
 
 int cobolrt_file_read_line(int handle, char *buffer, unsigned int buffer_len) {
     if (handle < 0 || handle >= MAX_OPEN_FILES || !open_files[handle]) return 1;
-    /* Space-fill buffer first */
-    memset(buffer, ' ', buffer_len);
     char line[4096];
     if (fgets(line, sizeof(line), open_files[handle]) == NULL) {
-        return 1; /* EOF */
+        return 1; /* EOF — do not modify buffer */
     }
+    /* Space-fill buffer before copying new data */
+    memset(buffer, ' ', buffer_len);
     /* Remove trailing newline */
     size_t len = strlen(line);
     if (len > 0 && line[len - 1] == '\n') {
@@ -2675,6 +2675,13 @@ fn main() {
                 // First input file is the main program; subsequent files are subprograms
                 let is_main = input_idx == 0;
                 let mir = cobol_mir::lower_with_options(&hir, &interner, is_main);
+
+                if !mir.errors.is_empty() {
+                    for err in &mir.errors {
+                        eprintln!("error: {}", err);
+                    }
+                    std::process::exit(1);
+                }
 
                 if cli.verbose {
                     eprintln!(

@@ -118,7 +118,7 @@ pub unsafe extern "C" fn cobolrt_decimal_add(
     left: *const PackedDecimal,
     right: *const PackedDecimal,
     result: *mut PackedDecimal,
-    rounded: bool,
+    _rounded: bool, // TODO: implement ROUNDED mode
 ) {
     if left.is_null() || right.is_null() || result.is_null() {
         return;
@@ -133,12 +133,7 @@ pub unsafe extern "C" fn cobolrt_decimal_add(
     let right_scaled = scale_value(right_val, (*right).scale, result_scale, false);
 
     let sum = left_scaled + right_scaled;
-    let final_val = if rounded {
-        sum // already at result scale
-    } else {
-        sum
-    };
-    i128_to_packed(final_val, result);
+    i128_to_packed(sum, result);
 }
 
 /// Subtract right from left, storing result in `result`.
@@ -154,7 +149,7 @@ pub unsafe extern "C" fn cobolrt_decimal_sub(
     left: *const PackedDecimal,
     right: *const PackedDecimal,
     result: *mut PackedDecimal,
-    rounded: bool,
+    _rounded: bool, // TODO: implement ROUNDED mode
 ) {
     if left.is_null() || right.is_null() || result.is_null() {
         return;
@@ -168,8 +163,7 @@ pub unsafe extern "C" fn cobolrt_decimal_sub(
     let right_scaled = scale_value(right_val, (*right).scale, result_scale, false);
 
     let diff = left_scaled - right_scaled;
-    let final_val = if rounded { diff } else { diff };
-    i128_to_packed(final_val, result);
+    i128_to_packed(diff, result);
 }
 
 /// Multiply two packed decimals, storing result in `result`.
