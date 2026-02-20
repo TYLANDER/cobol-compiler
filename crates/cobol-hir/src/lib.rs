@@ -850,8 +850,12 @@ pub enum DiagnosticSeverity {
 /// This is the main entry point for semantic analysis. It walks the typed
 /// AST, resolves names, computes storage layouts, and produces a fully
 /// validated [`HirModule`].
-pub fn lower(ast: &cobol_ast::SourceFile, interner: &mut cobol_intern::Interner) -> HirModule {
-    let mut lowerer = HirLowerer::new(interner);
+pub fn lower(
+    ast: &cobol_ast::SourceFile,
+    interner: &mut cobol_intern::Interner,
+    file_id: cobol_span::FileId,
+) -> HirModule {
+    let mut lowerer = HirLowerer::new(interner, file_id);
     lowerer.lower_source_file(ast);
     lowerer.finish()
 }
@@ -999,10 +1003,13 @@ struct SelectInfo {
     record_key: Option<String>,
     /// FILE STATUS data name.
     file_status: Option<String>,
+    /// Source span of the SELECT entry.
+    span: cobol_span::Span,
 }
 
 struct HirLowerer<'a> {
     interner: &'a mut cobol_intern::Interner,
+    file_id: cobol_span::FileId,
     data_items: la_arena::Arena<DataItemData>,
     working_storage: Vec<DataItemId>,
     linkage_items: Vec<DataItemId>,
@@ -1033,9 +1040,10 @@ struct HirLowerer<'a> {
 }
 
 impl<'a> HirLowerer<'a> {
-    fn new(interner: &'a mut cobol_intern::Interner) -> Self {
+    fn new(interner: &'a mut cobol_intern::Interner, file_id: cobol_span::FileId) -> Self {
         Self {
             interner,
+            file_id,
             data_items: la_arena::Arena::new(),
             working_storage: Vec::new(),
             linkage_items: Vec::new(),
@@ -1053,15 +1061,8 @@ impl<'a> HirLowerer<'a> {
         }
     }
 
-    fn dummy_span(&self) -> cobol_span::Span {
-        cobol_span::Span::new(
-            cobol_span::FileId::new(0),
-            cobol_span::TextRange::new(
-                cobol_span::TextSize::from(0u32),
-                cobol_span::TextSize::from(0u32),
-            ),
-            cobol_span::ExpansionId::ROOT,
-        )
+    fn make_span(&self, range: cobol_span::TextRange) -> cobol_span::Span {
+        cobol_span::Span::new(self.file_id, range, cobol_span::ExpansionId::ROOT)
     }
 
     fn lower_source_file(&mut self, ast: &cobol_ast::SourceFile) {
@@ -1107,6 +1108,7 @@ impl<'a> HirLowerer<'a> {
     }
 
     fn extract_select_entry(&mut self, node: &cobol_ast::SyntaxNode) {
+        let node_span = self.make_span(node.text_range());
         // Collect all non-whitespace tokens
         let mut tokens: Vec<String> = Vec::new();
         for el in node.children_with_tokens() {
@@ -1312,6 +1314,7 @@ impl<'a> HirLowerer<'a> {
                 relative_key,
                 record_key,
                 file_status,
+                span: node_span,
             });
         }
     }
@@ -1341,7 +1344,7 @@ impl<'a> HirLowerer<'a> {
                 relative_key: sel.relative_key.clone(),
                 record_key: sel.record_key.clone(),
                 file_status: sel.file_status.clone(),
-                span: self.dummy_span(),
+                span: sel.span,
             });
         }
     }
@@ -1503,6 +1506,8 @@ impl<'a> HirLowerer<'a> {
     }
 
     fn lower_data_item(&mut self, item: &cobol_ast::DataItem) -> Option<DataItemId> {
+        let item_span = self.make_span(item.syntax().text_range());
+
         // Extract level number
         let level_tok = item.level_number()?;
         let level_text = level_tok.text().to_string().trim().to_string();
@@ -1568,7 +1573,7 @@ impl<'a> HirLowerer<'a> {
                     Err(msg) => {
                         self.diagnostics.push(HirDiagnostic {
                             message: format!("invalid PIC clause: {}", msg),
-                            span: self.dummy_span(),
+                            span: item_span,
                             severity: DiagnosticSeverity::Error,
                         });
                         let usage = Self::extract_usage_type(item);
@@ -1659,7 +1664,7 @@ impl<'a> HirLowerer<'a> {
             redefines,
             occurs,
             value: value.clone(),
-            span: self.dummy_span(),
+            span: item_span,
             is_group,
             sign_clause,
             justified_right,
@@ -2179,6 +2184,7 @@ impl<'a> HirLowerer<'a> {
     }
 
     fn lower_procedure_division(&mut self, proc_div: &cobol_ast::ProcedureDivision) {
+        let proc_span = self.make_span(proc_div.syntax().text_range());
         // Extract USING parameters: scan direct token children for
         // "USING" keyword followed by parameter names until period.
         let mut saw_using = false;
@@ -2231,7 +2237,7 @@ impl<'a> HirLowerer<'a> {
             self.paragraphs.push(HirParagraph {
                 name,
                 statements: loose_stmts,
-                span: self.dummy_span(),
+                span: proc_span,
             });
         }
 
@@ -2242,6 +2248,7 @@ impl<'a> HirLowerer<'a> {
 
         // Handle sections and their contained paragraphs
         for section in proc_div.sections() {
+            let section_span = self.make_span(section.syntax().text_range());
             let section_name = if let Some(tok) = section.name() {
                 self.interner
                     .intern(&tok.text().to_string().to_ascii_uppercase())
@@ -2264,7 +2271,7 @@ impl<'a> HirLowerer<'a> {
                 self.paragraphs.push(HirParagraph {
                     name: implicit_name,
                     statements: section_loose_stmts,
-                    span: self.dummy_span(),
+                    span: section_span,
                 });
             }
 
@@ -2279,12 +2286,13 @@ impl<'a> HirLowerer<'a> {
             self.sections.push(HirSection {
                 name: section_name,
                 paragraphs: paragraph_indices,
-                span: self.dummy_span(),
+                span: section_span,
             });
         }
     }
 
     fn lower_paragraph(&mut self, para: &cobol_ast::Paragraph) {
+        let para_span = self.make_span(para.syntax().text_range());
         let name = if let Some(tok) = para.name() {
             self.interner.intern(tok.text())
         } else {
@@ -2299,7 +2307,7 @@ impl<'a> HirLowerer<'a> {
         self.paragraphs.push(HirParagraph {
             name,
             statements,
-            span: self.dummy_span(),
+            span: para_span,
         });
     }
 
@@ -7075,7 +7083,7 @@ mod tests {
         let root = parse_result.syntax();
         let sf = cobol_ast::SourceFile::cast(root).unwrap();
         let mut interner = cobol_intern::Interner::default();
-        let module = lower(&sf, &mut interner);
+        let module = lower(&sf, &mut interner, cobol_span::FileId::new(0));
 
         let item = find_ws_item(&module, &interner, "WS-ITEM");
         assert_eq!(item.storage.usage, UsageType::Display);
@@ -7092,7 +7100,7 @@ mod tests {
         let root = parse_result.syntax();
         let sf = cobol_ast::SourceFile::cast(root).unwrap();
         let mut interner = cobol_intern::Interner::default();
-        let module = lower(&sf, &mut interner);
+        let module = lower(&sf, &mut interner, cobol_span::FileId::new(0));
 
         let item = find_ws_item(&module, &interner, "WS-COMP");
         assert_eq!(item.storage.usage, UsageType::Comp);
@@ -7109,7 +7117,7 @@ mod tests {
         let root = parse_result.syntax();
         let sf = cobol_ast::SourceFile::cast(root).unwrap();
         let mut interner = cobol_intern::Interner::default();
-        let module = lower(&sf, &mut interner);
+        let module = lower(&sf, &mut interner, cobol_span::FileId::new(0));
 
         let item = find_ws_item(&module, &interner, "WS-PACKED");
         assert_eq!(item.storage.usage, UsageType::Comp3);
@@ -7126,7 +7134,7 @@ mod tests {
         let root = parse_result.syntax();
         let sf = cobol_ast::SourceFile::cast(root).unwrap();
         let mut interner = cobol_intern::Interner::default();
-        let module = lower(&sf, &mut interner);
+        let module = lower(&sf, &mut interner, cobol_span::FileId::new(0));
 
         let item = find_ws_item(&module, &interner, "WS-BIN");
         assert_eq!(item.storage.usage, UsageType::Binary);
@@ -7143,7 +7151,7 @@ mod tests {
         let root = parse_result.syntax();
         let sf = cobol_ast::SourceFile::cast(root).unwrap();
         let mut interner = cobol_intern::Interner::default();
-        let module = lower(&sf, &mut interner);
+        let module = lower(&sf, &mut interner, cobol_span::FileId::new(0));
 
         let item = find_ws_item(&module, &interner, "WS-PKD");
         assert_eq!(item.storage.usage, UsageType::PackedDecimal);
@@ -7160,7 +7168,7 @@ mod tests {
         let root = parse_result.syntax();
         let sf = cobol_ast::SourceFile::cast(root).unwrap();
         let mut interner = cobol_intern::Interner::default();
-        let module = lower(&sf, &mut interner);
+        let module = lower(&sf, &mut interner, cobol_span::FileId::new(0));
 
         let item = find_ws_item(&module, &interner, "WS-BIG");
         assert_eq!(item.storage.usage, UsageType::Comp);
@@ -7177,7 +7185,7 @@ mod tests {
         let root = parse_result.syntax();
         let sf = cobol_ast::SourceFile::cast(root).unwrap();
         let mut interner = cobol_intern::Interner::default();
-        let module = lower(&sf, &mut interner);
+        let module = lower(&sf, &mut interner, cobol_span::FileId::new(0));
 
         let item = find_ws_item(&module, &interner, "WS-DEFAULT");
         assert_eq!(item.storage.usage, UsageType::Display);
@@ -7195,7 +7203,7 @@ mod tests {
         let root = parse_result.syntax();
         let sf = cobol_ast::SourceFile::cast(root).unwrap();
         let mut interner = cobol_intern::Interner::default();
-        let module = lower(&sf, &mut interner);
+        let module = lower(&sf, &mut interner, cobol_span::FileId::new(0));
 
         let item = find_ws_item(&module, &interner, "WS-ISCOMP");
         assert_eq!(item.storage.usage, UsageType::Comp);

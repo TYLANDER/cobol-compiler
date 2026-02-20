@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 description = "LLVM codegen backend for the cobolc compiler"
 
+[features]
+default = []
+llvm = ["inkwell"]
+
 [dependencies]
 cobol-mir = { workspace = true }
 cobol-span = { workspace = true }
+inkwell = { workspace = true, optional = true }

@@ -24,4 +24,6 @@ cobol-codegen-cranelift = { workspace = true }
 cobol-runtime = { workspace = true }
 cobol-diag = { workspace = true }
 cobol-db = { workspace = true }
+cobol-lsp = { workspace = true }
 clap = { workspace = true }
+tokio = { workspace = true }

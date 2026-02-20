@@ -6,6 +6,8 @@
 //! once) and include COBOL-specific operations for decimal arithmetic, packed
 //! decimal conversions, and PERFORM stack management.
 
+pub mod passes;
+
 use std::hash::Hash;
 
 // ---------------------------------------------------------------------------

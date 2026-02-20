@@ -9,3 +9,13 @@ description = "Language Server Protocol implementation for COBOL"
 cobol-db = { workspace = true }
 cobol-span = { workspace = true }
 cobol-diag = { workspace = true }
+cobol-intern = { workspace = true }
+cobol-vfs = { workspace = true }
+cobol-pp = { workspace = true }
+cobol-lexer = { workspace = true }
+cobol-parser = { workspace = true }
+cobol-ast = { workspace = true }
+cobol-hir = { workspace = true }
+tower-lsp = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }

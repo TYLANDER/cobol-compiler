@@ -2612,8 +2612,10 @@ void cobolrt_sort_using_giving(
 #[derive(Parser, Debug)]
 #[command(name = "cobolc", version, about)]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Input COBOL source file(s)
-    #[arg(required = true)]
     input: Vec<PathBuf>,
 
     /// Output file path
@@ -2653,8 +2655,28 @@ struct Cli {
     dump: bool,
 }
 
+#[derive(clap::Subcommand, Debug)]
+enum Command {
+    /// Start the Language Server Protocol server (for IDE integration)
+    Lsp,
+}
+
 fn main() {
     let cli = Cli::parse();
+
+    // Handle subcommands
+    if let Some(Command::Lsp) = cli.command {
+        let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+        rt.block_on(cobol_lsp::run_server());
+        return;
+    }
+
+    if cli.input.is_empty() {
+        eprintln!("error: no input files specified");
+        eprintln!("usage: cobolc <FILE>... [OPTIONS]");
+        eprintln!("       cobolc lsp");
+        std::process::exit(1);
+    }
 
     if cli.verbose {
         eprintln!("cobolc v{}", env!("CARGO_PKG_VERSION"));
@@ -2767,7 +2789,7 @@ fn main() {
                 let ast =
                     cobol_ast::SourceFile::cast(syntax).expect("root node should be SOURCE_FILE");
                 let mut interner = cobol_intern::Interner::new();
-                let hir = cobol_hir::lower(&ast, &mut interner);
+                let hir = cobol_hir::lower(&ast, &mut interner, file_id);
                 if cli.dump {
                     println!("{:#?}", hir);
                 }
@@ -2785,7 +2807,7 @@ fn main() {
                 let ast =
                     cobol_ast::SourceFile::cast(syntax).expect("root node should be SOURCE_FILE");
                 let mut interner = cobol_intern::Interner::new();
-                let hir = cobol_hir::lower(&ast, &mut interner);
+                let hir = cobol_hir::lower(&ast, &mut interner, file_id);
                 let mir = cobol_mir::lower(&hir, &interner);
                 if cli.dump {
                     println!("{:#?}", mir);
@@ -2816,7 +2838,7 @@ fn main() {
                     cobol_ast::SourceFile::cast(syntax).expect("root node should be SOURCE_FILE");
 
                 let mut interner = cobol_intern::Interner::new();
-                let hir = cobol_hir::lower(&ast, &mut interner);
+                let hir = cobol_hir::lower(&ast, &mut interner, file_id);
                 for diag in &hir.diagnostics {
                     if diag.severity == cobol_hir::DiagnosticSeverity::Error {
                         eprintln!("error: {}", diag.message);
@@ -2825,7 +2847,7 @@ fn main() {
 
                 // First input file is the main program; subsequent files are subprograms
                 let is_main = input_idx == 0;
-                let mir = cobol_mir::lower_with_options(&hir, &interner, is_main);
+                let mut mir = cobol_mir::lower_with_options(&hir, &interner, is_main);
 
                 if !mir.errors.is_empty() {
                     for err in &mir.errors {
@@ -2833,6 +2855,14 @@ fn main() {
                     }
                     std::process::exit(1);
                 }
+
+                // Run MIR optimization passes.
+                let mir_opt_level = match cli.opt_level.as_str() {
+                    "0" => cobol_mir::passes::OptLevel::None,
+                    "1" => cobol_mir::passes::OptLevel::Basic,
+                    _ => cobol_mir::passes::OptLevel::Full,
+                };
+                cobol_mir::passes::optimize(&mut mir, mir_opt_level);
 
                 if cli.verbose {
                     eprintln!(
@@ -2860,9 +2890,13 @@ fn main() {
                 use cobol_codegen_llvm::CodegenBackend;
                 let backend: Box<dyn CodegenBackend> = match cli.backend.as_str() {
                     "cranelift" => Box::new(cobol_codegen_cranelift::CraneliftBackend::new()),
-                    _ => {
+                    "llvm" => Box::new(cobol_codegen_llvm::LlvmBackend::new(
+                        cobol_codegen_llvm::OptLevel::O2,
+                    )),
+                    other => {
                         eprintln!(
-                            "error: LLVM backend not yet implemented, use --backend=cranelift"
+                            "error: unknown backend '{}', use 'cranelift' or 'llvm'",
+                            other
                         );
                         std::process::exit(1);
                     }
