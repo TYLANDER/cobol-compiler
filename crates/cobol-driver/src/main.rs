@@ -271,6 +271,143 @@ static void int_to_display(long long value, char *data, unsigned int len) {
     int_to_display_ex(value, data, len, 1);
 }
 
+/* ---------- COMP (BINARY) encoding helpers ---------- */
+/* Encoding constants: 0=display, 1=COMP(binary), 2=COMP-3(packed BCD) */
+#define ENC_DISPLAY 0
+#define ENC_COMP    1
+#define ENC_COMP3   2
+
+/* Read a big-endian signed binary integer from COMP storage. */
+static long long comp_to_int(const char *data, unsigned int byte_size) {
+    /* Sign-extend from the first byte */
+    long long result = (signed char)data[0];
+    for (unsigned int i = 1; i < byte_size; i++) {
+        result = (result << 8) | ((unsigned char)data[i]);
+    }
+    return result;
+}
+
+/* Write a signed integer as big-endian binary into COMP storage. */
+static void int_to_comp(long long value, char *data, unsigned int byte_size, int is_signed) {
+    if (!is_signed && value < 0) {
+        _cobol_size_error_flag = 1;
+        value = -value;
+    }
+    for (int i = (int)byte_size - 1; i >= 0; i--) {
+        data[i] = (char)(value & 0xFF);
+        value >>= 8;
+    }
+}
+
+/* Read a packed BCD (COMP-3) value. Last nibble is sign: 0xC=positive, 0xD=negative, 0xF=unsigned.
+ * Each byte holds two BCD digits, except the last byte's low nibble is the sign. */
+static long long comp3_to_int(const char *data, unsigned int byte_size) {
+    long long result = 0;
+    int negative = 0;
+    for (unsigned int i = 0; i < byte_size; i++) {
+        unsigned char b = (unsigned char)data[i];
+        unsigned char hi = (b >> 4) & 0x0F;
+        unsigned char lo = b & 0x0F;
+        if (i == byte_size - 1) {
+            /* Last byte: high nibble is last digit, low nibble is sign */
+            if (hi <= 9) result = result * 10 + hi;
+            if (lo == 0x0D || lo == 0x0B) negative = 1;
+        } else {
+            if (hi <= 9) result = result * 10 + hi;
+            if (lo <= 9) result = result * 10 + lo;
+        }
+    }
+    return negative ? -result : result;
+}
+
+/* Write a signed integer as packed BCD (COMP-3). */
+static void int_to_comp3(long long value, char *data, unsigned int byte_size, int is_signed) {
+    int negative = (value < 0);
+    if (negative) value = -value;
+    if (!is_signed && negative) {
+        _cobol_size_error_flag = 1;
+    }
+    memset(data, 0, byte_size);
+    /* Number of digit positions = byte_size * 2 - 1 (last nibble is sign) */
+    int num_digits = (int)byte_size * 2 - 1;
+    /* Fill digits right-to-left */
+    unsigned char digits[32];
+    memset(digits, 0, sizeof(digits));
+    for (int i = num_digits - 1; i >= 0 && value > 0; i--) {
+        digits[i] = (unsigned char)(value % 10);
+        value /= 10;
+    }
+    /* Pack into bytes */
+    int d = 0;
+    for (unsigned int i = 0; i < byte_size; i++) {
+        unsigned char hi = digits[d++];
+        unsigned char lo;
+        if (i == byte_size - 1) {
+            /* Last byte: sign nibble */
+            lo = (negative && is_signed) ? 0x0D : 0x0C;
+        } else {
+            lo = digits[d++];
+        }
+        data[i] = (char)((hi << 4) | lo);
+    }
+}
+
+/* Generic field-to-int: dispatch based on encoding. */
+static long long field_to_int(const char *data, unsigned int len, int encoding) {
+    switch (encoding) {
+        case ENC_COMP:  return comp_to_int(data, len);
+        case ENC_COMP3: return comp3_to_int(data, len);
+        default:        return display_to_int(data, len);
+    }
+}
+
+/* Generic int-to-field: dispatch based on encoding. */
+static void int_to_field(long long value, char *data, unsigned int len, int encoding, int is_signed) {
+    switch (encoding) {
+        case ENC_COMP:  int_to_comp(value, data, len, is_signed); break;
+        case ENC_COMP3: int_to_comp3(value, data, len, is_signed); break;
+        default:        int_to_display_ex(value, data, len, is_signed); break;
+    }
+}
+
+/* Display a COMP field: convert to decimal string and write to stdout. */
+void cobolrt_display_comp(const char *data, unsigned int byte_size,
+                          unsigned int digits, int is_signed) {
+    long long val = comp_to_int(data, byte_size);
+    int negative = (val < 0);
+    if (negative) val = -val;
+    char buf[32];
+    int len = 0;
+    if (val == 0) { buf[len++] = '0'; }
+    else {
+        char tmp[32]; int tlen = 0;
+        while (val > 0) { tmp[tlen++] = '0' + (char)(val % 10); val /= 10; }
+        for (int i = tlen - 1; i >= 0; i--) buf[len++] = tmp[i];
+    }
+    if (negative && is_signed) { fputc('-', stdout); }
+    fwrite(buf, 1, len, stdout);
+    fflush(stdout);
+}
+
+/* Display a COMP-3 field: convert to decimal string and write to stdout. */
+void cobolrt_display_comp3(const char *data, unsigned int byte_size,
+                           unsigned int digits, int is_signed) {
+    long long val = comp3_to_int(data, byte_size);
+    int negative = (val < 0);
+    if (negative) val = -val;
+    char buf[32];
+    int len = 0;
+    if (val == 0) { buf[len++] = '0'; }
+    else {
+        char tmp[32]; int tlen = 0;
+        while (val > 0) { tmp[tlen++] = '0' + (char)(val % 10); val /= 10; }
+        for (int i = tlen - 1; i >= 0; i--) buf[len++] = tmp[i];
+    }
+    if (negative && is_signed) { fputc('-', stdout); }
+    fwrite(buf, 1, len, stdout);
+    fflush(stdout);
+}
+
 void cobolrt_add_numeric(
     const char *src1, unsigned int src1_len,
     const char *src2, unsigned int src2_len,
@@ -281,6 +418,18 @@ void cobolrt_add_numeric(
     long long b = display_to_int(src2, src2_len);
     long long result = a + b;
     int_to_display_ex(result, dest, dest_len, dest_is_signed);
+}
+
+void cobolrt_add_numeric_enc(
+    const char *src1, unsigned int src1_len, int src1_enc,
+    const char *src2, unsigned int src2_len, int src2_enc,
+    char *dest, unsigned int dest_len, int dest_enc,
+    int dest_is_signed
+) {
+    long long a = field_to_int(src1, src1_len, src1_enc);
+    long long b = field_to_int(src2, src2_len, src2_enc);
+    long long result = a + b;
+    int_to_field(result, dest, dest_len, dest_enc, dest_is_signed);
 }
 
 void cobolrt_subtract_numeric(
@@ -295,6 +444,18 @@ void cobolrt_subtract_numeric(
     int_to_display_ex(result, dest, dest_len, dest_is_signed);
 }
 
+void cobolrt_subtract_numeric_enc(
+    const char *src1, unsigned int src1_len, int src1_enc,
+    const char *src2, unsigned int src2_len, int src2_enc,
+    char *dest, unsigned int dest_len, int dest_enc,
+    int dest_is_signed
+) {
+    long long a = field_to_int(src1, src1_len, src1_enc);
+    long long b = field_to_int(src2, src2_len, src2_enc);
+    long long result = a - b;
+    int_to_field(result, dest, dest_len, dest_enc, dest_is_signed);
+}
+
 void cobolrt_multiply_numeric(
     const char *src1, unsigned int src1_len,
     const char *src2, unsigned int src2_len,
@@ -305,6 +466,18 @@ void cobolrt_multiply_numeric(
     long long b = display_to_int(src2, src2_len);
     long long result = a * b;
     int_to_display_ex(result, dest, dest_len, dest_is_signed);
+}
+
+void cobolrt_multiply_numeric_enc(
+    const char *src1, unsigned int src1_len, int src1_enc,
+    const char *src2, unsigned int src2_len, int src2_enc,
+    char *dest, unsigned int dest_len, int dest_enc,
+    int dest_is_signed
+) {
+    long long a = field_to_int(src1, src1_len, src1_enc);
+    long long b = field_to_int(src2, src2_len, src2_enc);
+    long long result = a * b;
+    int_to_field(result, dest, dest_len, dest_enc, dest_is_signed);
 }
 
 void cobolrt_divide_numeric(
@@ -324,6 +497,22 @@ void cobolrt_divide_numeric(
     int_to_display_ex(result, dest, dest_len, dest_is_signed);
 }
 
+void cobolrt_divide_numeric_enc(
+    const char *src1, unsigned int src1_len, int src1_enc,
+    const char *src2, unsigned int src2_len, int src2_enc,
+    char *dest, unsigned int dest_len, int dest_enc,
+    int dest_is_signed
+) {
+    long long a = field_to_int(src1, src1_len, src1_enc);
+    long long b = field_to_int(src2, src2_len, src2_enc);
+    if (b == 0) {
+        _cobol_size_error_flag = 1;
+        return;
+    }
+    long long result = a / b;
+    int_to_field(result, dest, dest_len, dest_enc, dest_is_signed);
+}
+
 int cobolrt_compare_numeric(
     const char *src1, unsigned int src1_len,
     const char *src2, unsigned int src2_len
@@ -333,6 +522,27 @@ int cobolrt_compare_numeric(
     if (a < b) return -1;
     if (a > b) return 1;
     return 0;
+}
+
+int cobolrt_compare_numeric_enc(
+    const char *src1, unsigned int src1_len, int src1_enc,
+    const char *src2, unsigned int src2_len, int src2_enc
+) {
+    long long a = field_to_int(src1, src1_len, src1_enc);
+    long long b = field_to_int(src2, src2_len, src2_enc);
+    if (a < b) return -1;
+    if (a > b) return 1;
+    return 0;
+}
+
+/* Move a numeric value between fields with potentially different encodings. */
+void cobolrt_move_numeric_enc(
+    const char *src, unsigned int src_len, int src_enc,
+    char *dest, unsigned int dest_len, int dest_enc,
+    int dest_is_signed
+) {
+    long long val = field_to_int(src, src_len, src_enc);
+    int_to_field(val, dest, dest_len, dest_enc, dest_is_signed);
 }
 
 /* Convert display-format bytes to a 64-bit integer (public runtime function). */

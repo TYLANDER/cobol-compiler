@@ -203,6 +203,22 @@ impl CraneliftCodegen {
                 // REDEFINES: share the same DataId as the redefined item
                 if let Some(&target_id) = self.data_ids.get(redef_target) {
                     self.data_ids.insert(g.name.clone(), target_id);
+                    // If this item also has a parent_offset (e.g. child of an
+                    // OCCURS group), record the intra-element byte offset so
+                    // subscripted access to individual fields within a multi-item
+                    // OCCURS entry lands at the correct position.
+                    if let Some((ref parent_name, byte_offset)) = g.parent_offset {
+                        let mut total_offset = byte_offset;
+                        let mut current = parent_name.clone();
+                        while let Some((grandparent, gp_offset)) =
+                            raw_parent_offsets.get(&current)
+                        {
+                            total_offset += gp_offset;
+                            current = grandparent.clone();
+                        }
+                        self.parent_offsets
+                            .insert(g.name.clone(), (current, total_offset));
+                    }
                     continue;
                 }
             }
@@ -400,12 +416,51 @@ impl CraneliftCodegen {
                 sig.params.push(AbiParam::new(types::I32)); // dest_len
                 sig.params.push(AbiParam::new(types::I32)); // dest_is_signed
             }
+            "cobolrt_add_numeric_enc"
+            | "cobolrt_subtract_numeric_enc"
+            | "cobolrt_multiply_numeric_enc"
+            | "cobolrt_divide_numeric_enc" => {
+                sig.params.push(AbiParam::new(ptr)); // src1
+                sig.params.push(AbiParam::new(types::I32)); // src1_len
+                sig.params.push(AbiParam::new(types::I32)); // src1_enc
+                sig.params.push(AbiParam::new(ptr)); // src2
+                sig.params.push(AbiParam::new(types::I32)); // src2_len
+                sig.params.push(AbiParam::new(types::I32)); // src2_enc
+                sig.params.push(AbiParam::new(ptr)); // dest
+                sig.params.push(AbiParam::new(types::I32)); // dest_len
+                sig.params.push(AbiParam::new(types::I32)); // dest_enc
+                sig.params.push(AbiParam::new(types::I32)); // dest_is_signed
+            }
             "cobolrt_compare_numeric" | "cobolrt_compare_alphanumeric" => {
                 sig.params.push(AbiParam::new(ptr)); // src1
                 sig.params.push(AbiParam::new(types::I32)); // src1_len
                 sig.params.push(AbiParam::new(ptr)); // src2
                 sig.params.push(AbiParam::new(types::I32)); // src2_len
                 sig.returns.push(AbiParam::new(types::I32)); // -1, 0, 1
+            }
+            "cobolrt_compare_numeric_enc" => {
+                sig.params.push(AbiParam::new(ptr)); // src1
+                sig.params.push(AbiParam::new(types::I32)); // src1_len
+                sig.params.push(AbiParam::new(types::I32)); // src1_enc
+                sig.params.push(AbiParam::new(ptr)); // src2
+                sig.params.push(AbiParam::new(types::I32)); // src2_len
+                sig.params.push(AbiParam::new(types::I32)); // src2_enc
+                sig.returns.push(AbiParam::new(types::I32)); // -1, 0, 1
+            }
+            "cobolrt_display_comp" | "cobolrt_display_comp3" => {
+                sig.params.push(AbiParam::new(ptr)); // data
+                sig.params.push(AbiParam::new(types::I32)); // byte_size
+                sig.params.push(AbiParam::new(types::I32)); // digits
+                sig.params.push(AbiParam::new(types::I32)); // is_signed
+            }
+            "cobolrt_move_numeric_enc" => {
+                sig.params.push(AbiParam::new(ptr)); // src
+                sig.params.push(AbiParam::new(types::I32)); // src_len
+                sig.params.push(AbiParam::new(types::I32)); // src_enc
+                sig.params.push(AbiParam::new(ptr)); // dest
+                sig.params.push(AbiParam::new(types::I32)); // dest_len
+                sig.params.push(AbiParam::new(types::I32)); // dest_enc
+                sig.params.push(AbiParam::new(types::I32)); // dest_is_signed
             }
             "cobolrt_is_numeric"
             | "cobolrt_is_alphabetic"

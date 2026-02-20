@@ -1,0 +1,24 @@
+       IDENTIFICATION DIVISION.
+       PROGRAM-ID. SMOKE-COMP.
+       DATA DIVISION.
+       WORKING-STORAGE SECTION.
+       01 WS-A PIC S9(4) USAGE COMP VALUE 1000.
+       01 WS-B PIC S9(4) USAGE COMP VALUE 500.
+       01 WS-C PIC S9(4) USAGE COMP VALUE 0.
+       01 WS-P PIC S9(4) USAGE COMP-3 VALUE 500.
+       01 WS-Q PIC S9(4) USAGE COMP-3 VALUE 123.
+       01 WS-R PIC S9(4) USAGE COMP-3 VALUE 0.
+       PROCEDURE DIVISION.
+           ADD WS-A WS-B GIVING WS-C.
+           IF WS-C = 1500
+               DISPLAY "COMP-ADD PASS"
+           ELSE
+               DISPLAY "COMP-ADD FAIL GOT " WS-C
+           END-IF.
+           ADD WS-P WS-Q GIVING WS-R.
+           IF WS-R = 623
+               DISPLAY "COMP3-ADD PASS"
+           ELSE
+               DISPLAY "COMP3-ADD FAIL GOT " WS-R
+           END-IF.
+           STOP RUN.

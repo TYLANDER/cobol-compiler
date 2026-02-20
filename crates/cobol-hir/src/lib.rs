@@ -1362,10 +1362,14 @@ impl<'a> HirLowerer<'a> {
         let level_text = level_tok.text().to_string().trim().to_string();
         let level: u8 = level_text.parse().unwrap_or(1);
 
-        // Extract data name
-        let name = item.data_name().map(|tok| {
+        // Extract data name (FILLER is treated as anonymous — no name)
+        let name = item.data_name().and_then(|tok| {
             let name_text = tok.text().to_string();
-            self.interner.intern(&name_text)
+            if name_text.eq_ignore_ascii_case("FILLER") {
+                None
+            } else {
+                Some(self.interner.intern(&name_text))
+            }
         });
 
         // Extract PIC clause
