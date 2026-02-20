@@ -66,15 +66,30 @@ Source → Preprocessor → Lexer → Parser → AST → HIR → MIR → LLVM/Cr
 
 ## Status
 
-**Phase 1: Minimal Viable Compiler** (in progress)
+**Phase 1: Minimal Viable Compiler** — complete
 
-- [x] Project scaffold and interface contracts
-- [ ] Lexer (fixed-format)
-- [ ] Parser (core divisions)
-- [ ] Basic HIR and MIR
-- [ ] LLVM codegen (Hello World)
-- [ ] Runtime (DISPLAY, basic decimal)
-- [ ] Smoke tests passing
+- [x] 16-crate Rust workspace with Cranelift backend
+- [x] Pipeline: Lexer → Parser (rowan CST) → HIR → MIR (SSA) → Cranelift codegen → native binary
+- [x] 11 initial smoke tests passing
+
+**Phase 2: NIST CCVS Compliance** — complete
+
+- [x] 379/382 NIST CCVS tests passing (1107 sub-tests), 3 skipped
+- [x] 30 smoke tests passing
+- [x] Nucleus (NC): 300 tests — arithmetic, control flow, tables, INSPECT, OCCURS, INDEXED BY, SEARCH, STRING/UNSTRING
+- [x] Sequential I/O (SQ): 25 tests — OPEN, READ, WRITE, CLOSE, multi-file handling
+- [x] Source Manipulation (SM): 30 tests — COPY, REPLACING, nested copybooks
+- [x] Inter-program Communication (IC): 27 tests — CALL, USING, BY REFERENCE/CONTENT/VALUE, subprograms
+- [x] COMP/COMP-3 encoding (binary and packed BCD) with encoding-aware arithmetic
+- [x] Level-88 conditions, EVALUATE/ALSO, DIVIDE/REMAINDER, SORT, INITIALIZE
+
+**Phase 3: Extended Language Coverage** — in progress
+
+- [ ] Intrinsic Functions (IF module)
+- [ ] SORT/MERGE statements (ST module)
+- [ ] Indexed I/O (IX module)
+- [ ] Relative I/O (RL module)
+- [ ] Regression expected-output baseline for all passing tests
 
 ## License
 
