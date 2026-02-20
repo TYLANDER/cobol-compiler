@@ -558,6 +558,7 @@ impl LanguageServer for CobolLanguageServer {
                     prepare_provider: Some(true),
                     work_done_progress_options: Default::default(),
                 })),
+                document_formatting_provider: Some(OneOf::Left(true)),
                 folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
                 semantic_tokens_provider: Some(
                     SemanticTokensServerCapabilities::SemanticTokensOptions(
@@ -1298,6 +1299,279 @@ impl LanguageServer for CobolLanguageServer {
 
         Ok(Some(ranges))
     }
+
+    async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
+        let uri = &params.text_document.uri;
+        let state = self.state.lock().await;
+
+        let file = match state.files.get(uri) {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+
+        let formatted = if file.source_format == cobol_lexer::SourceFormat::Free {
+            format_free(&file.source)
+        } else {
+            format_fixed(&file.source)
+        };
+
+        if formatted == file.source {
+            return Ok(Some(vec![]));
+        }
+
+        // Replace the entire document
+        let line_count = file.source.lines().count() as u32;
+        let last_line_len = file.source.lines().last().map_or(0, |l| l.len()) as u32;
+        Ok(Some(vec![TextEdit {
+            range: Range {
+                start: Position::new(0, 0),
+                end: Position::new(line_count, last_line_len),
+            },
+            new_text: formatted,
+        }]))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// COBOL Formatting — Fixed Format
+// ---------------------------------------------------------------------------
+
+/// Words that identify Area-A items (divisions, sections, paragraphs).
+const AREA_A_KEYWORDS: &[&str] = &[
+    "IDENTIFICATION",
+    "ENVIRONMENT",
+    "DATA",
+    "PROCEDURE",
+    "WORKING-STORAGE",
+    "LOCAL-STORAGE",
+    "LINKAGE",
+    "FILE",
+    "INPUT-OUTPUT",
+    "CONFIGURATION",
+    "FD",
+    "SD",
+];
+
+/// Format a fixed-format COBOL source file.
+fn format_fixed(source: &str) -> String {
+    let mut result = String::with_capacity(source.len());
+
+    for line in source.lines() {
+        let formatted = format_fixed_line(line);
+        result.push_str(&formatted);
+        result.push('\n');
+    }
+
+    // Preserve original trailing newline behavior
+    if !source.ends_with('\n') && result.ends_with('\n') {
+        result.pop();
+    }
+
+    result
+}
+
+/// Format a single fixed-format line.
+fn format_fixed_line(line: &str) -> String {
+    // Empty or very short lines — pass through
+    if line.trim().is_empty() {
+        return String::new();
+    }
+
+    // Get the content, handling lines shorter than 7 columns
+    let bytes = line.as_bytes();
+    let len = bytes.len();
+
+    // If the line has an indicator in column 7 that's a comment/debug/continuation, preserve it
+    if len >= 7 {
+        let indicator = bytes[6] as char;
+        if indicator == '*' || indicator == '/' || indicator == 'D' || indicator == 'd' {
+            // Comment/debug line — just trim trailing spaces
+            return line.trim_end().to_string();
+        }
+        if indicator == '-' {
+            // Continuation line — trim trailing spaces
+            return line.trim_end().to_string();
+        }
+    }
+
+    // Extract the code content (skip sequence area cols 1-6 and indicator col 7)
+    let content = if len > 7 {
+        &line[7..]
+    } else if len > 6 {
+        ""
+    } else {
+        // Short line (< 7 chars) — could be sequence area only
+        return line.trim_end().to_string();
+    };
+
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    // Determine if this is an Area A item (column 8) or Area B (column 12)
+    let area_a = is_area_a_line(trimmed);
+
+    // Build the formatted line: 6 spaces for sequence area + 1 space for indicator
+    let indent = if area_a {
+        "       " // 7 spaces = cols 1-7, content starts at col 8
+    } else {
+        "           " // 11 spaces = cols 1-7 + 4 more for Area B at col 12
+    };
+
+    // Uppercase COBOL words and trim trailing whitespace
+    let uppercased = uppercase_cobol_words(trimmed);
+    format!("{}{}", indent, uppercased.trim_end())
+}
+
+/// Determine whether a content line belongs in Area A (column 8) or Area B (column 12).
+fn is_area_a_line(trimmed: &str) -> bool {
+    let upper = trimmed.to_ascii_uppercase();
+    let first_word = upper.split_whitespace().next().unwrap_or("");
+
+    // Division headers
+    if upper.contains("DIVISION") && upper.ends_with('.') {
+        return true;
+    }
+
+    // Section headers
+    if upper.contains("SECTION") && upper.ends_with('.') {
+        return true;
+    }
+
+    // FD / SD
+    if first_word == "FD" || first_word == "SD" {
+        return true;
+    }
+
+    // Level 01 and 77 data items
+    if first_word == "01" || first_word == "1" || first_word == "77" {
+        return true;
+    }
+
+    // Paragraph names: a word followed by a period on its own line
+    // (or PROGRAM-ID, etc. — but those are in divisions)
+    if AREA_A_KEYWORDS.contains(&first_word) {
+        return true;
+    }
+
+    // A standalone word ending with period (paragraph name)
+    if trimmed.ends_with('.')
+        && !trimmed.contains(' ')
+        && first_word.chars().next().is_some_and(|c| c.is_alphabetic())
+    {
+        return true;
+    }
+
+    false
+}
+
+/// Uppercase COBOL reserved words while preserving string literals.
+fn uppercase_cobol_words(line: &str) -> String {
+    let mut result = String::with_capacity(line.len());
+    let mut in_string = false;
+    let mut string_delim = '"';
+    let mut word_start = None;
+
+    for (i, ch) in line.char_indices() {
+        if in_string {
+            result.push(ch);
+            if ch == string_delim {
+                in_string = false;
+            }
+            continue;
+        }
+
+        if ch == '"' || ch == '\'' {
+            // Flush any pending word
+            if let Some(start) = word_start.take() {
+                let word = &line[start..i];
+                result.push_str(&word.to_ascii_uppercase());
+            }
+            in_string = true;
+            string_delim = ch;
+            result.push(ch);
+            continue;
+        }
+
+        if ch.is_alphanumeric() || ch == '-' || ch == '_' {
+            if word_start.is_none() {
+                word_start = Some(i);
+            }
+        } else {
+            if let Some(start) = word_start.take() {
+                let word = &line[start..i];
+                result.push_str(&word.to_ascii_uppercase());
+            }
+            result.push(ch);
+        }
+    }
+
+    // Flush final word
+    if let Some(start) = word_start {
+        let word = &line[start..];
+        result.push_str(&word.to_ascii_uppercase());
+    }
+
+    result
+}
+
+// ---------------------------------------------------------------------------
+// COBOL Formatting — Free Format
+// ---------------------------------------------------------------------------
+
+/// Format a free-format COBOL source file.
+fn format_free(source: &str) -> String {
+    let mut result = String::with_capacity(source.len());
+
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            result.push('\n');
+            continue;
+        }
+
+        // Comment lines
+        if trimmed.starts_with("*>") {
+            result.push_str(trimmed);
+            result.push('\n');
+            continue;
+        }
+
+        // Compiler directives
+        if trimmed.starts_with(">>") {
+            result.push_str(trimmed);
+            result.push('\n');
+            continue;
+        }
+
+        // Determine indentation level
+        let upper = trimmed.to_ascii_uppercase();
+        let first_word = upper.split_whitespace().next().unwrap_or("");
+
+        let is_top_level = (upper.contains("DIVISION") && upper.ends_with('.'))
+            || (upper.contains("SECTION") && upper.ends_with('.'))
+            || first_word == "FD"
+            || first_word == "SD"
+            || first_word == "01"
+            || first_word == "1"
+            || first_word == "77"
+            || AREA_A_KEYWORDS.contains(&first_word);
+        let indent: usize = if is_top_level { 0 } else { 4 };
+
+        let uppercased = uppercase_cobol_words(trimmed);
+        for _ in 0..indent {
+            result.push(' ');
+        }
+        result.push_str(uppercased.trim_end());
+        result.push('\n');
+    }
+
+    if !source.ends_with('\n') && result.ends_with('\n') {
+        result.pop();
+    }
+
+    result
 }
 
 /// Checks if the line prefix ends with a COBOL verb (indicating data names should follow).
@@ -1550,5 +1824,81 @@ mod tests {
             "too many parse errors in free-format: {:?}",
             parse_result.errors
         );
+    }
+
+    #[test]
+    fn format_fixed_division_area_a() {
+        let input = "            IDENTIFICATION DIVISION.\n";
+        let result = format_fixed(input);
+        assert_eq!(result, "       IDENTIFICATION DIVISION.\n");
+    }
+
+    #[test]
+    fn format_fixed_statement_area_b() {
+        let input = "       MOVE 1 TO WS-A.\n";
+        let result = format_fixed(input);
+        assert_eq!(result, "           MOVE 1 TO WS-A.\n");
+    }
+
+    #[test]
+    fn format_fixed_preserves_comments() {
+        let input = "      * This is a comment\n";
+        let result = format_fixed(input);
+        assert_eq!(result, "      * This is a comment\n");
+    }
+
+    #[test]
+    fn format_fixed_level_01_area_a() {
+        let input = "           01 WS-REC PIC X(10).\n";
+        let result = format_fixed(input);
+        assert_eq!(result, "       01 WS-REC PIC X(10).\n");
+    }
+
+    #[test]
+    fn format_fixed_level_05_area_b() {
+        let input = "       05 WS-FIELD PIC 9(3).\n";
+        let result = format_fixed(input);
+        assert_eq!(result, "           05 WS-FIELD PIC 9(3).\n");
+    }
+
+    #[test]
+    fn format_fixed_uppercases_keywords() {
+        let input = "           move ws-a to ws-b.\n";
+        let result = format_fixed(input);
+        assert_eq!(result, "           MOVE WS-A TO WS-B.\n");
+    }
+
+    #[test]
+    fn format_fixed_preserves_strings() {
+        let input = "           display \"hello world\".\n";
+        let result = format_fixed(input);
+        assert_eq!(result, "           DISPLAY \"hello world\".\n");
+    }
+
+    #[test]
+    fn format_free_basic() {
+        let input = "IDENTIFICATION DIVISION.\nPROGRAM-ID. TEST.\n    move a to b.\n";
+        let result = format_free(input);
+        // PROGRAM-ID is indented as a clause (4 spaces), statements also 4 spaces
+        assert_eq!(
+            result,
+            "IDENTIFICATION DIVISION.\n    PROGRAM-ID. TEST.\n    MOVE A TO B.\n"
+        );
+    }
+
+    #[test]
+    fn format_free_preserves_comments() {
+        let input = "*> This is a comment\n";
+        let result = format_free(input);
+        assert_eq!(result, "*> This is a comment\n");
+    }
+
+    #[test]
+    fn uppercase_preserves_quoted_strings() {
+        assert_eq!(
+            uppercase_cobol_words("display \"hello\""),
+            "DISPLAY \"hello\""
+        );
+        assert_eq!(uppercase_cobol_words("display 'hello'"), "DISPLAY 'hello'");
     }
 }
