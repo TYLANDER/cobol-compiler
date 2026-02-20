@@ -1785,8 +1785,12 @@ impl<'a> MirLowerer<'a> {
             cobol_hir::HirStatement::Close { file } => {
                 self.lower_file_close(*file, func, instructions);
             }
-            cobol_hir::HirStatement::Write { record } => {
-                self.lower_file_write(*record, func, instructions);
+            cobol_hir::HirStatement::Write {
+                record,
+                from,
+                advancing,
+            } => {
+                self.lower_file_write(*record, *from, *advancing, func, instructions);
             }
             cobol_hir::HirStatement::Read {
                 file, into, at_end, ..
@@ -4191,6 +4195,31 @@ impl<'a> MirLowerer<'a> {
         }
     }
 
+    /// Emit instructions to update the FILE STATUS variable for a file, if one is defined.
+    /// `status_value` is a MIR Value containing the COBOL status code (0, 10, 35, etc.).
+    fn emit_file_status_update(
+        &self,
+        file_name: &str,
+        status_value: Value,
+        func: &mut MirFunction,
+        instructions: &mut Vec<MirInst>,
+    ) {
+        if let Some(status_var) = self.file_status_map.get(file_name) {
+            if let Some(&_idx) = self.global_map.get(status_var) {
+                let status_addr = func.new_value();
+                instructions.push(MirInst::GlobalAddr {
+                    dest: status_addr,
+                    name: status_var.clone(),
+                });
+                instructions.push(MirInst::CallRuntime {
+                    dest: None,
+                    func: "cobolrt_set_file_status".to_string(),
+                    args: vec![status_addr, status_value],
+                });
+            }
+        }
+    }
+
     /// Lower OPEN statement.
     fn lower_file_open(
         &self,
@@ -4304,6 +4333,14 @@ impl<'a> MirLowerer<'a> {
                 value: handle_result,
             });
         }
+
+        // Update FILE STATUS: OPEN always succeeds (status 00)
+        let zero_status = func.new_value();
+        instructions.push(MirInst::Const {
+            dest: zero_status,
+            value: MirConst::Int(0),
+        });
+        self.emit_file_status_update(&file_name, zero_status, func, instructions);
     }
 
     /// Lower CLOSE statement.
@@ -4334,12 +4371,22 @@ impl<'a> MirLowerer<'a> {
                 args: vec![handle_val],
             });
         }
+
+        // Update FILE STATUS: CLOSE always succeeds (status 00)
+        let zero_status = func.new_value();
+        instructions.push(MirInst::Const {
+            dest: zero_status,
+            value: MirConst::Int(0),
+        });
+        self.emit_file_status_update(&file_name, zero_status, func, instructions);
     }
 
-    /// Lower WRITE statement.
+    /// Lower WRITE statement with optional FROM and ADVANCING.
     fn lower_file_write(
         &self,
         record: cobol_intern::Name,
+        from: Option<cobol_intern::Name>,
+        advancing: Option<cobol_hir::WriteAdvancing>,
         func: &mut MirFunction,
         instructions: &mut Vec<MirInst>,
     ) {
@@ -4377,6 +4424,38 @@ impl<'a> MirLowerer<'a> {
             return;
         };
 
+        // Handle WRITE FROM: copy source data into the record area before writing
+        if let Some(from_name) = from {
+            let from_str = self.interner.resolve(from_name).to_string();
+            if let Some(&idx) = self.global_map.get(&from_str) {
+                let from_global = &self.module.globals[idx];
+                let from_size = match &from_global.ty {
+                    MirType::Bytes(n) => *n,
+                    _ => 1,
+                };
+                let from_addr = func.new_value();
+                instructions.push(MirInst::GlobalAddr {
+                    dest: from_addr,
+                    name: from_str,
+                });
+                let src_len = func.new_value();
+                instructions.push(MirInst::Const {
+                    dest: src_len,
+                    value: MirConst::Int(from_size as i64),
+                });
+                let dest_len = func.new_value();
+                instructions.push(MirInst::Const {
+                    dest: dest_len,
+                    value: MirConst::Int(record_size as i64),
+                });
+                instructions.push(MirInst::CallRuntime {
+                    dest: None,
+                    func: "cobolrt_move_alphanumeric".to_string(),
+                    args: vec![from_addr, src_len, record_addr, dest_len],
+                });
+            }
+        }
+
         if self.global_map.contains_key(&handle_name) {
             let handle_addr = func.new_value();
             instructions.push(MirInst::GlobalAddr {
@@ -4401,18 +4480,53 @@ impl<'a> MirLowerer<'a> {
                 .copied()
                 .unwrap_or(cobol_hir::FileOrganization::Sequential);
 
-            let write_func = match org {
-                cobol_hir::FileOrganization::Relative | cobol_hir::FileOrganization::Indexed => {
-                    "cobolrt_file_write_record"
-                }
-                _ => "cobolrt_file_write_line",
-            };
+            // ADVANCING only applies to plain SEQUENTIAL (print files), not LINE SEQUENTIAL
+            let seq_advancing =
+                advancing.filter(|_| matches!(org, cobol_hir::FileOrganization::Sequential));
 
-            instructions.push(MirInst::CallRuntime {
-                dest: None,
-                func: write_func.to_string(),
-                args: vec![handle_val, record_addr, size_val],
+            if let Some(adv) = seq_advancing {
+                // Use the ADVANCING-aware write function
+                let (before_lines, after_lines) = match adv {
+                    cobol_hir::WriteAdvancing::BeforeLines(n) => (n as i64, 0),
+                    cobol_hir::WriteAdvancing::AfterLines(n) => (0, n as i64),
+                    cobol_hir::WriteAdvancing::BeforePage => (-1, 0),
+                    cobol_hir::WriteAdvancing::AfterPage => (0, -1),
+                };
+                let before_val = func.new_value();
+                instructions.push(MirInst::Const {
+                    dest: before_val,
+                    value: MirConst::Int(before_lines),
+                });
+                let after_val = func.new_value();
+                instructions.push(MirInst::Const {
+                    dest: after_val,
+                    value: MirConst::Int(after_lines),
+                });
+                instructions.push(MirInst::CallRuntime {
+                    dest: None,
+                    func: "cobolrt_file_write_advancing".to_string(),
+                    args: vec![handle_val, record_addr, size_val, before_val, after_val],
+                });
+            } else {
+                let write_func = match org {
+                    cobol_hir::FileOrganization::Relative
+                    | cobol_hir::FileOrganization::Indexed => "cobolrt_file_write_record",
+                    _ => "cobolrt_file_write_line",
+                };
+                instructions.push(MirInst::CallRuntime {
+                    dest: None,
+                    func: write_func.to_string(),
+                    args: vec![handle_val, record_addr, size_val],
+                });
+            }
+
+            // Update FILE STATUS: WRITE always succeeds (status 00)
+            let zero_status = func.new_value();
+            instructions.push(MirInst::Const {
+                dest: zero_status,
+                value: MirConst::Int(0),
             });
+            self.emit_file_status_update(&file_name, zero_status, func, instructions);
         }
     }
 
@@ -4527,8 +4641,17 @@ impl<'a> MirLowerer<'a> {
             },
         });
 
-        // Success block: copy INTO, then jump to continue
+        // Success block: set FILE STATUS 00, copy INTO, then jump to continue
         let mut success_insts = Vec::new();
+
+        // FILE STATUS: 00 = successful read
+        let status_00 = func.new_value();
+        success_insts.push(MirInst::Const {
+            dest: status_00,
+            value: MirConst::Int(0),
+        });
+        self.emit_file_status_update(&file_name, status_00, func, &mut success_insts);
+
         if let Some(into_name) = into {
             let into_str = self.interner.resolve(into_name).to_string();
             if let Some(&idx) = self.global_map.get(&into_str) {
@@ -4571,8 +4694,17 @@ impl<'a> MirLowerer<'a> {
             terminator: Terminator::Goto(continue_block),
         });
 
-        // At-end block: execute AT END statements, then jump to continue
+        // At-end block: set FILE STATUS 10, execute AT END statements, jump to continue
         let mut at_end_insts = Vec::new();
+
+        // FILE STATUS: 10 = at end / end of file
+        let status_10 = func.new_value();
+        at_end_insts.push(MirInst::Const {
+            dest: status_10,
+            value: MirConst::Int(10),
+        });
+        self.emit_file_status_update(&file_name, status_10, func, &mut at_end_insts);
+
         let mut at_end_bid = at_end_block;
         for stmt in at_end {
             self.lower_statement_to_blocks(stmt, func, &mut at_end_bid, &mut at_end_insts);
@@ -4650,6 +4782,14 @@ impl<'a> MirLowerer<'a> {
                 func: "cobolrt_file_rewrite".to_string(),
                 args: vec![handle_val, record_addr, size_val],
             });
+
+            // Update FILE STATUS: REWRITE succeeds (status 00)
+            let zero_status = func.new_value();
+            instructions.push(MirInst::Const {
+                dest: zero_status,
+                value: MirConst::Int(0),
+            });
+            self.emit_file_status_update(&file_name, zero_status, func, instructions);
         }
     }
 

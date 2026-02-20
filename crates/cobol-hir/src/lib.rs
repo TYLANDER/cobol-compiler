@@ -414,6 +414,8 @@ pub enum HirStatement {
     },
     Write {
         record: cobol_intern::Name,
+        from: Option<cobol_intern::Name>,
+        advancing: Option<WriteAdvancing>,
     },
     Read {
         file: cobol_intern::Name,
@@ -595,6 +597,19 @@ pub enum OpenMode {
     Output,
     IoMode,
     Extend,
+}
+
+/// WRITE ADVANCING clause: controls newline/page feed output around a record write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteAdvancing {
+    /// Output n newlines before the record.
+    BeforeLines(u32),
+    /// Output n newlines after the record.
+    AfterLines(u32),
+    /// Output a page feed (form feed) before the record.
+    BeforePage,
+    /// Output a page feed (form feed) after the record.
+    AfterPage,
 }
 
 /// Source for ACCEPT statement.
@@ -3124,12 +3139,71 @@ impl<'a> HirLowerer<'a> {
 
     fn lower_write_stmt(&mut self, node: &cobol_ast::SyntaxNode) -> Option<HirStatement> {
         let tokens = self.collect_tokens(node);
-        // WRITE record-name
+        // WRITE record-name [FROM source] [BEFORE|AFTER ADVANCING n LINES|PAGE]
         if tokens.len() < 2 {
             return None;
         }
         let record = self.interner.intern(&tokens[1].1.to_ascii_uppercase());
-        Some(HirStatement::Write { record })
+        let mut from = None;
+        let mut advancing = None;
+        let mut i = 2;
+
+        while i < tokens.len() {
+            let word = tokens[i].1.to_ascii_uppercase();
+            match word.as_str() {
+                "FROM" => {
+                    i += 1;
+                    if i < tokens.len() {
+                        from = Some(self.interner.intern(&tokens[i].1.to_ascii_uppercase()));
+                        i += 1;
+                    }
+                }
+                "BEFORE" | "AFTER" => {
+                    let is_before = word == "BEFORE";
+                    i += 1;
+                    // Skip optional ADVANCING keyword
+                    if i < tokens.len() && tokens[i].1.eq_ignore_ascii_case("ADVANCING") {
+                        i += 1;
+                    }
+                    // Parse count or PAGE
+                    if i < tokens.len() {
+                        let adv_word = tokens[i].1.to_ascii_uppercase();
+                        if adv_word == "PAGE" {
+                            advancing = Some(if is_before {
+                                WriteAdvancing::BeforePage
+                            } else {
+                                WriteAdvancing::AfterPage
+                            });
+                            i += 1;
+                        } else if let Ok(n) = adv_word.parse::<u32>() {
+                            // Skip optional LINE/LINES
+                            i += 1;
+                            if i < tokens.len() {
+                                let next = tokens[i].1.to_ascii_uppercase();
+                                if next == "LINE" || next == "LINES" {
+                                    i += 1;
+                                }
+                            }
+                            advancing = Some(if is_before {
+                                WriteAdvancing::BeforeLines(n)
+                            } else {
+                                WriteAdvancing::AfterLines(n)
+                            });
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
+                "END-WRITE" | "INVALID" | "NOT" => break,
+                _ => i += 1,
+            }
+        }
+
+        Some(HirStatement::Write {
+            record,
+            from,
+            advancing,
+        })
     }
 
     fn lower_read_stmt(&mut self, node: &cobol_ast::SyntaxNode) -> Option<HirStatement> {

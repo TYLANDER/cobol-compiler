@@ -20,16 +20,10 @@ runtime_fail = [
 
 # Tests to skip entirely
 skip = [
-    "SQ103A",
-    "SQ104A",
-    "SQ105A",
 ]
 
 # Optional: reasons for known failures
 [reasons]
-SQ103A = "Requires WRITE ADVANCING (line-sequential positioning) — not yet implemented"
-SQ104A = "Requires WRITE ADVANCING (line-sequential positioning) — not yet implemented"
-SQ105A = "Requires WRITE ADVANCING (line-sequential positioning) — not yet implemented"
 # NC130A: Requires qualified names (OF phrase) and MOVE/ADD CORRESPONDING
 # NC127A-TEST-2 fails: INITIALIZE with REPLACING NUMERIC DATA BY not yet implemented
 # (only the sub-test fails; the rest of NC127A passes)

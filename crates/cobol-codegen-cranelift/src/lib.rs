@@ -499,6 +499,13 @@ impl CraneliftCodegen {
                 sig.params.push(AbiParam::new(ptr)); // data ptr
                 sig.params.push(AbiParam::new(types::I32)); // data len
             }
+            "cobolrt_file_write_advancing" => {
+                sig.params.push(AbiParam::new(types::I32)); // file handle
+                sig.params.push(AbiParam::new(ptr)); // data ptr
+                sig.params.push(AbiParam::new(types::I32)); // data len
+                sig.params.push(AbiParam::new(types::I32)); // before_lines
+                sig.params.push(AbiParam::new(types::I32)); // after_lines
+            }
             "cobolrt_file_read_line" => {
                 sig.params.push(AbiParam::new(types::I32)); // file handle
                 sig.params.push(AbiParam::new(ptr)); // buffer ptr
@@ -520,6 +527,10 @@ impl CraneliftCodegen {
                 sig.params.push(AbiParam::new(types::I32)); // file handle
                 sig.params.push(AbiParam::new(ptr)); // data ptr
                 sig.params.push(AbiParam::new(types::I32)); // data len
+            }
+            "cobolrt_set_file_status" => {
+                sig.params.push(AbiParam::new(ptr)); // status var ptr
+                sig.params.push(AbiParam::new(types::I32)); // status code
             }
             "cobolrt_file_delete" => {
                 sig.params.push(AbiParam::new(types::I32)); // file handle

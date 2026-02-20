@@ -812,6 +812,37 @@ void cobolrt_file_write_line(int handle, const char *data, unsigned int data_len
     fflush(open_files[handle]);
 }
 
+/* WRITE with ADVANCING control.
+   before_lines: number of newlines to output BEFORE the record.
+   after_lines : number of newlines to output AFTER the record.
+   A value of -1 for either means PAGE (form feed).
+   Default COBOL behaviour (no ADVANCING clause) is after_lines=1, before_lines=0. */
+void cobolrt_file_write_advancing(int handle, const char *data, unsigned int data_len,
+                                   int before_lines, int after_lines) {
+    if (handle < 0 || handle >= MAX_OPEN_FILES || !open_files[handle]) return;
+
+    /* BEFORE ADVANCING */
+    if (before_lines == -1) {
+        fputc('\f', open_files[handle]); /* page */
+    } else {
+        for (int i = 0; i < before_lines; i++) fputc('\n', open_files[handle]);
+    }
+
+    /* Write data, trimming trailing spaces */
+    int end = (int)data_len - 1;
+    while (end >= 0 && data[end] == ' ') end--;
+    fwrite(data, 1, (size_t)(end + 1), open_files[handle]);
+
+    /* AFTER ADVANCING */
+    if (after_lines == -1) {
+        fputc('\f', open_files[handle]); /* page */
+    } else {
+        for (int i = 0; i < after_lines; i++) fputc('\n', open_files[handle]);
+    }
+
+    fflush(open_files[handle]);
+}
+
 int cobolrt_file_read_line(int handle, char *buffer, unsigned int buffer_len) {
     if (handle < 0 || handle >= MAX_OPEN_FILES || !open_files[handle]) return 1;
     char line[4096];
@@ -932,6 +963,17 @@ void cobolrt_file_delete(int handle) {
     }
     fflush(open_files[handle]);
     fseek(open_files[handle], (long)(pos + 1) * (long)rec_size, SEEK_SET);
+}
+
+/* Set a 2-byte FILE STATUS variable.  status_code is a COBOL-85 status:
+   0  -> "00" (successful)
+   10 -> "10" (at end / end of file)
+   35 -> "35" (file not found on OPEN INPUT)
+   etc.  We encode the two decimal digits as ASCII characters. */
+void cobolrt_set_file_status(char *status_var, int status_code) {
+    if (!status_var) return;
+    status_var[0] = '0' + (status_code / 10);
+    status_var[1] = '0' + (status_code % 10);
 }
 
 /* START: position file to a specific relative record number.
