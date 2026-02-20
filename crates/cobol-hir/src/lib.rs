@@ -4626,61 +4626,53 @@ impl<'a> HirLowerer<'a> {
             let upper = tokens[i].1.to_ascii_uppercase();
             match upper.as_str() {
                 "END-CALL" => break,
-                "ON" => {
-                    i += 1; // skip ON
-                    if i < tokens.len() && tokens[i].1.eq_ignore_ascii_case("EXCEPTION") {
-                        i += 1; // skip EXCEPTION
-                                // Collect statements until NOT or END-CALL
-                        while i < tokens.len() {
-                            let u2 = tokens[i].1.to_ascii_uppercase();
-                            if u2 == "NOT" || u2 == "END-CALL" {
-                                break;
-                            }
-                            // Parse inline statement: DISPLAY is the most common
-                            if u2 == "DISPLAY" {
-                                i += 1;
-                                if i < tokens.len() {
-                                    let expr = self.token_to_expr(tokens[i].0, &tokens[i].1);
-                                    on_exception.push(HirStatement::Display {
-                                        args: vec![expr],
-                                        no_advancing: false,
-                                    });
-                                    i += 1;
-                                }
-                            } else {
-                                i += 1;
-                            }
+                "ON" | "EXCEPTION" => {
+                    // Skip ON and EXCEPTION keywords
+                    while i < tokens.len() {
+                        let u = tokens[i].1.to_ascii_uppercase();
+                        if u == "ON" || u == "EXCEPTION" {
+                            i += 1;
+                        } else {
+                            break;
                         }
+                    }
+                    // Collect handler tokens until NOT or END-CALL
+                    let mut handler_tokens = Vec::new();
+                    while i < tokens.len() {
+                        let u = tokens[i].1.to_ascii_uppercase();
+                        if u == "NOT" || u == "END-CALL" {
+                            break;
+                        }
+                        handler_tokens.push(tokens[i].clone());
+                        i += 1;
+                    }
+                    if !handler_tokens.is_empty() {
+                        self.parse_inline_statements(&handler_tokens, &mut on_exception);
                     }
                 }
                 "NOT" => {
                     i += 1; // skip NOT
-                            // Skip ON if present
-                    if i < tokens.len() && tokens[i].1.eq_ignore_ascii_case("ON") {
+                            // Skip ON and EXCEPTION keywords
+                    while i < tokens.len() {
+                        let u = tokens[i].1.to_ascii_uppercase();
+                        if u == "ON" || u == "EXCEPTION" {
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    // Collect handler tokens until END-CALL
+                    let mut handler_tokens = Vec::new();
+                    while i < tokens.len() {
+                        let u = tokens[i].1.to_ascii_uppercase();
+                        if u == "END-CALL" {
+                            break;
+                        }
+                        handler_tokens.push(tokens[i].clone());
                         i += 1;
                     }
-                    if i < tokens.len() && tokens[i].1.eq_ignore_ascii_case("EXCEPTION") {
-                        i += 1; // skip EXCEPTION
-                                // Collect statements until END-CALL
-                        while i < tokens.len() {
-                            let u2 = tokens[i].1.to_ascii_uppercase();
-                            if u2 == "END-CALL" {
-                                break;
-                            }
-                            if u2 == "DISPLAY" {
-                                i += 1;
-                                if i < tokens.len() {
-                                    let expr = self.token_to_expr(tokens[i].0, &tokens[i].1);
-                                    not_on_exception.push(HirStatement::Display {
-                                        args: vec![expr],
-                                        no_advancing: false,
-                                    });
-                                    i += 1;
-                                }
-                            } else {
-                                i += 1;
-                            }
-                        }
+                    if !handler_tokens.is_empty() {
+                        self.parse_inline_statements(&handler_tokens, &mut not_on_exception);
                     }
                 }
                 _ => {
