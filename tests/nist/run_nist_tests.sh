@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # NIST CCVS test runner for cobolc
-# Runs all NC*, SM*, and IC* test programs and checks for PASS/FAIL.
+# Runs all NC, SM, IC, SQ, IF, ST, RL, IX test programs and checks for PASS/FAIL.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -162,6 +162,24 @@ fi
 if ls "$SCRIPT_DIR"/ST*.cob 1>/dev/null 2>&1; then
     echo "--- SORT/MERGE (ST) ---"
     for f in "$SCRIPT_DIR"/ST*.cob; do
+        [ -f "$f" ] && run_nist_test "$f"
+    done
+    echo ""
+fi
+
+# Run RL tests (Relative I/O)
+if ls "$SCRIPT_DIR"/RL*.cob 1>/dev/null 2>&1; then
+    echo "--- Relative I/O (RL) ---"
+    for f in "$SCRIPT_DIR"/RL*.cob; do
+        [ -f "$f" ] && run_nist_test "$f"
+    done
+    echo ""
+fi
+
+# Run IX tests (Indexed I/O)
+if ls "$SCRIPT_DIR"/IX*.cob 1>/dev/null 2>&1; then
+    echo "--- Indexed I/O (IX) ---"
+    for f in "$SCRIPT_DIR"/IX*.cob; do
         [ -f "$f" ] && run_nist_test "$f"
     done
     echo ""

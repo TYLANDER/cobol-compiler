@@ -16,7 +16,13 @@ SKIPPED_EXISTING=0
 SKIPPED_OTHER=0
 TOTAL=0
 
-SKIP_TESTS="SQ103A SQ104A SQ105A"
+# Load skip list from known_failures.toml (single source of truth)
+KNOWN_FAILURES="$NIST_DIR/known_failures.toml"
+SKIP_TESTS=""
+if [ -f "$KNOWN_FAILURES" ]; then
+    SKIP_TESTS=$(grep -E '^\s*"[A-Z0-9]' "$KNOWN_FAILURES" 2>/dev/null | \
+        sed 's/.*"\([^"]*\)".*/\1/' || true)
+fi
 
 for f in "$NIST_DIR"/*.cob; do
     name=$(basename "$f" .cob)
@@ -25,12 +31,10 @@ for f in "$NIST_DIR"/*.cob; do
 
     TOTAL=$((TOTAL + 1))
 
-    for skip in $SKIP_TESTS; do
-        if [ "$name" = "$skip" ]; then
-            SKIPPED_OTHER=$((SKIPPED_OTHER + 1))
-            continue 2
-        fi
-    done
+    if echo "$SKIP_TESTS" | grep -qw "$name" 2>/dev/null; then
+        SKIPPED_OTHER=$((SKIPPED_OTHER + 1))
+        continue
+    fi
 
     if [ -f "$EXPECTED_DIR/${name}.txt" ]; then
         SKIPPED_EXISTING=$((SKIPPED_EXISTING + 1))

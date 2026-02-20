@@ -4992,18 +4992,20 @@ impl<'a> MirLowerer<'a> {
             }
         }
 
+        // RETURNING is not yet implemented — emit a hard error so we
+        // never silently miscompile.
+        if returning.is_some() {
+            panic!(
+                "CALL ... RETURNING is not yet supported. \
+                 Remove the RETURNING clause or use BY REFERENCE parameters instead."
+            );
+        }
+
         instructions.push(MirInst::CallRuntime {
             dest: None,
             func: prog_name,
             args: arg_values,
         });
-
-        // RETURNING: the target is preserved in HIR for future use.
-        // Currently all subprograms return void, so we cannot assign a
-        // return value yet. When subprogram RETURNING is implemented at
-        // the callee side, this will need to capture the return value
-        // and MOVE it into the RETURNING target.
-        let _ = returning;
     }
 
     /// Lower ADD statement: ADD op1 op2 ... GIVING target

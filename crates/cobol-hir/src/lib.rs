@@ -4850,9 +4850,8 @@ impl<'a> HirLowerer<'a> {
                 "RETURNING" | "GIVING" => {
                     i += 1; // skip RETURNING/GIVING
                     if i < tokens.len() {
-                        let (dr, next) = self.parse_data_ref_at(&tokens, i);
+                        let (dr, _next) = self.parse_data_ref_at(&tokens, i);
                         returning_target = Some(dr);
-                        i = next;
                     }
                     break;
                 }
@@ -4866,65 +4865,44 @@ impl<'a> HirLowerer<'a> {
             }
         }
 
-        // Parse ON EXCEPTION / NOT ON EXCEPTION blocks
+        // Parse ON EXCEPTION / NOT ON EXCEPTION blocks from AST child nodes.
+        // The parser creates proper child statement nodes inside CALL_STMT,
+        // so we use lower_child_statement for full statement support
+        // (IF, PERFORM, ADD, SUBTRACT, etc. — not just MOVE/DISPLAY).
         let mut on_exception = Vec::new();
         let mut not_on_exception = Vec::new();
+        {
+            // Track which handler region we're in by scanning tokens/children.
+            // 0 = before handlers, 1 = ON EXCEPTION, 2 = NOT ON EXCEPTION
+            let mut handler_region: u8 = 0;
+            let mut saw_not = false;
 
-        while i < tokens.len() {
-            let upper = tokens[i].1.to_ascii_uppercase();
-            match upper.as_str() {
-                "END-CALL" => break,
-                "ON" | "EXCEPTION" => {
-                    // Skip ON and EXCEPTION keywords
-                    while i < tokens.len() {
-                        let u = tokens[i].1.to_ascii_uppercase();
-                        if u == "ON" || u == "EXCEPTION" {
-                            i += 1;
-                        } else {
-                            break;
+            for child in node.children_with_tokens() {
+                if let Some(tok) = child.as_token() {
+                    let text = tok.text().to_ascii_uppercase();
+                    match text.as_str() {
+                        "NOT" => {
+                            saw_not = true;
+                        }
+                        "ON" | "EXCEPTION" => {
+                            if saw_not {
+                                handler_region = 2; // NOT ON EXCEPTION
+                                saw_not = false;
+                            } else if handler_region == 0 {
+                                handler_region = 1; // ON EXCEPTION
+                            }
+                        }
+                        _ => {
+                            saw_not = false;
                         }
                     }
-                    // Collect handler tokens until NOT or END-CALL
-                    let mut handler_tokens = Vec::new();
-                    while i < tokens.len() {
-                        let u = tokens[i].1.to_ascii_uppercase();
-                        if u == "NOT" || u == "END-CALL" {
-                            break;
-                        }
-                        handler_tokens.push(tokens[i].clone());
-                        i += 1;
+                } else if let Some(child_node) = child.as_node() {
+                    saw_not = false;
+                    match handler_region {
+                        1 => self.lower_child_statement(child_node, &mut on_exception),
+                        2 => self.lower_child_statement(child_node, &mut not_on_exception),
+                        _ => {} // statements before handler region (part of USING/etc.)
                     }
-                    if !handler_tokens.is_empty() {
-                        self.parse_inline_statements(&handler_tokens, &mut on_exception);
-                    }
-                }
-                "NOT" => {
-                    i += 1; // skip NOT
-                            // Skip ON and EXCEPTION keywords
-                    while i < tokens.len() {
-                        let u = tokens[i].1.to_ascii_uppercase();
-                        if u == "ON" || u == "EXCEPTION" {
-                            i += 1;
-                        } else {
-                            break;
-                        }
-                    }
-                    // Collect handler tokens until END-CALL
-                    let mut handler_tokens = Vec::new();
-                    while i < tokens.len() {
-                        let u = tokens[i].1.to_ascii_uppercase();
-                        if u == "END-CALL" {
-                            break;
-                        }
-                        handler_tokens.push(tokens[i].clone());
-                        i += 1;
-                    }
-                    if !handler_tokens.is_empty() {
-                        self.parse_inline_statements(&handler_tokens, &mut not_on_exception);
-                    }
-                }
-                _ => {
-                    i += 1;
                 }
             }
         }
