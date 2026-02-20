@@ -1,0 +1,23 @@
+[package]
+name = "cobol-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Criterion benchmarks for the COBOL compiler pipeline"
+
+[dependencies]
+cobol-intern = { workspace = true }
+cobol-span = { workspace = true }
+cobol-vfs = { workspace = true }
+cobol-pp = { workspace = true }
+cobol-lexer = { workspace = true }
+cobol-parser = { workspace = true }
+cobol-ast = { workspace = true }
+cobol-hir = { workspace = true }
+cobol-mir = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "pipeline"
+harness = false

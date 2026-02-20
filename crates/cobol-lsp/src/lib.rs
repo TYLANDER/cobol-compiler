@@ -323,6 +323,85 @@ fn uri_to_path(uri: &Url) -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
+// Semantic token types for syntax highlighting
+// ---------------------------------------------------------------------------
+
+const SEMANTIC_TOKEN_TYPES: &[SemanticTokenType] = &[
+    SemanticTokenType::NAMESPACE, // 0 — divisions, section headers
+    SemanticTokenType::TYPE,      // 1 — PIC, USAGE, data description
+    SemanticTokenType::FUNCTION,  // 2 — paragraph/section names (unused in tokens, reserved)
+    SemanticTokenType::VARIABLE,  // 3 — data item references (Word tokens)
+    SemanticTokenType::STRING,    // 4 — string/hex literals
+    SemanticTokenType::NUMBER,    // 5 — numeric literals, level numbers
+    SemanticTokenType::KEYWORD,   // 6 — verbs, reserved words, scope terminators
+    SemanticTokenType::COMMENT,   // 7 — comment lines
+    SemanticTokenType::OPERATOR,  // 8 — arithmetic/comparison operators
+];
+
+/// Maps a lexer TokenKind to a semantic token type index, or None if the
+/// token should not receive semantic highlighting.
+fn token_kind_to_semantic_type(kind: cobol_lexer::TokenKind) -> Option<u32> {
+    use cobol_lexer::TokenKind::*;
+    match kind {
+        // Division/section headers → namespace
+        IdentificationDivision
+        | EnvironmentDivision
+        | DataDivision
+        | ProcedureDivision
+        | ConfigurationSection
+        | InputOutputSection
+        | FileSection
+        | WorkingStorageSection
+        | LinkageSection
+        | LocalStorageSection
+        | ScreenSection
+        | ReportSection
+        | CommunicationSection => Some(0),
+
+        // Data description → type
+        Pic | Picture | Usage | Comp | Comp1 | Comp2 | Comp3 | Comp4 | Comp5 | Binary
+        | PackedDecimal => Some(1),
+
+        // String literals → string
+        StringLiteral | HexLiteral => Some(4),
+
+        // Numeric literals and level numbers → number
+        IntegerLiteral | DecimalLiteral | Level | Level66 | Level77 | Level88 => Some(5),
+
+        // Verbs → keyword
+        Accept | Add | Alter | Call | Cancel | Close | Compute | Continue | Delete | Display
+        | Divide | Enter | Evaluate | ExecSql | Exit | GoTo | GoBack | If | Initialize
+        | Inspect | Merge | Move | Multiply | Open | Perform | Read | Release | Return_
+        | Rewrite | Search | Set | Sort | Start | Stop | String_ | Subtract | Unstring | Write_
+        | Copy => Some(6),
+
+        // Scope terminators and reserved words → keyword
+        EndAdd | EndCall | EndCompute | EndDelete | EndDivide | EndEvaluate | EndIf
+        | EndMultiply | EndPerform | EndRead | EndReturn | EndRewrite | EndSearch | EndStart
+        | EndString | EndSubtract | EndUnstring | EndWrite | Else | Not | And | Or | Also | Any
+        | At | Before | After | By | Corresponding | Corr | Delimited | Delimiter | End | From
+        | Giving | In | Of | Into | On | Other | Replacing | Rounded | Tallying | Test | Than
+        | Then | Through | Thru | Times | To | Until | Up | Down | Using | Varying | With
+        | True_ | False_ | Null_ | Nulls | Returning | Run | Fd | Sd | Select | Assign
+        | SizeError | OnSizeError | NotOnSizeError | InvalidKey | NotInvalidKey | AtEnd
+        | NotAtEnd | Value | Values | Redefines | Occurs | Depending | Ascending | Descending
+        | Key | Indexed | Filler | Renames | Blank | When | Zero | Zeroes | Zeros | Justified
+        | Just | Sign_ | Leading | Trailing | Separate | Sync | Synchronized | Global
+        | External | Reference | Content | All | ProgramId | SectionKw | ParagraphKw => Some(6),
+
+        // Comments → comment
+        Comment => Some(7),
+
+        // Operators → operator
+        Plus | Minus | Star | Slash | DoubleStar | Ampersand | EqualSign | GreaterThan
+        | LessThan | GreaterEqual | LessEqual | NotEqual => Some(8),
+
+        // Word, whitespace, punctuation, etc. → no semantic type
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // COBOL keywords for completion
 // ---------------------------------------------------------------------------
 
@@ -385,6 +464,24 @@ impl LanguageServer for CobolLanguageServer {
                 }),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
+                rename_provider: Some(OneOf::Right(RenameOptions {
+                    prepare_provider: Some(true),
+                    work_done_progress_options: Default::default(),
+                })),
+                folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
+                semantic_tokens_provider: Some(
+                    SemanticTokensServerCapabilities::SemanticTokensOptions(
+                        SemanticTokensOptions {
+                            legend: SemanticTokensLegend {
+                                token_types: SEMANTIC_TOKEN_TYPES.to_vec(),
+                                token_modifiers: vec![],
+                            },
+                            full: Some(SemanticTokensFullOptions::Bool(true)),
+                            range: None,
+                            ..Default::default()
+                        },
+                    ),
+                ),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -887,6 +984,244 @@ impl LanguageServer for CobolLanguageServer {
             Ok(Some(locations))
         }
     }
+
+    async fn prepare_rename(
+        &self,
+        params: TextDocumentPositionParams,
+    ) -> Result<Option<PrepareRenameResponse>> {
+        let uri = &params.text_document.uri;
+        let pos = params.position;
+        let state = self.state.lock().await;
+
+        let file = match state.files.get(uri) {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+
+        let hir = match &file.hir {
+            Some(h) => h,
+            None => return Ok(None),
+        };
+
+        let offset = file.pp_line_index.offset(pos);
+        let word = match Self::word_at_position(&file.source, offset) {
+            Some(w) => w,
+            None => return Ok(None),
+        };
+
+        // Only allow rename if the word is a known symbol
+        let is_symbol = Self::find_data_item(hir, &file.interner, word).is_some()
+            || Self::find_paragraph(hir, &file.interner, word).is_some()
+            || Self::find_section(hir, &file.interner, word).is_some();
+
+        if !is_symbol {
+            return Ok(None);
+        }
+
+        // Return the range of the word under cursor
+        let bytes = file.source.as_bytes();
+        let off = offset as usize;
+        let mut start = off;
+        while start > 0 && is_cobol_name_char(bytes[start - 1]) {
+            start -= 1;
+        }
+        let mut end = off;
+        while end < bytes.len() && is_cobol_name_char(bytes[end]) {
+            end += 1;
+        }
+
+        let range = Range::new(
+            file.pp_line_index.position(start as u32),
+            file.pp_line_index.position(end as u32),
+        );
+
+        Ok(Some(PrepareRenameResponse::Range(range)))
+    }
+
+    async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
+        let uri = &params.text_document_position.text_document.uri;
+        let pos = params.text_document_position.position;
+        let new_name = &params.new_name;
+        let state = self.state.lock().await;
+
+        let file = match state.files.get(uri) {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+
+        let offset = file.pp_line_index.offset(pos);
+        let word = match Self::word_at_position(&file.source, offset) {
+            Some(w) => w.to_uppercase(),
+            None => return Ok(None),
+        };
+
+        // Find all whole-word occurrences in the preprocessed text
+        let pp_text_upper = file.pp_text.to_uppercase();
+        let mut edits = Vec::new();
+
+        let mut search_from = 0;
+        while let Some(found) = pp_text_upper[search_from..].find(&word) {
+            let abs_pos = search_from + found;
+            let end_pos = abs_pos + word.len();
+
+            let before_ok =
+                abs_pos == 0 || !is_cobol_name_char(file.pp_text.as_bytes()[abs_pos - 1]);
+            let after_ok = end_pos >= file.pp_text.len()
+                || !is_cobol_name_char(file.pp_text.as_bytes()[end_pos]);
+
+            if before_ok && after_ok {
+                let start = file.pp_line_index.position(abs_pos as u32);
+                let end = file.pp_line_index.position(end_pos as u32);
+                edits.push(TextEdit::new(Range::new(start, end), new_name.clone()));
+            }
+
+            search_from = abs_pos + 1;
+        }
+
+        if edits.is_empty() {
+            return Ok(None);
+        }
+
+        let mut changes = HashMap::new();
+        changes.insert(uri.clone(), edits);
+
+        Ok(Some(WorkspaceEdit {
+            changes: Some(changes),
+            ..Default::default()
+        }))
+    }
+
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> Result<Option<SemanticTokensResult>> {
+        let uri = &params.text_document.uri;
+        let state = self.state.lock().await;
+
+        let file = match state.files.get(uri) {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+
+        // Re-lex the preprocessed text for precise token positions
+        let tokens = cobol_lexer::lex(
+            &file.pp_text,
+            file.file_id,
+            cobol_lexer::SourceFormat::Fixed,
+        );
+
+        let mut data = Vec::new();
+        let mut prev_line = 0u32;
+        let mut prev_col = 0u32;
+
+        for token in &tokens {
+            let sem_type = match token_kind_to_semantic_type(token.kind) {
+                Some(t) => t,
+                None => continue,
+            };
+
+            let start_offset: u32 = token.span.range.start().into();
+            let end_offset: u32 = token.span.range.end().into();
+            let pos = file.pp_line_index.position(start_offset);
+            let length = end_offset - start_offset;
+
+            if length == 0 {
+                continue;
+            }
+
+            let delta_line = pos.line - prev_line;
+            let delta_start = if delta_line == 0 {
+                pos.character - prev_col
+            } else {
+                pos.character
+            };
+
+            data.push(SemanticToken {
+                delta_line,
+                delta_start,
+                length,
+                token_type: sem_type,
+                token_modifiers_bitset: 0,
+            });
+
+            prev_line = pos.line;
+            prev_col = pos.character;
+        }
+
+        Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
+            result_id: None,
+            data,
+        })))
+    }
+
+    async fn folding_range(&self, params: FoldingRangeParams) -> Result<Option<Vec<FoldingRange>>> {
+        let uri = &params.text_document.uri;
+        let state = self.state.lock().await;
+
+        let file = match state.files.get(uri) {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+
+        let hir = match &file.hir {
+            Some(h) => h,
+            None => return Ok(None),
+        };
+
+        let mut ranges = Vec::new();
+
+        // Sections
+        for sec in &hir.sections {
+            let start = file.pp_line_index.position(sec.span.range.start().into());
+            let end = file.pp_line_index.position(sec.span.range.end().into());
+            if end.line > start.line {
+                ranges.push(FoldingRange {
+                    start_line: start.line,
+                    start_character: Some(start.character),
+                    end_line: end.line,
+                    end_character: Some(end.character),
+                    kind: Some(FoldingRangeKind::Region),
+                    collapsed_text: None,
+                });
+            }
+        }
+
+        // Paragraphs
+        for para in &hir.paragraphs {
+            let start = file.pp_line_index.position(para.span.range.start().into());
+            let end = file.pp_line_index.position(para.span.range.end().into());
+            if end.line > start.line {
+                ranges.push(FoldingRange {
+                    start_line: start.line,
+                    start_character: Some(start.character),
+                    end_line: end.line,
+                    end_character: Some(end.character),
+                    kind: Some(FoldingRangeKind::Region),
+                    collapsed_text: None,
+                });
+            }
+        }
+
+        // Level-01 group items in DATA DIVISION
+        for (_, item) in hir.data_items.iter() {
+            if item.level == 1 && item.is_group {
+                let start = file.pp_line_index.position(item.span.range.start().into());
+                let end = file.pp_line_index.position(item.span.range.end().into());
+                if end.line > start.line {
+                    ranges.push(FoldingRange {
+                        start_line: start.line,
+                        start_character: Some(start.character),
+                        end_line: end.line,
+                        end_character: Some(end.character),
+                        kind: Some(FoldingRangeKind::Region),
+                        collapsed_text: None,
+                    });
+                }
+            }
+        }
+
+        Ok(Some(ranges))
+    }
 }
 
 /// Checks if the line prefix ends with a COBOL verb (indicating data names should follow).
@@ -1006,5 +1341,53 @@ mod tests {
     fn uri_to_path_file_scheme() {
         let uri = Url::parse("file:///tmp/test.cbl").unwrap();
         assert_eq!(uri_to_path(&uri), PathBuf::from("/tmp/test.cbl"));
+    }
+
+    #[test]
+    fn semantic_token_type_mapping() {
+        use cobol_lexer::TokenKind;
+        // Verbs → keyword (6)
+        assert_eq!(token_kind_to_semantic_type(TokenKind::Move), Some(6));
+        assert_eq!(token_kind_to_semantic_type(TokenKind::Add), Some(6));
+        assert_eq!(token_kind_to_semantic_type(TokenKind::If), Some(6));
+
+        // Division headers → namespace (0)
+        assert_eq!(
+            token_kind_to_semantic_type(TokenKind::ProcedureDivision),
+            Some(0)
+        );
+        assert_eq!(
+            token_kind_to_semantic_type(TokenKind::DataDivision),
+            Some(0)
+        );
+
+        // Literals
+        assert_eq!(
+            token_kind_to_semantic_type(TokenKind::StringLiteral),
+            Some(4)
+        );
+        assert_eq!(
+            token_kind_to_semantic_type(TokenKind::IntegerLiteral),
+            Some(5)
+        );
+
+        // Operators
+        assert_eq!(token_kind_to_semantic_type(TokenKind::Plus), Some(8));
+        assert_eq!(token_kind_to_semantic_type(TokenKind::EqualSign), Some(8));
+
+        // Comments
+        assert_eq!(token_kind_to_semantic_type(TokenKind::Comment), Some(7));
+
+        // Word → no semantic type
+        assert_eq!(token_kind_to_semantic_type(TokenKind::Word), None);
+
+        // Whitespace → no semantic type
+        assert_eq!(token_kind_to_semantic_type(TokenKind::Whitespace), None);
+    }
+
+    #[test]
+    fn semantic_token_types_length() {
+        // Ensure our constant matches the expected count
+        assert_eq!(SEMANTIC_TOKEN_TYPES.len(), 9);
     }
 }
