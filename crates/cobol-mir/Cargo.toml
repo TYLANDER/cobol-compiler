@@ -10,3 +10,8 @@ cobol-intern = { workspace = true }
 cobol-span = { workspace = true }
 cobol-hir = { workspace = true }
 la-arena = { workspace = true }
+
+[dev-dependencies]
+cobol-lexer = { workspace = true }
+cobol-parser = { workspace = true }
+cobol-ast = { workspace = true }

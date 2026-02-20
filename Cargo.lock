@@ -269,7 +269,9 @@ dependencies = [
  "cobol-intern",
  "cobol-lexer",
  "cobol-parser",
+ "cobol-pp",
  "cobol-span",
+ "cobol-vfs",
  "la-arena",
  "smol_str",
 ]
@@ -313,8 +315,11 @@ dependencies = [
 name = "cobol-mir"
 version = "0.1.0"
 dependencies = [
+ "cobol-ast",
  "cobol-hir",
  "cobol-intern",
+ "cobol-lexer",
+ "cobol-parser",
  "cobol-span",
  "la-arena",
 ]

@@ -15,3 +15,5 @@ smol_str = { workspace = true }
 
 [dev-dependencies]
 cobol-lexer = { workspace = true }
+cobol-pp = { workspace = true }
+cobol-vfs = { workspace = true }

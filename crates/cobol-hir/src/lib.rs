@@ -4888,7 +4888,11 @@ impl<'a> HirLowerer<'a> {
             for child in node.children_with_tokens() {
                 if let Some(tok) = child.as_token() {
                     let text = tok.text().to_ascii_uppercase();
-                    match text.as_str() {
+                    let trimmed = text.trim();
+                    if trimmed.is_empty() {
+                        continue; // skip whitespace tokens
+                    }
+                    match trimmed {
                         "NOT" => {
                             saw_not = true;
                         }
@@ -7209,5 +7213,165 @@ mod tests {
         assert_eq!(item.storage.usage, UsageType::Comp);
         assert_eq!(item.storage.encoding, DataEncoding::Binary);
         assert_eq!(item.storage.byte_size, 4); // 9 digits -> 4 bytes
+    }
+
+    // ------------------------------------------------------------------
+    // CALL statement regression tests
+    // ------------------------------------------------------------------
+
+    /// Helper: parse free-format COBOL source and return the HIR module.
+    fn lower_free_source(src: &str) -> (HirModule, cobol_intern::Interner) {
+        let file_id = cobol_span::FileId::new(0);
+        let tokens = cobol_lexer::lex(src, file_id, cobol_lexer::SourceFormat::Free);
+        let parse_result = cobol_parser::parse(&tokens);
+        let root = parse_result.syntax();
+        let sf = cobol_ast::SourceFile::cast(root).unwrap();
+        let mut interner = cobol_intern::Interner::default();
+        let module = lower(&sf, &mut interner, file_id);
+        (module, interner)
+    }
+
+    /// Find a CALL statement in the first paragraph's statements.
+    fn find_call_stmt(module: &HirModule) -> &HirStatement {
+        for para in &module.paragraphs {
+            for stmt in &para.statements {
+                if matches!(stmt, HirStatement::Call { .. }) {
+                    return stmt;
+                }
+            }
+        }
+        panic!("no CALL statement found in module");
+    }
+
+    #[test]
+    fn call_on_exception_captures_display() {
+        let src = r#"
+IDENTIFICATION DIVISION.
+PROGRAM-ID. TEST-CALL.
+DATA DIVISION.
+WORKING-STORAGE SECTION.
+01 WS-X PIC 9 VALUE 0.
+PROCEDURE DIVISION.
+    CALL "SUBPROG" USING WS-X
+        ON EXCEPTION
+            DISPLAY "ERROR"
+    END-CALL.
+    STOP RUN.
+"#;
+        let (module, _interner) = lower_free_source(src);
+        let call = find_call_stmt(&module);
+        match call {
+            HirStatement::Call { on_exception, .. } => {
+                assert!(
+                    !on_exception.is_empty(),
+                    "ON EXCEPTION handler should contain DISPLAY"
+                );
+                assert!(matches!(&on_exception[0], HirStatement::Display { .. }));
+            }
+            _ => panic!("expected Call statement"),
+        }
+    }
+
+    #[test]
+    fn call_not_on_exception_captures_move() {
+        let src = r#"
+IDENTIFICATION DIVISION.
+PROGRAM-ID. TEST-CALL.
+DATA DIVISION.
+WORKING-STORAGE SECTION.
+01 WS-X PIC 9 VALUE 0.
+01 WS-Y PIC 9 VALUE 1.
+PROCEDURE DIVISION.
+    CALL "SUBPROG" USING WS-X
+        NOT ON EXCEPTION
+            MOVE WS-Y TO WS-X
+    END-CALL.
+    STOP RUN.
+"#;
+        let (module, _interner) = lower_free_source(src);
+        let call = find_call_stmt(&module);
+        match call {
+            HirStatement::Call {
+                not_on_exception, ..
+            } => {
+                assert!(
+                    !not_on_exception.is_empty(),
+                    "NOT ON EXCEPTION handler should contain MOVE"
+                );
+                assert!(matches!(&not_on_exception[0], HirStatement::Move { .. }));
+            }
+            _ => panic!("expected Call statement"),
+        }
+    }
+
+    #[test]
+    fn call_both_exception_handlers_with_add() {
+        let src = r#"
+IDENTIFICATION DIVISION.
+PROGRAM-ID. TEST-CALL.
+DATA DIVISION.
+WORKING-STORAGE SECTION.
+01 WS-X PIC 9 VALUE 0.
+01 WS-Y PIC 9 VALUE 1.
+PROCEDURE DIVISION.
+    CALL "SUBPROG" USING WS-X
+        ON EXCEPTION
+            DISPLAY "FAILED"
+            ADD 1 TO WS-X
+        NOT ON EXCEPTION
+            DISPLAY "OK"
+            ADD 1 TO WS-Y
+    END-CALL.
+    STOP RUN.
+"#;
+        let (module, _interner) = lower_free_source(src);
+        let call = find_call_stmt(&module);
+        match call {
+            HirStatement::Call {
+                on_exception,
+                not_on_exception,
+                ..
+            } => {
+                assert_eq!(
+                    on_exception.len(),
+                    2,
+                    "ON EXCEPTION should have DISPLAY + ADD"
+                );
+                assert!(matches!(&on_exception[0], HirStatement::Display { .. }));
+                assert!(matches!(&on_exception[1], HirStatement::Add { .. }));
+
+                assert_eq!(
+                    not_on_exception.len(),
+                    2,
+                    "NOT ON EXCEPTION should have DISPLAY + ADD"
+                );
+                assert!(matches!(&not_on_exception[0], HirStatement::Display { .. }));
+                assert!(matches!(&not_on_exception[1], HirStatement::Add { .. }));
+            }
+            _ => panic!("expected Call statement"),
+        }
+    }
+
+    #[test]
+    fn call_returning_parsed_into_hir() {
+        let src = r#"
+IDENTIFICATION DIVISION.
+PROGRAM-ID. TEST-CALL.
+DATA DIVISION.
+WORKING-STORAGE SECTION.
+01 WS-X PIC 9 VALUE 0.
+01 WS-RET PIC 9 VALUE 0.
+PROCEDURE DIVISION.
+    CALL "SUBPROG" USING WS-X RETURNING WS-RET.
+    STOP RUN.
+"#;
+        let (module, _interner) = lower_free_source(src);
+        let call = find_call_stmt(&module);
+        match call {
+            HirStatement::Call { returning, .. } => {
+                assert!(returning.is_some(), "RETURNING clause should be captured");
+            }
+            _ => panic!("expected Call statement"),
+        }
     }
 }

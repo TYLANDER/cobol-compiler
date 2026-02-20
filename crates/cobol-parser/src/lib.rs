@@ -2520,13 +2520,33 @@ impl<'t> Parser<'t> {
             // Detect ON SIZE ERROR / NOT ON SIZE ERROR phrases — consume all
             // tokens so the HIR layer can parse the handler from the flat
             // token stream.
-            if self.at_word("ON") || self.at_word("SIZE") || self.at_word("ERROR") {
+            //
+            // IMPORTANT: We must NOT consume ON EXCEPTION / NOT ON EXCEPTION
+            // — those belong to an enclosing CALL statement, not to this
+            // arithmetic statement.  Use lookahead to disambiguate.
+            if self.at_word("ON") {
+                if self.peek_word_at(1, "EXCEPTION") {
+                    break; // enclosing CALL handler
+                }
+                in_size_error = true;
+                self.bump();
+                self.skip_ws();
+                continue;
+            }
+            if self.at_word("SIZE") || self.at_word("ERROR") {
                 in_size_error = true;
                 self.bump();
                 self.skip_ws();
                 continue;
             }
             if self.at_word("NOT") {
+                // NOT ON EXCEPTION / NOT EXCEPTION → enclosing CALL handler
+                if self.peek_word_at(1, "EXCEPTION") {
+                    break;
+                }
+                if self.peek_word_at(1, "ON") && self.peek_word_at(2, "EXCEPTION") {
+                    break;
+                }
                 in_size_error = true;
                 self.bump();
                 self.skip_ws();

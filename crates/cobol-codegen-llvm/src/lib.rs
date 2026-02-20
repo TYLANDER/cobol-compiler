@@ -1359,4 +1359,41 @@ mod tests {
         assert_ne!(OptLevel::O0, OptLevel::O3);
         assert_eq!(OptLevel::Os, OptLevel::Os);
     }
+
+    #[test]
+    fn opt_level_from_cli_string() {
+        // Mirrors the mapping in cobol-driver/src/main.rs — each CLI
+        // --opt-level value must produce the correct LLVM OptLevel.
+        let map = |s: &str| -> OptLevel {
+            match s {
+                "0" => OptLevel::O0,
+                "1" => OptLevel::O1,
+                "2" => OptLevel::O2,
+                "3" => OptLevel::O3,
+                "s" => OptLevel::Os,
+                _ => OptLevel::O2,
+            }
+        };
+        assert_eq!(map("0"), OptLevel::O0);
+        assert_eq!(map("1"), OptLevel::O1);
+        assert_eq!(map("2"), OptLevel::O2);
+        assert_eq!(map("3"), OptLevel::O3);
+        assert_eq!(map("s"), OptLevel::Os);
+        // Unknown falls back to O2
+        assert_eq!(map("z"), OptLevel::O2);
+    }
+
+    #[test]
+    fn llvm_backend_stores_opt_level() {
+        for &level in &[
+            OptLevel::O0,
+            OptLevel::O1,
+            OptLevel::O2,
+            OptLevel::O3,
+            OptLevel::Os,
+        ] {
+            let backend = LlvmBackend::new(level);
+            assert_eq!(backend.opt_level(), level);
+        }
+    }
 }

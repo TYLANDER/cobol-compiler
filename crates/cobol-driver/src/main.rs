@@ -2890,9 +2890,17 @@ fn main() {
                 use cobol_codegen_llvm::CodegenBackend;
                 let backend: Box<dyn CodegenBackend> = match cli.backend.as_str() {
                     "cranelift" => Box::new(cobol_codegen_cranelift::CraneliftBackend::new()),
-                    "llvm" => Box::new(cobol_codegen_llvm::LlvmBackend::new(
-                        cobol_codegen_llvm::OptLevel::O2,
-                    )),
+                    "llvm" => {
+                        let llvm_opt = match cli.opt_level.as_str() {
+                            "0" => cobol_codegen_llvm::OptLevel::O0,
+                            "1" => cobol_codegen_llvm::OptLevel::O1,
+                            "2" => cobol_codegen_llvm::OptLevel::O2,
+                            "3" => cobol_codegen_llvm::OptLevel::O3,
+                            "s" => cobol_codegen_llvm::OptLevel::Os,
+                            _ => cobol_codegen_llvm::OptLevel::O2,
+                        };
+                        Box::new(cobol_codegen_llvm::LlvmBackend::new(llvm_opt))
+                    }
                     other => {
                         eprintln!(
                             "error: unknown backend '{}', use 'cranelift' or 'llvm'",

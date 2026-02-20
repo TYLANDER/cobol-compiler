@@ -4994,13 +4994,15 @@ impl<'a> MirLowerer<'a> {
             }
         }
 
-        // RETURNING is not yet implemented — emit a hard error so we
-        // never silently miscompile.
+        // RETURNING is not yet implemented — emit a structured error so the
+        // compiler exits gracefully instead of panicking.
         if returning.is_some() {
-            panic!(
+            self.module.errors.push(
                 "CALL ... RETURNING is not yet supported. \
                  Remove the RETURNING clause or use BY REFERENCE parameters instead."
+                    .to_string(),
             );
+            return;
         }
 
         instructions.push(MirInst::CallRuntime {
@@ -10146,6 +10148,7 @@ impl<'a> MirLowerer<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cobol_ast::AstNode;
 
     /// Helper: build a minimal MIR module with one function containing
     /// a single basic block that returns immediately.
@@ -10491,6 +10494,47 @@ mod tests {
         assert_eq!(
             module.file_descriptors[0].organization,
             cobol_hir::FileOrganization::Indexed
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // CALL RETURNING graceful error test
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn call_returning_produces_error_not_panic() {
+        // CALL ... RETURNING should produce a structured error in
+        // mir.errors rather than panicking.
+        let src = r#"
+IDENTIFICATION DIVISION.
+PROGRAM-ID. TEST-RET.
+DATA DIVISION.
+WORKING-STORAGE SECTION.
+01 WS-X PIC 9 VALUE 0.
+01 WS-RET PIC 9 VALUE 0.
+PROCEDURE DIVISION.
+    CALL "SUBPROG" USING WS-X RETURNING WS-RET.
+    STOP RUN.
+"#;
+        let file_id = cobol_span::FileId::new(0);
+        let tokens = cobol_lexer::lex(src, file_id, cobol_lexer::SourceFormat::Free);
+        let parse_result = cobol_parser::parse(&tokens);
+        let root = parse_result.syntax();
+        let sf = cobol_ast::SourceFile::cast(root).unwrap();
+        let mut interner = cobol_intern::Interner::default();
+        let hir = cobol_hir::lower(&sf, &mut interner, file_id);
+        let mir = lower(&hir, &interner);
+
+        // Should NOT have panicked. Instead, errors should contain a message
+        // about RETURNING not being supported.
+        assert!(
+            !mir.errors.is_empty(),
+            "MIR should contain an error for CALL RETURNING"
+        );
+        assert!(
+            mir.errors[0].contains("RETURNING"),
+            "error message should mention RETURNING, got: {}",
+            mir.errors[0]
         );
     }
 }
