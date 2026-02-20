@@ -76,17 +76,53 @@ impl LineIndex {
 
 /// Cached compilation results for a single open file.
 struct FileState {
-    #[allow(dead_code)] // used in multi-file / cross-reference scenarios
     file_id: FileId,
     /// Original source text (as the editor sees it).
     source: String,
+    /// LineIndex over the original source (for translating back to editor positions).
+    source_line_index: LineIndex,
     /// LineIndex over the preprocessed text (spans from parser/HIR are offsets into this).
     pp_line_index: LineIndex,
     /// Preprocessed text — the text that was actually parsed.
-    #[allow(dead_code)] // stored for future source-map integration
     pp_text: String,
+    /// Maps preprocessed byte ranges back to original source locations.
+    expansion_map: cobol_pp::ExpansionMap,
+    /// Detected source format (fixed or free).
+    source_format: cobol_lexer::SourceFormat,
     hir: Option<HirModule>,
     interner: Interner,
+}
+
+/// Detect the source format (fixed vs free) from the file content.
+///
+/// Looks for `>>SOURCE FORMAT IS FREE` or `>>SOURCE FORMAT IS FIXED`
+/// directives. Falls back to fixed-format unless the file starts with
+/// a free-format indicator.
+fn detect_source_format(text: &str) -> cobol_lexer::SourceFormat {
+    for line in text.lines().take(20) {
+        let trimmed = line.trim().to_uppercase();
+        if trimmed.contains(">>SOURCE") && trimmed.contains("FREE") {
+            return cobol_lexer::SourceFormat::Free;
+        }
+        if trimmed.contains(">>SOURCE") && trimmed.contains("FIXED") {
+            return cobol_lexer::SourceFormat::Fixed;
+        }
+    }
+    // Heuristic: if no lines are longer than 80 chars and column 7 has
+    // indicator characters, it's likely fixed format.  Otherwise check
+    // if the first IDENTIFICATION keyword starts in column 1-6 (free) or 7+ (fixed).
+    for line in text.lines().take(10) {
+        let upper = line.to_uppercase();
+        if upper.trim_start().starts_with("IDENTIFICATION") {
+            // If IDENTIFICATION starts before column 7, treat as free
+            if let Some(pos) = upper.find("IDENTIFICATION") {
+                if pos < 7 {
+                    return cobol_lexer::SourceFormat::Free;
+                }
+            }
+        }
+    }
+    cobol_lexer::SourceFormat::Fixed
 }
 
 // ---------------------------------------------------------------------------
@@ -132,11 +168,16 @@ impl CobolLanguageServer {
         let path = uri_to_path(&uri);
         let file_id = state.vfs.set_file_content(path, text.clone());
 
+        // Detect source format from file content
+        let source_format = detect_source_format(&text);
+
         // Run pipeline: preprocess → lex → parse → HIR lower
         let pp_result = cobol_pp::preprocess(&text, file_id, &state.vfs);
         let pp_text = pp_result.text.clone();
+        let expansion_map = pp_result.expansion_map;
+        let source_line_index = LineIndex::new(&text);
         let pp_line_index = LineIndex::new(&pp_text);
-        let tokens = cobol_lexer::lex(&pp_text, file_id, cobol_lexer::SourceFormat::Fixed);
+        let tokens = cobol_lexer::lex(&pp_text, file_id, source_format);
         let parse_result = cobol_parser::parse(&tokens);
 
         let mut interner = Interner::new();
@@ -192,8 +233,11 @@ impl CobolLanguageServer {
             FileState {
                 file_id,
                 source: text,
+                source_line_index,
                 pp_line_index,
                 pp_text,
+                expansion_map,
+                source_format,
                 hir,
                 interner,
             },
@@ -315,6 +359,52 @@ impl CobolLanguageServer {
 
 fn is_cobol_name_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'-' || b == b'_'
+}
+
+/// Translate a preprocessed byte offset to a source document position using
+/// the expansion map.  For spans that originate in copybooks (different file),
+/// returns `None` — the reference is not in the current editor buffer.
+fn pp_offset_to_source_position(pp_offset: usize, file: &FileState) -> Option<Position> {
+    // Walk expansion entries to find the one covering this offset.
+    for entry in &file.expansion_map.entries {
+        if entry.output_range.contains(&pp_offset) {
+            // Only map back if the span came from the same source file
+            if entry.source_file == file.file_id {
+                let delta = pp_offset - entry.output_range.start;
+                let source_byte = entry.source_offset + delta;
+                return Some(file.source_line_index.position(source_byte as u32));
+            } else {
+                return None; // copybook — skip
+            }
+        }
+    }
+    // Fallback: use the pp_line_index directly (no COPY expansion)
+    Some(file.pp_line_index.position(pp_offset as u32))
+}
+
+/// Find all token-level occurrences of a symbol name in the preprocessed text.
+/// Uses the lexer to avoid matching inside strings, comments, or operators.
+/// Returns (start_byte, end_byte) pairs in the preprocessed text.
+fn find_symbol_token_spans(
+    pp_text: &str,
+    file_id: FileId,
+    format: cobol_lexer::SourceFormat,
+    symbol: &str,
+) -> Vec<(usize, usize)> {
+    let tokens = cobol_lexer::lex(pp_text, file_id, format);
+    let upper = symbol.to_uppercase();
+    let mut spans = Vec::new();
+
+    for token in &tokens {
+        // Only match Word tokens (identifiers), not keywords or literals
+        if token.kind == cobol_lexer::TokenKind::Word && token.text.eq_ignore_ascii_case(&upper) {
+            let start: u32 = token.span.range.start().into();
+            let end: u32 = token.span.range.end().into();
+            spans.push((start as usize, end as usize));
+        }
+    }
+
+    spans
 }
 
 fn uri_to_path(uri: &Url) -> PathBuf {
@@ -540,7 +630,7 @@ impl LanguageServer for CobolLanguageServer {
         };
 
         let offset = file.pp_line_index.offset(pos);
-        let word = match Self::word_at_position(&file.source, offset) {
+        let word = match Self::word_at_position(&file.pp_text, offset) {
             Some(w) => w,
             None => return Ok(None),
         };
@@ -613,7 +703,7 @@ impl LanguageServer for CobolLanguageServer {
         };
 
         let offset = file.pp_line_index.offset(pos);
-        let word = match Self::word_at_position(&file.source, offset) {
+        let word = match Self::word_at_position(&file.pp_text, offset) {
             Some(w) => w,
             None => return Ok(None),
         };
@@ -949,33 +1039,23 @@ impl LanguageServer for CobolLanguageServer {
         };
 
         let offset = file.pp_line_index.offset(pos);
-        let word = match Self::word_at_position(&file.source, offset) {
-            Some(w) => w.to_uppercase(),
+        let word = match Self::word_at_position(&file.pp_text, offset) {
+            Some(w) => w,
             None => return Ok(None),
         };
 
-        // Find all occurrences of this name in the preprocessed text
-        let pp_text_upper = file.pp_text.to_uppercase();
+        // Use lexer-based token search for accurate symbol matching
+        let spans = find_symbol_token_spans(&file.pp_text, file.file_id, file.source_format, word);
+
         let mut locations = Vec::new();
-
-        let mut search_from = 0;
-        while let Some(pos) = pp_text_upper[search_from..].find(&word) {
-            let abs_pos = search_from + pos;
-            let end_pos = abs_pos + word.len();
-
-            // Verify it's a whole word match (not a substring of a larger identifier)
-            let before_ok =
-                abs_pos == 0 || !is_cobol_name_char(file.pp_text.as_bytes()[abs_pos - 1]);
-            let after_ok = end_pos >= file.pp_text.len()
-                || !is_cobol_name_char(file.pp_text.as_bytes()[end_pos]);
-
-            if before_ok && after_ok {
-                let start = file.pp_line_index.position(abs_pos as u32);
-                let end = file.pp_line_index.position(end_pos as u32);
-                locations.push(Location::new(uri.clone(), Range::new(start, end)));
+        for (start, end) in spans {
+            // Map preprocessed offsets back to source document positions
+            if let (Some(start_pos), Some(end_pos)) = (
+                pp_offset_to_source_position(start, file),
+                pp_offset_to_source_position(end, file),
+            ) {
+                locations.push(Location::new(uri.clone(), Range::new(start_pos, end_pos)));
             }
-
-            search_from = abs_pos + 1;
         }
 
         if locations.is_empty() {
@@ -1004,7 +1084,7 @@ impl LanguageServer for CobolLanguageServer {
         };
 
         let offset = file.pp_line_index.offset(pos);
-        let word = match Self::word_at_position(&file.source, offset) {
+        let word = match Self::word_at_position(&file.pp_text, offset) {
             Some(w) => w,
             None => return Ok(None),
         };
@@ -1018,8 +1098,8 @@ impl LanguageServer for CobolLanguageServer {
             return Ok(None);
         }
 
-        // Return the range of the word under cursor
-        let bytes = file.source.as_bytes();
+        // Return the range of the word under cursor, mapped to source positions
+        let bytes = file.pp_text.as_bytes();
         let off = offset as usize;
         let mut start = off;
         while start > 0 && is_cobol_name_char(bytes[start - 1]) {
@@ -1030,12 +1110,18 @@ impl LanguageServer for CobolLanguageServer {
             end += 1;
         }
 
-        let range = Range::new(
-            file.pp_line_index.position(start as u32),
-            file.pp_line_index.position(end as u32),
-        );
+        let start_pos = match pp_offset_to_source_position(start, file) {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+        let end_pos = match pp_offset_to_source_position(end, file) {
+            Some(p) => p,
+            None => return Ok(None),
+        };
 
-        Ok(Some(PrepareRenameResponse::Range(range)))
+        Ok(Some(PrepareRenameResponse::Range(Range::new(
+            start_pos, end_pos,
+        ))))
     }
 
     async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
@@ -1050,32 +1136,26 @@ impl LanguageServer for CobolLanguageServer {
         };
 
         let offset = file.pp_line_index.offset(pos);
-        let word = match Self::word_at_position(&file.source, offset) {
-            Some(w) => w.to_uppercase(),
+        let word = match Self::word_at_position(&file.pp_text, offset) {
+            Some(w) => w,
             None => return Ok(None),
         };
 
-        // Find all whole-word occurrences in the preprocessed text
-        let pp_text_upper = file.pp_text.to_uppercase();
+        // Use lexer-based token search for accurate symbol matching
+        let spans = find_symbol_token_spans(&file.pp_text, file.file_id, file.source_format, word);
+
         let mut edits = Vec::new();
-
-        let mut search_from = 0;
-        while let Some(found) = pp_text_upper[search_from..].find(&word) {
-            let abs_pos = search_from + found;
-            let end_pos = abs_pos + word.len();
-
-            let before_ok =
-                abs_pos == 0 || !is_cobol_name_char(file.pp_text.as_bytes()[abs_pos - 1]);
-            let after_ok = end_pos >= file.pp_text.len()
-                || !is_cobol_name_char(file.pp_text.as_bytes()[end_pos]);
-
-            if before_ok && after_ok {
-                let start = file.pp_line_index.position(abs_pos as u32);
-                let end = file.pp_line_index.position(end_pos as u32);
-                edits.push(TextEdit::new(Range::new(start, end), new_name.clone()));
+        for (start, end) in spans {
+            // Map preprocessed offsets back to source document positions
+            if let (Some(start_pos), Some(end_pos)) = (
+                pp_offset_to_source_position(start, file),
+                pp_offset_to_source_position(end, file),
+            ) {
+                edits.push(TextEdit::new(
+                    Range::new(start_pos, end_pos),
+                    new_name.clone(),
+                ));
             }
-
-            search_from = abs_pos + 1;
         }
 
         if edits.is_empty() {
@@ -1104,11 +1184,7 @@ impl LanguageServer for CobolLanguageServer {
         };
 
         // Re-lex the preprocessed text for precise token positions
-        let tokens = cobol_lexer::lex(
-            &file.pp_text,
-            file.file_id,
-            cobol_lexer::SourceFormat::Fixed,
-        );
+        let tokens = cobol_lexer::lex(&file.pp_text, file.file_id, file.source_format);
 
         let mut data = Vec::new();
         let mut prev_line = 0u32;
@@ -1389,5 +1465,90 @@ mod tests {
     fn semantic_token_types_length() {
         // Ensure our constant matches the expected count
         assert_eq!(SEMANTIC_TOKEN_TYPES.len(), 9);
+    }
+
+    #[test]
+    fn detect_source_format_free_directive() {
+        let src = ">>SOURCE FORMAT IS FREE\nIDENTIFICATION DIVISION.\n";
+        assert!(matches!(
+            detect_source_format(src),
+            cobol_lexer::SourceFormat::Free
+        ));
+    }
+
+    #[test]
+    fn detect_source_format_fixed_directive() {
+        let src = ">>SOURCE FORMAT IS FIXED\n       IDENTIFICATION DIVISION.\n";
+        assert!(matches!(
+            detect_source_format(src),
+            cobol_lexer::SourceFormat::Fixed
+        ));
+    }
+
+    #[test]
+    fn detect_source_format_heuristic_free() {
+        // IDENTIFICATION starting at column 0 → free
+        let src = "IDENTIFICATION DIVISION.\nPROGRAM-ID. TEST.\n";
+        assert!(matches!(
+            detect_source_format(src),
+            cobol_lexer::SourceFormat::Free
+        ));
+    }
+
+    #[test]
+    fn detect_source_format_heuristic_fixed() {
+        // IDENTIFICATION starting at column 7 → fixed
+        let src = "       IDENTIFICATION DIVISION.\n       PROGRAM-ID. TEST.\n";
+        assert!(matches!(
+            detect_source_format(src),
+            cobol_lexer::SourceFormat::Fixed
+        ));
+    }
+
+    #[test]
+    fn find_symbol_token_spans_basic() {
+        let src = "       MOVE WS-A TO WS-B\n       ADD WS-A TO WS-B\n";
+        let fid = FileId::new(0);
+        let spans = find_symbol_token_spans(src, fid, cobol_lexer::SourceFormat::Fixed, "WS-A");
+        // WS-A should appear exactly twice (once in MOVE, once in ADD)
+        assert_eq!(spans.len(), 2);
+    }
+
+    #[test]
+    fn find_symbol_token_spans_excludes_strings() {
+        // WS-A inside a string literal should NOT be found
+        let src = "       DISPLAY \"WS-A\" WS-A\n";
+        let fid = FileId::new(0);
+        let spans = find_symbol_token_spans(src, fid, cobol_lexer::SourceFormat::Fixed, "WS-A");
+        // Only the standalone WS-A after the string, not the one inside quotes
+        assert_eq!(spans.len(), 1);
+    }
+
+    #[test]
+    fn find_symbol_token_spans_case_insensitive() {
+        let src = "       MOVE ws-a TO WS-A\n";
+        let fid = FileId::new(0);
+        let spans = find_symbol_token_spans(src, fid, cobol_lexer::SourceFormat::Fixed, "WS-A");
+        assert_eq!(spans.len(), 2);
+    }
+
+    #[test]
+    fn free_format_source_lexes_correctly() {
+        // Verify the free-format sample file can be lexed and parsed
+        let src = include_str!("../../../tests/smoke/SMOKE-FREE.cob");
+        let fid = FileId::new(0);
+        let format = detect_source_format(src);
+        assert!(matches!(format, cobol_lexer::SourceFormat::Free));
+
+        let vfs = cobol_vfs::Vfs::new();
+        let pp = cobol_pp::preprocess(src, fid, &vfs);
+        let tokens = cobol_lexer::lex(&pp.text, fid, format);
+        let parse_result = cobol_parser::parse(&tokens);
+        // Should parse without fatal errors
+        assert!(
+            parse_result.errors.len() <= 2,
+            "too many parse errors in free-format: {:?}",
+            parse_result.errors
+        );
     }
 }

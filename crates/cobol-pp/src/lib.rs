@@ -1078,6 +1078,34 @@ impl<'a> Preprocessor<'a> {
 }
 
 // ---------------------------------------------------------------------------
+// Compiler directive stripping
+// ---------------------------------------------------------------------------
+
+/// Strips compiler directives (lines starting with `>>`) from the source,
+/// replacing them with blank lines to preserve line numbering.
+fn strip_compiler_directives(source: &str) -> String {
+    let mut result = String::with_capacity(source.len());
+    let mut pos = 0;
+    while pos < source.len() {
+        let line_end = source[pos..]
+            .find('\n')
+            .map(|i| pos + i + 1)
+            .unwrap_or(source.len());
+        let trimmed = source[pos..line_end].trim_start();
+        if trimmed.starts_with(">>") {
+            // Replace directive line with a blank line (just the newline)
+            if line_end <= source.len() && source.as_bytes().get(line_end - 1) == Some(&b'\n') {
+                result.push('\n');
+            }
+        } else {
+            result.push_str(&source[pos..line_end]);
+        }
+        pos = line_end;
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------
 // preprocess()
 // ---------------------------------------------------------------------------
 
@@ -1091,8 +1119,13 @@ pub fn preprocess(
     file_id: cobol_span::FileId,
     loader: &dyn cobol_vfs::FileLoader,
 ) -> PreprocessResult {
+    // Strip >>SOURCE FORMAT directives (compiler directives, not part of the
+    // COBOL source text).  Replace them with blank lines to preserve line
+    // numbering for diagnostics.
+    let source = strip_compiler_directives(source);
+
     let mut pp = Preprocessor::new(loader, file_id);
-    let expanded = pp.expand(source, file_id, cobol_span::ExpansionId::ROOT, 0);
+    let expanded = pp.expand(&source, file_id, cobol_span::ExpansionId::ROOT, 0);
 
     // Apply global REPLACE substitutions if any are active
     let text = if pp.active_replace.is_empty() {

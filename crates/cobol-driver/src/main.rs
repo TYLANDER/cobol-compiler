@@ -2638,8 +2638,8 @@ struct Cli {
     #[arg(short = 'O', long = "opt-level", default_value = "0", value_parser = ["0", "1", "2", "3", "s"])]
     opt_level: String,
 
-    /// Source format
-    #[arg(long, default_value = "fixed", value_parser = ["fixed", "free"])]
+    /// Source format (auto detects >>SOURCE FORMAT directives)
+    #[arg(long, default_value = "auto", value_parser = ["auto", "fixed", "free"])]
     format: String,
 
     /// Copybook include directories
@@ -2659,6 +2659,32 @@ struct Cli {
 enum Command {
     /// Start the Language Server Protocol server (for IDE integration)
     Lsp,
+}
+
+/// Auto-detect source format from file content.
+/// Checks for `>>SOURCE FORMAT IS FREE/FIXED` directives, then falls back to
+/// heuristic: if `IDENTIFICATION` starts before column 7, assume free format.
+fn detect_source_format(text: &str) -> cobol_lexer::SourceFormat {
+    for line in text.lines().take(20) {
+        let trimmed = line.trim().to_uppercase();
+        if trimmed.contains(">>SOURCE") && trimmed.contains("FREE") {
+            return cobol_lexer::SourceFormat::Free;
+        }
+        if trimmed.contains(">>SOURCE") && trimmed.contains("FIXED") {
+            return cobol_lexer::SourceFormat::Fixed;
+        }
+    }
+    for line in text.lines().take(10) {
+        let upper = line.to_uppercase();
+        if upper.trim_start().starts_with("IDENTIFICATION") {
+            if let Some(pos) = upper.find("IDENTIFICATION") {
+                if pos < 7 {
+                    return cobol_lexer::SourceFormat::Free;
+                }
+            }
+        }
+    }
+    cobol_lexer::SourceFormat::Fixed
 }
 
 fn main() {
@@ -2710,10 +2736,11 @@ fn main() {
         }
     }
 
-    // Determine source format
-    let source_format = match cli.format.as_str() {
-        "free" => cobol_lexer::SourceFormat::Free,
-        _ => cobol_lexer::SourceFormat::Fixed,
+    // Determine source format (may be overridden per-file by >>SOURCE directive)
+    let cli_format = match cli.format.as_str() {
+        "free" => Some(cobol_lexer::SourceFormat::Free),
+        "fixed" => Some(cobol_lexer::SourceFormat::Fixed),
+        _ => None, // "auto" or default — detect per-file
     };
 
     // For exe/obj mode, accumulate object files across all inputs,
@@ -2742,6 +2769,9 @@ fn main() {
 
         use cobol_db::InputDatabase;
         db.set_file_text(file_id, source.clone());
+
+        // Determine source format: CLI override or auto-detect from file content
+        let source_format = cli_format.unwrap_or_else(|| detect_source_format(&source));
         db.set_source_format(file_id, source_format);
 
         // Run the preprocessor to expand COPY/REPLACE directives
