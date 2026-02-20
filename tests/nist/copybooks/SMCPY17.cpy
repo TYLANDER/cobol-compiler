@@ -1,0 +1,3 @@
+           MOVE "COPY-PROC" TO WS-RESULT
+           ADD 10 TO WS-COUNTER
+           MOVE "EXECUTED" TO WS-STATUS.

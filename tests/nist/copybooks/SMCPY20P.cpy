@@ -1,0 +1,2 @@
+           MOVE "PROC-COPY-OK" TO WS-PROC-RESULT
+           ADD 5 TO WS-DATA-FIELD2.

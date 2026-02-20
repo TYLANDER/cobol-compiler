@@ -1,0 +1,2 @@
+       COPY SMCPY18B.
+       01  WS-OUTER-FIELD        PIC X(10) VALUE "OUTER-OK".

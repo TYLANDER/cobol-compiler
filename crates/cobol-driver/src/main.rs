@@ -1850,6 +1850,161 @@ char* cobolrt_min_numeric(
     }
     return (char*)a;
 }
+
+/* ---- SORT USING GIVING implementation ----
+ *
+ * cobolrt_sort_using_giving reads all records from the input file,
+ * sorts them in memory by the specified key(s), and writes the sorted
+ * records to the output file.
+ *
+ * key_info is a string of the form "offset,length,asc;offset,length,asc;..."
+ * where asc is 1 for ascending, 0 for descending.
+ */
+
+/* Maximum record size and maximum number of records for sort */
+#define SORT_MAX_RECORD_SIZE 4096
+#define SORT_MAX_RECORDS 100000
+#define SORT_MAX_KEYS 16
+
+/* Sort context passed to the qsort comparator via a global (not re-entrant) */
+static unsigned int _sort_key_offsets[SORT_MAX_KEYS];
+static unsigned int _sort_key_lengths[SORT_MAX_KEYS];
+static int          _sort_key_ascending[SORT_MAX_KEYS];
+static unsigned int _sort_num_keys = 0;
+static unsigned int _sort_record_size = 0;
+
+static int sort_compare(const void *a, const void *b) {
+    const char *rec_a = *(const char * const *)a;
+    const char *rec_b = *(const char * const *)b;
+    for (unsigned int k = 0; k < _sort_num_keys; k++) {
+        unsigned int off = _sort_key_offsets[k];
+        unsigned int len = _sort_key_lengths[k];
+        int asc = _sort_key_ascending[k];
+        int cmp = memcmp(rec_a + off, rec_b + off, len);
+        if (cmp != 0) {
+            return asc ? cmp : -cmp;
+        }
+    }
+    return 0;
+}
+
+/* Parse key_info string "off,len,asc;off,len,asc;..." into the global arrays */
+static void parse_key_info(const char *key_info, unsigned int key_info_len) {
+    _sort_num_keys = 0;
+    unsigned int i = 0;
+    while (i < key_info_len && _sort_num_keys < SORT_MAX_KEYS) {
+        /* Parse offset */
+        unsigned int off = 0;
+        while (i < key_info_len && key_info[i] >= '0' && key_info[i] <= '9') {
+            off = off * 10 + (key_info[i] - '0');
+            i++;
+        }
+        if (i < key_info_len && key_info[i] == ',') i++; /* skip comma */
+        /* Parse length */
+        unsigned int len = 0;
+        while (i < key_info_len && key_info[i] >= '0' && key_info[i] <= '9') {
+            len = len * 10 + (key_info[i] - '0');
+            i++;
+        }
+        if (i < key_info_len && key_info[i] == ',') i++; /* skip comma */
+        /* Parse ascending flag */
+        int asc = 1;
+        if (i < key_info_len) {
+            asc = (key_info[i] == '1') ? 1 : 0;
+            i++;
+        }
+        if (i < key_info_len && key_info[i] == ';') i++; /* skip semicolon */
+
+        _sort_key_offsets[_sort_num_keys] = off;
+        _sort_key_lengths[_sort_num_keys] = len;
+        _sort_key_ascending[_sort_num_keys] = asc;
+        _sort_num_keys++;
+    }
+}
+
+void cobolrt_sort_using_giving(
+    const char *input_filename, unsigned int input_filename_len,
+    const char *output_filename, unsigned int output_filename_len,
+    unsigned int record_size,
+    unsigned int num_keys,
+    const char *key_info, unsigned int key_info_len
+) {
+    (void)num_keys; /* We parse actual count from key_info */
+
+    /* Build null-terminated filenames */
+    char in_fname[1024];
+    char out_fname[1024];
+    unsigned int in_len = input_filename_len < sizeof(in_fname) - 1
+        ? input_filename_len : (unsigned int)(sizeof(in_fname) - 1);
+    memcpy(in_fname, input_filename, in_len);
+    in_fname[in_len] = '\0';
+    unsigned int out_len = output_filename_len < sizeof(out_fname) - 1
+        ? output_filename_len : (unsigned int)(sizeof(out_fname) - 1);
+    memcpy(out_fname, output_filename, out_len);
+    out_fname[out_len] = '\0';
+
+    /* Parse key info */
+    parse_key_info(key_info, key_info_len);
+    _sort_record_size = record_size;
+
+    /* If no keys were parsed, use the whole record as one ascending key */
+    if (_sort_num_keys == 0) {
+        _sort_key_offsets[0] = 0;
+        _sort_key_lengths[0] = record_size;
+        _sort_key_ascending[0] = 1;
+        _sort_num_keys = 1;
+    }
+
+    /* Read all records from input file */
+    FILE *fin = fopen(in_fname, "r");
+    if (!fin) return;
+
+    char **records = (char **)malloc(SORT_MAX_RECORDS * sizeof(char *));
+    if (!records) { fclose(fin); return; }
+    unsigned int count = 0;
+    char line[SORT_MAX_RECORD_SIZE + 2]; /* +2 for newline and null */
+
+    while (fgets(line, sizeof(line), fin) != NULL && count < SORT_MAX_RECORDS) {
+        /* Remove trailing newline/carriage return */
+        size_t len = strlen(line);
+        if (len > 0 && line[len - 1] == '\n') { line[--len] = '\0'; }
+        if (len > 0 && line[len - 1] == '\r') { line[--len] = '\0'; }
+
+        /* Allocate a fixed-size record buffer, space-padded */
+        char *rec = (char *)malloc(record_size);
+        if (!rec) break;
+        memset(rec, ' ', record_size);
+        unsigned int copy_len = (unsigned int)len < record_size ? (unsigned int)len : record_size;
+        memcpy(rec, line, copy_len);
+
+        records[count++] = rec;
+    }
+    fclose(fin);
+
+    /* Sort the records */
+    if (count > 0) {
+        qsort(records, count, sizeof(char *), sort_compare);
+    }
+
+    /* Write sorted records to output file */
+    FILE *fout = fopen(out_fname, "w");
+    if (fout) {
+        for (unsigned int i = 0; i < count; i++) {
+            /* Trim trailing spaces for output */
+            int end = (int)record_size - 1;
+            while (end >= 0 && records[i][end] == ' ') end--;
+            fwrite(records[i], 1, (size_t)(end + 1), fout);
+            fputc('\n', fout);
+        }
+        fclose(fout);
+    }
+
+    /* Free records */
+    for (unsigned int i = 0; i < count; i++) {
+        free(records[i]);
+    }
+    free(records);
+}
 "#;
 
 /// cobolc -- The World's Best Open-Source COBOL Compiler

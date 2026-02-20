@@ -118,6 +118,7 @@ run_test "SMOKE-SET"
 run_test "SMOKE-GOBACK" "$SCRIPT_DIR/SMOKE-GOBACK-SUB.cob"
 run_test "SMOKE-INTRINSIC"
 run_test "SMOKE-CONTINUE"
+run_test "SMOKE-CLASS"
 
 echo ""
 echo "=== Results ==="

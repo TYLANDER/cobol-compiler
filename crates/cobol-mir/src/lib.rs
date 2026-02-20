@@ -1900,8 +1900,20 @@ impl<'a> MirLowerer<'a> {
             cobol_hir::HirStatement::Continue => {
                 // CONTINUE and plain EXIT are no-ops
             }
-            _ => {
-                // Other statements: not yet implemented
+            cobol_hir::HirStatement::Sort {
+                sort_file,
+                keys,
+                using_files,
+                giving_files,
+            } => {
+                self.lower_sort(
+                    *sort_file,
+                    keys,
+                    using_files,
+                    giving_files,
+                    func,
+                    instructions,
+                );
             }
         }
     }
@@ -4206,6 +4218,178 @@ impl<'a> MirLowerer<'a> {
 
             *current_block_id = continue_block;
         }
+    }
+
+    /// Lower SORT ... USING ... GIVING statement.
+    ///
+    /// For the simple USING/GIVING form we emit a single runtime call:
+    ///   cobolrt_sort_using_giving(
+    ///       input_filename_ptr, input_filename_len,
+    ///       output_filename_ptr, output_filename_len,
+    ///       record_size,
+    ///       num_keys,
+    ///       key_offsets_ptr, key_lengths_ptr, key_ascending_ptr
+    ///   )
+    ///
+    /// The runtime opens the input file, reads all records, sorts them, and
+    /// writes the sorted records to the output file.
+    fn lower_sort(
+        &self,
+        sort_file: cobol_intern::Name,
+        keys: &[cobol_hir::SortKey],
+        using_files: &[cobol_intern::Name],
+        giving_files: &[cobol_intern::Name],
+        func: &mut MirFunction,
+        instructions: &mut Vec<MirInst>,
+    ) {
+        // Only handle the USING/GIVING form for now (most common simple case)
+        if using_files.is_empty() || giving_files.is_empty() {
+            return;
+        }
+
+        // Get the sort file name and look up its record size
+        let sort_file_name = self.interner.resolve(sort_file).to_string();
+        let record_size: u32 = self
+            .file_record_map
+            .get(&sort_file_name)
+            .and_then(|records| records.first())
+            .and_then(|rec_name| self.global_map.get(rec_name))
+            .map(|&idx| {
+                let global = &self.module.globals[idx];
+                match &global.ty {
+                    MirType::Bytes(n) => *n,
+                    _ => 80, // default record size
+                }
+            })
+            .unwrap_or(80);
+
+        // Resolve key offsets and lengths from the sort file's record structure.
+        // For each key, find its offset within the record and its byte size.
+        let mut key_offsets: Vec<u32> = Vec::new();
+        let mut key_lengths: Vec<u32> = Vec::new();
+        let mut key_ascending: Vec<u32> = Vec::new(); // 1=ascending, 0=descending
+
+        for key in keys {
+            let key_name = self.interner.resolve(key.name).to_string();
+            // Look up the key in the global map to find its offset and size
+            if let Some(&idx) = self.global_map.get(&key_name) {
+                let global = &self.module.globals[idx];
+                let size = match &global.ty {
+                    MirType::Bytes(n) => *n,
+                    _ => 1,
+                };
+                // Compute offset relative to the record start
+                // The parent_offset gives us the offset within the parent record
+                let offset = global.parent_offset.as_ref().map(|(_, o)| *o).unwrap_or(0);
+                key_offsets.push(offset);
+                key_lengths.push(size);
+            } else {
+                // Key not found; use defaults
+                key_offsets.push(0);
+                key_lengths.push(record_size);
+            }
+            key_ascending.push(if key.ascending { 1 } else { 0 });
+        }
+
+        let num_keys = keys.len() as u32;
+
+        // Get input file path from ASSIGN TO
+        let using_file_name = self.interner.resolve(using_files[0]).to_string();
+        let input_path = self
+            .file_assign_map
+            .get(&using_file_name)
+            .cloned()
+            .unwrap_or_else(|| format!("{}.DAT", using_file_name));
+
+        // Get output file path from ASSIGN TO
+        let giving_file_name = self.interner.resolve(giving_files[0]).to_string();
+        let output_path = self
+            .file_assign_map
+            .get(&giving_file_name)
+            .cloned()
+            .unwrap_or_else(|| format!("{}.DAT", giving_file_name));
+
+        // Emit constants for input filename
+        let input_ptr = func.new_value();
+        instructions.push(MirInst::Const {
+            dest: input_ptr,
+            value: MirConst::Str(input_path.clone()),
+        });
+        let input_len = func.new_value();
+        instructions.push(MirInst::Const {
+            dest: input_len,
+            value: MirConst::Int(input_path.len() as i64),
+        });
+
+        // Emit constants for output filename
+        let output_ptr = func.new_value();
+        instructions.push(MirInst::Const {
+            dest: output_ptr,
+            value: MirConst::Str(output_path.clone()),
+        });
+        let output_len = func.new_value();
+        instructions.push(MirInst::Const {
+            dest: output_len,
+            value: MirConst::Int(output_path.len() as i64),
+        });
+
+        // Record size
+        let rec_size_val = func.new_value();
+        instructions.push(MirInst::Const {
+            dest: rec_size_val,
+            value: MirConst::Int(record_size as i64),
+        });
+
+        // Number of keys
+        let num_keys_val = func.new_value();
+        instructions.push(MirInst::Const {
+            dest: num_keys_val,
+            value: MirConst::Int(num_keys as i64),
+        });
+
+        // Key arrays as packed byte arrays: offsets, lengths, ascending flags
+        // We pack them as space-separated integers in a string that the runtime parses,
+        // OR we store them as inline byte arrays. For simplicity, we use a combined
+        // format string: "offset1,length1,asc1;offset2,length2,asc2;..."
+        let key_info_str = keys
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("{},{},{}", key_offsets[i], key_lengths[i], key_ascending[i]))
+            .collect::<Vec<_>>()
+            .join(";");
+
+        let key_info_ptr = func.new_value();
+        instructions.push(MirInst::Const {
+            dest: key_info_ptr,
+            value: MirConst::Str(key_info_str.clone()),
+        });
+        let key_info_len = func.new_value();
+        instructions.push(MirInst::Const {
+            dest: key_info_len,
+            value: MirConst::Int(key_info_str.len() as i64),
+        });
+
+        // Call cobolrt_sort_using_giving(
+        //     input_ptr, input_len,
+        //     output_ptr, output_len,
+        //     record_size,
+        //     num_keys,
+        //     key_info_ptr, key_info_len
+        // )
+        instructions.push(MirInst::CallRuntime {
+            dest: None,
+            func: "cobolrt_sort_using_giving".to_string(),
+            args: vec![
+                input_ptr,
+                input_len,
+                output_ptr,
+                output_len,
+                rec_size_val,
+                num_keys_val,
+                key_info_ptr,
+                key_info_len,
+            ],
+        });
     }
 
     /// Lower CALL statement: call an external subprogram.

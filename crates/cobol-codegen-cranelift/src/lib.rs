@@ -590,6 +590,18 @@ impl CraneliftCodegen {
                 sig.params.push(AbiParam::new(types::I32)); // b_len
                 sig.returns.push(AbiParam::new(ptr)); // result ptr (points to a or b)
             }
+            "cobolrt_sort_using_giving" => {
+                // (input_ptr, input_len, output_ptr, output_len,
+                //  record_size, num_keys, key_info_ptr, key_info_len)
+                sig.params.push(AbiParam::new(ptr)); // input filename ptr
+                sig.params.push(AbiParam::new(types::I32)); // input filename len
+                sig.params.push(AbiParam::new(ptr)); // output filename ptr
+                sig.params.push(AbiParam::new(types::I32)); // output filename len
+                sig.params.push(AbiParam::new(types::I32)); // record size
+                sig.params.push(AbiParam::new(types::I32)); // num keys
+                sig.params.push(AbiParam::new(ptr)); // key info string ptr
+                sig.params.push(AbiParam::new(types::I32)); // key info string len
+            }
             _ => {
                 // Unknown function (likely a subprogram call).
                 // Infer signature: all pointer args, void return.

@@ -1153,6 +1153,8 @@ impl<'t> Parser<'t> {
             }
             if self.at_word("FD") || self.at_kind(cobol_lexer::TokenKind::Fd) {
                 self.parse_fd_entry();
+            } else if self.at_word("SD") || self.at_kind(cobol_lexer::TokenKind::Sd) {
+                self.parse_sd_entry();
             } else if self.at_level_number() {
                 self.parse_data_item();
             } else {
@@ -1169,6 +1171,28 @@ impl<'t> Parser<'t> {
         // FD keyword
         self.skip_ws();
         self.bump(); // FD
+
+        // File name and clauses until period
+        self.skip_ws();
+        while !self.at_end() && self.current_kind() != cobol_lexer::TokenKind::Period {
+            self.bump();
+        }
+        // Period
+        if !self.at_end() && self.current_kind() == cobol_lexer::TokenKind::Period {
+            self.bump();
+        }
+
+        self.finish_node();
+    }
+
+    fn parse_sd_entry(&mut self) {
+        // SD entries are treated like FD entries for parsing purposes.
+        // The HIR will distinguish them later.
+        self.start_node(SyntaxKind::FD_ENTRY);
+
+        // SD keyword
+        self.skip_ws();
+        self.bump(); // SD
 
         // File name and clauses until period
         self.skip_ws();

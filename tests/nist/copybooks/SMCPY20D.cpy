@@ -1,0 +1,2 @@
+       01  WS-DATA-FIELD1        PIC X(15) VALUE "DATA-COPY-OK".
+       01  WS-DATA-FIELD2        PIC 9(5)  VALUE 10000.

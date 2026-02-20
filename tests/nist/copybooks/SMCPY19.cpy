@@ -1,0 +1,3 @@
+       01  WS-PRE-FIELD1         PIC X(10) VALUE "LEADING-OK".
+       01  WS-PRE-FIELD2         PIC 9(4)  VALUE 7777.
+       01  WS-PRE-COUNTER        PIC 9(3)  VALUE 100.

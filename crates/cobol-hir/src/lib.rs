@@ -455,6 +455,17 @@ pub enum HirStatement {
         on_size_error: Option<Vec<HirStatement>>,
         not_on_size_error: Option<Vec<HirStatement>>,
     },
+    /// SORT file-name ON ASCENDING/DESCENDING KEY data-name USING input-file GIVING output-file
+    Sort {
+        /// The sort work file (SD entry).
+        sort_file: cobol_intern::Name,
+        /// Sort keys with ascending/descending direction.
+        keys: Vec<SortKey>,
+        /// USING file(s) — input file(s) to read records from.
+        using_files: Vec<cobol_intern::Name>,
+        /// GIVING file(s) — output file(s) to write sorted records to.
+        giving_files: Vec<cobol_intern::Name>,
+    },
 }
 
 /// A WHEN clause inside a SEARCH statement.
@@ -2271,6 +2282,11 @@ impl<'a> HirLowerer<'a> {
                 }
                 SyntaxKind::SET_STMT => {
                     if let Some(s) = self.lower_set_stmt(&child) {
+                        stmts.push(s);
+                    }
+                }
+                SyntaxKind::SORT_STMT => {
+                    if let Some(s) = self.lower_sort_stmt(&child) {
                         stmts.push(s);
                     }
                 }
@@ -5291,6 +5307,98 @@ impl<'a> HirLowerer<'a> {
         })
     }
 
+    /// Lower a SORT statement.
+    ///
+    /// Supported form:
+    ///   SORT sort-file ON ASCENDING/DESCENDING KEY key-name ...
+    ///       USING input-file ...
+    ///       GIVING output-file ...
+    fn lower_sort_stmt(&mut self, node: &cobol_ast::SyntaxNode) -> Option<HirStatement> {
+        let tokens = self.collect_all_tokens(node);
+        if tokens.len() < 2 {
+            return None;
+        }
+
+        let mut idx = 0;
+        // Skip "SORT" keyword
+        if idx < tokens.len() && tokens[idx].1.eq_ignore_ascii_case("SORT") {
+            idx += 1;
+        }
+
+        // Get the sort file name
+        if idx >= tokens.len() {
+            return None;
+        }
+        let sort_file_str = tokens[idx].1.to_ascii_uppercase();
+        let sort_file = self.interner.intern(&sort_file_str);
+        idx += 1;
+
+        let mut keys: Vec<SortKey> = Vec::new();
+        let mut using_files: Vec<cobol_intern::Name> = Vec::new();
+        let mut giving_files: Vec<cobol_intern::Name> = Vec::new();
+        let mut current_ascending = true;
+        let mut in_using = false;
+        let mut in_giving = false;
+
+        while idx < tokens.len() {
+            let upper = tokens[idx].1.to_ascii_uppercase();
+            match upper.as_str() {
+                "ON" | "KEY" | "IS" => {
+                    // Skip filler keywords
+                    idx += 1;
+                }
+                "ASCENDING" => {
+                    current_ascending = true;
+                    in_using = false;
+                    in_giving = false;
+                    idx += 1;
+                }
+                "DESCENDING" => {
+                    current_ascending = false;
+                    in_using = false;
+                    in_giving = false;
+                    idx += 1;
+                }
+                "USING" => {
+                    in_using = true;
+                    in_giving = false;
+                    idx += 1;
+                }
+                "GIVING" => {
+                    in_giving = true;
+                    in_using = false;
+                    idx += 1;
+                }
+                "WITH" | "DUPLICATES" | "ORDER" | "IN" | "COLLATING" | "SEQUENCE" | "END-SORT" => {
+                    // Skip optional clauses we don't yet handle
+                    idx += 1;
+                }
+                _ => {
+                    let name_str = tokens[idx].1.to_ascii_uppercase();
+                    if in_using {
+                        using_files.push(self.interner.intern(&name_str));
+                    } else if in_giving {
+                        giving_files.push(self.interner.intern(&name_str));
+                    } else {
+                        // Must be a key name
+                        keys.push(SortKey {
+                            name: self.interner.intern(&name_str),
+                            ascending: current_ascending,
+                        });
+                    }
+                    idx += 1;
+                }
+            }
+        }
+
+        Some(HirStatement::Sort {
+            sort_file,
+            keys,
+            using_files,
+            giving_files,
+        })
+    }
+
     fn lower_set_stmt(&mut self, node: &cobol_ast::SyntaxNode) -> Option<HirStatement> {
         let tokens = self.collect_all_tokens(node);
         if tokens.len() < 3 {
@@ -5494,6 +5602,11 @@ impl<'a> HirLowerer<'a> {
             }
             SyntaxKind::SET_STMT => {
                 if let Some(s) = self.lower_set_stmt(node) {
+                    stmts.push(s);
+                }
+            }
+            SyntaxKind::SORT_STMT => {
+                if let Some(s) = self.lower_sort_stmt(node) {
                     stmts.push(s);
                 }
             }
