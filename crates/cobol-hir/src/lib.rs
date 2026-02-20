@@ -256,6 +256,8 @@ pub struct FileDescriptor {
     pub assign_to: String,
     /// RELATIVE KEY data name (for ORGANIZATION IS RELATIVE).
     pub relative_key: Option<String>,
+    /// RECORD KEY data name (for ORGANIZATION IS INDEXED).
+    pub record_key: Option<String>,
     /// FILE STATUS data name.
     pub file_status: Option<String>,
     /// Source location.
@@ -993,6 +995,8 @@ struct SelectInfo {
     access_mode: AccessMode,
     /// RELATIVE KEY data name (for relative files).
     relative_key: Option<String>,
+    /// RECORD KEY data name (for indexed files).
+    record_key: Option<String>,
     /// FILE STATUS data name.
     file_status: Option<String>,
 }
@@ -1128,6 +1132,7 @@ impl<'a> HirLowerer<'a> {
         let mut organization = FileOrganization::Sequential;
         let mut access_mode = AccessMode::Sequential;
         let mut relative_key = None;
+        let mut record_key = None;
         let mut file_status = None;
 
         let mut i = 0;
@@ -1265,6 +1270,21 @@ impl<'a> HirLowerer<'a> {
                         }
                     }
                 }
+                "RECORD" => {
+                    // RECORD KEY IS data-name
+                    i += 1;
+                    if i < tokens.len() && tokens[i].eq_ignore_ascii_case("KEY") {
+                        i += 1;
+                        // Skip optional IS
+                        if i < tokens.len() && tokens[i].eq_ignore_ascii_case("IS") {
+                            i += 1;
+                        }
+                        if i < tokens.len() {
+                            record_key = Some(tokens[i].to_ascii_uppercase());
+                            i += 1;
+                        }
+                    }
+                }
                 "STATUS" => {
                     // STATUS IS data-name (without FILE prefix)
                     i += 1;
@@ -1290,6 +1310,7 @@ impl<'a> HirLowerer<'a> {
                 organization,
                 access_mode,
                 relative_key,
+                record_key,
                 file_status,
             });
         }
@@ -1318,6 +1339,7 @@ impl<'a> HirLowerer<'a> {
                 access_mode: sel.access_mode,
                 assign_to: sel.assign_to.clone(),
                 relative_key: sel.relative_key.clone(),
+                record_key: sel.record_key.clone(),
                 file_status: sel.file_status.clone(),
                 span: self.dummy_span(),
             });

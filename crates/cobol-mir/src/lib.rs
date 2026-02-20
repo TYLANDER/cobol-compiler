@@ -482,6 +482,8 @@ pub struct MirFileDescriptor {
     pub record_size: u32,
     /// RELATIVE KEY data name (for ORGANIZATION IS RELATIVE).
     pub relative_key: Option<String>,
+    /// RECORD KEY data name (for ORGANIZATION IS INDEXED).
+    pub record_key: Option<String>,
     /// FILE STATUS data name.
     pub file_status: Option<String>,
 }
@@ -690,6 +692,7 @@ impl<'a> MirLowerer<'a> {
                 access_mode: fd.access_mode,
                 record_size,
                 relative_key: fd.relative_key.clone(),
+                record_key: fd.record_key.clone(),
                 file_status: fd.file_status.clone(),
             });
         }
@@ -4397,7 +4400,9 @@ impl<'a> MirLowerer<'a> {
                 .unwrap_or(cobol_hir::FileOrganization::Sequential);
 
             let write_func = match org {
-                cobol_hir::FileOrganization::Relative => "cobolrt_file_write_record",
+                cobol_hir::FileOrganization::Relative | cobol_hir::FileOrganization::Indexed => {
+                    "cobolrt_file_write_record"
+                }
                 _ => "cobolrt_file_write_line",
             };
 
@@ -4477,7 +4482,9 @@ impl<'a> MirLowerer<'a> {
             .copied()
             .unwrap_or(cobol_hir::FileOrganization::Sequential);
         let read_func = match org {
-            cobol_hir::FileOrganization::Relative => "cobolrt_file_read_record",
+            cobol_hir::FileOrganization::Relative | cobol_hir::FileOrganization::Indexed => {
+                "cobolrt_file_read_record"
+            }
             _ => "cobolrt_file_read_line",
         };
 
@@ -10335,6 +10342,7 @@ mod tests {
             access_mode: cobol_hir::AccessMode::Sequential,
             record_size: 80,
             relative_key: None,
+            record_key: None,
             file_status: None,
         };
         assert_eq!(fd.name, "INPUT-FILE");
@@ -10467,6 +10475,7 @@ mod tests {
                 access_mode: cobol_hir::AccessMode::Sequential,
                 record_size: 200,
                 relative_key: None,
+                record_key: None,
                 file_status: None,
             }],
             errors: Vec::new(),
