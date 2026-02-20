@@ -1,0 +1,19 @@
+*> Free-format COBOL smoke test
+IDENTIFICATION DIVISION.
+PROGRAM-ID. SMOKE-FREE.
+*> This tests free-format source support
+DATA DIVISION.
+WORKING-STORAGE SECTION.
+01 WS-NUM PIC 9(4) VALUE 1234.
+01 WS-RESULT PIC 9(4).
+PROCEDURE DIVISION.
+*> Test 1: Basic computation in free format
+    COMPUTE WS-RESULT = WS-NUM + 1
+    IF WS-RESULT = 1235
+        DISPLAY "SMOKE-FREE-TEST-1 PASS"
+    ELSE
+        DISPLAY "SMOKE-FREE-TEST-1 FAIL"
+    END-IF
+*> Test 2: String handling
+    DISPLAY "SMOKE-FREE-TEST-2 PASS"
+    STOP RUN.

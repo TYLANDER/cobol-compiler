@@ -38,7 +38,7 @@ run_test() {
     while [ $i -lt ${#args[@]} ]; do
         local arg="${args[$i]}"
         case "$arg" in
-            -I|--include)
+            -I|--include|--format)
                 flags+=("$arg")
                 i=$((i + 1))
                 if [ $i -lt ${#args[@]} ]; then
@@ -122,6 +122,7 @@ run_test "SMOKE-CLASS"
 run_test "SMOKE-SORT"
 run_test "SMOKE-INDEX"
 run_test "SMOKE-RELATIVE"
+run_test "SMOKE-FREE" "--format" "free"
 
 echo ""
 echo "=== Results ==="

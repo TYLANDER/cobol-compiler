@@ -228,12 +228,12 @@ PR gate: no regressions (any previously-passing test that now fails blocks merge
 - [x] CALL/CANCEL (IC module — 27 tests, CALL RETURNING, ON EXCEPTION)
 - [x] Intrinsic functions — 14 implemented (LENGTH, UPPER-CASE, LOWER-CASE, REVERSE, TRIM, MAX, MIN, ORD, MOD, ABS, INTEGER, NUMVAL, CURRENT-DATE, nested functions)
 - [x] IF module — 15 tests
-- [x] 402/405 NIST tests passing (3 SM skips), 29 smoke tests
+- [x] 418/421 NIST tests passing (3 SM skips), 31 smoke tests
 - [x] Clippy clean (0 warnings), rustfmt clean
-- [ ] Relative I/O (RL module) — not yet started
-- [ ] Indexed I/O (IX module) — not yet started
-- [ ] Free-format source support
-- [ ] Report Writer (basic)
+- [x] Relative I/O (RL module — 8 tests)
+- [x] Indexed I/O (IX module — 8 tests)
+- [x] Free-format source support (already implemented in lexer; `--format free` CLI flag; verified with SMOKE-FREE test)
+- [ ] Report Writer (basic) — deferred to Phase 5; rarely used in modern COBOL
 - **Deliverable**: Beta release
 
 ### Phase 4: IDE & Fast Backend
