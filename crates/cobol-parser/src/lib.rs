@@ -135,6 +135,12 @@ pub enum SyntaxKind {
     SELECT_CLAUSE,
     FILE_CONTROL_ENTRY,
 
+    // -- Program structure --
+    /// A single program unit (outer or nested).
+    PROGRAM,
+    /// END PROGRAM program-name.
+    END_PROGRAM_CLAUSE,
+
     // -- Error recovery --
     ERROR_NODE,
     TOMBSTONE,
@@ -807,6 +813,78 @@ impl<'t> Parser<'t> {
 
         self.skip_ws();
 
+        // Parse one or more program units (supports nested/stacked programs).
+        // A program starts with IDENTIFICATION/ID DIVISION. If the file starts
+        // with a different division (e.g. DATA DIVISION in tests), parse it as
+        // a single implicit program.
+        let mut parsed_any = false;
+        while !self.at_end() && !self.at_kind(cobol_lexer::TokenKind::Eof) {
+            if self.at_any_word(&["IDENTIFICATION", "ID"]) && self.peek_word_at(1, "DIVISION") {
+                self.parse_program();
+                parsed_any = true;
+            } else {
+                break;
+            }
+            self.skip_ws();
+        }
+
+        // If no IDENTIFICATION DIVISION was found, parse remaining divisions
+        // directly under SOURCE_FILE (backward compat for fragments).
+        if !parsed_any {
+            self.parse_implicit_program();
+        }
+
+        // Consume any remaining tokens (including EOF).
+        if !self.at_end() && !self.at_kind(cobol_lexer::TokenKind::Eof) {
+            self.error("unexpected tokens outside of any program");
+            while !self.at_end() {
+                self.bump();
+            }
+        } else {
+            while !self.at_end() {
+                self.bump();
+            }
+        }
+        // Consume the EOF token itself if present.
+        if self.pos < self.tokens.len() {
+            self.bump();
+        }
+
+        // If there were no tokens at all, insert a synthetic EOF.
+        if self.tokens.is_empty() {
+            self.builder
+                .token(CobolLanguage::kind_to_raw(SyntaxKind::EOF), "");
+        }
+
+        self.finish_node();
+    }
+
+    /// Parse divisions directly under SOURCE_FILE (no PROGRAM wrapper).
+    /// Used when the file doesn't start with IDENTIFICATION DIVISION.
+    fn parse_implicit_program(&mut self) {
+        // ENVIRONMENT DIVISION
+        if !self.at_end() && self.at_word("ENVIRONMENT") && self.peek_word_at(1, "DIVISION") {
+            self.parse_environment_division();
+        }
+        self.skip_ws();
+
+        // DATA DIVISION
+        if !self.at_end() && self.at_word("DATA") && self.peek_word_at(1, "DIVISION") {
+            self.parse_data_division();
+        }
+        self.skip_ws();
+
+        // PROCEDURE DIVISION
+        if !self.at_end() && self.at_word("PROCEDURE") && self.peek_word_at(1, "DIVISION") {
+            self.parse_procedure_division();
+        }
+    }
+
+    /// Parse a single program unit: IDENTIFICATION → ENVIRONMENT → DATA →
+    /// PROCEDURE → nested programs → END PROGRAM.
+    fn parse_program(&mut self) {
+        self.start_node(SyntaxKind::PROGRAM);
+
         // IDENTIFICATION DIVISION
         if !self.at_end()
             && self.at_any_word(&["IDENTIFICATION", "ID"])
@@ -836,30 +914,53 @@ impl<'t> Parser<'t> {
             self.parse_procedure_division();
         }
 
-        // Consume any remaining tokens (including EOF).
-        // If there are non-whitespace, non-EOF tokens left, the source has
-        // content that didn't match any division — report an error.
-        if !self.at_end() && !self.at_kind(cobol_lexer::TokenKind::Eof) {
-            self.error("unexpected tokens outside of any division");
-            while !self.at_end() {
-                self.bump();
+        self.skip_ws();
+
+        // Parse nested programs (contained programs before END PROGRAM)
+        while !self.at_end() && !self.at_kind(cobol_lexer::TokenKind::Eof) && !self.at_end_program()
+        {
+            if self.at_any_word(&["IDENTIFICATION", "ID"]) && self.peek_word_at(1, "DIVISION") {
+                self.parse_program();
+            } else {
+                break;
             }
-        } else {
-            while !self.at_end() {
-                self.bump();
-            }
-        }
-        // Consume the EOF token itself if present.
-        if self.pos < self.tokens.len() {
-            self.bump();
+            self.skip_ws();
         }
 
-        // If there were no tokens at all, insert a synthetic EOF.
-        if self.tokens.is_empty() {
-            self.builder
-                .token(CobolLanguage::kind_to_raw(SyntaxKind::EOF), "");
+        // END PROGRAM program-name.
+        if self.at_end_program() {
+            self.parse_end_program();
         }
 
+        self.finish_node();
+    }
+
+    /// Check if we're at an END PROGRAM clause.
+    fn at_end_program(&self) -> bool {
+        if self.at_end() {
+            return false;
+        }
+        self.at_word("END") && self.peek_word_at(1, "PROGRAM")
+    }
+
+    /// Parse: END PROGRAM program-name.
+    fn parse_end_program(&mut self) {
+        self.start_node(SyntaxKind::END_PROGRAM_CLAUSE);
+        self.bump(); // END
+        self.skip_ws();
+        if !self.at_end() && self.at_word("PROGRAM") {
+            self.bump(); // PROGRAM
+        }
+        self.skip_ws();
+        // Consume the program name
+        if !self.at_end() && self.current_kind() != cobol_lexer::TokenKind::Period {
+            self.bump(); // program-name
+        }
+        self.skip_ws();
+        // Consume the period
+        if !self.at_end() && self.current_kind() == cobol_lexer::TokenKind::Period {
+            self.bump(); // .
+        }
         self.finish_node();
     }
 
@@ -1654,9 +1755,9 @@ impl<'t> Parser<'t> {
 
         // Parse paragraphs and sections
         self.skip_ws();
-        while !self.at_end() && !self.at_division() {
+        while !self.at_end() && !self.at_division() && !self.at_end_program() {
             self.skip_ws();
-            if self.at_end() || self.at_division() {
+            if self.at_end() || self.at_division() || self.at_end_program() {
                 break;
             }
 
@@ -4139,6 +4240,16 @@ mod tests {
         assert_eq!(kind, back);
     }
 
+    /// Helper: get the first PROGRAM node's children, or fall back to SOURCE_FILE children.
+    fn program_children(syntax: &SyntaxNode) -> Vec<SyntaxNode> {
+        // With nested program support, divisions are inside a PROGRAM node
+        if let Some(prog) = syntax.children().find(|c| c.kind() == SyntaxKind::PROGRAM) {
+            prog.children().collect()
+        } else {
+            syntax.children().collect()
+        }
+    }
+
     #[test]
     fn test_parse_hello_world() {
         // Simulates tokens for a minimal HELLO-WORLD.cob:
@@ -4188,7 +4299,7 @@ mod tests {
         assert_eq!(syntax.kind(), SyntaxKind::SOURCE_FILE);
 
         // Should have IDENTIFICATION_DIVISION and PROCEDURE_DIVISION children
-        let children: Vec<_> = syntax.children().collect();
+        let children = program_children(&syntax);
         let has_id_div = children
             .iter()
             .any(|c| c.kind() == SyntaxKind::IDENTIFICATION_DIVISION);

@@ -870,9 +870,51 @@ pub fn lower(
     interner: &mut cobol_intern::Interner,
     file_id: cobol_span::FileId,
 ) -> HirModule {
-    let mut lowerer = HirLowerer::new(interner, file_id);
+    lower_with_dialect(ast, interner, file_id, cobol_lexer::Dialect::Cobol85)
+}
+
+/// Lower AST to HIR with a specific dialect configuration.
+pub fn lower_with_dialect(
+    ast: &cobol_ast::SourceFile,
+    interner: &mut cobol_intern::Interner,
+    file_id: cobol_span::FileId,
+    dialect: cobol_lexer::Dialect,
+) -> HirModule {
+    let mut lowerer = HirLowerer::new(interner, file_id, dialect);
     lowerer.lower_source_file(ast);
     lowerer.finish()
+}
+
+/// Lower all programs in a source file (supports nested/stacked programs).
+///
+/// Returns one `HirModule` per program unit found in the file.
+/// For single-program files, returns a Vec of length 1 (same as `lower()`).
+pub fn lower_all_programs(
+    ast: &cobol_ast::SourceFile,
+    interner: &mut cobol_intern::Interner,
+    file_id: cobol_span::FileId,
+    dialect: cobol_lexer::Dialect,
+) -> Vec<HirModule> {
+    let programs: Vec<_> = ast.programs().collect();
+    if programs.is_empty() {
+        // Fallback: no PROGRAM nodes, treat entire file as one program (backward compat)
+        return vec![lower_with_dialect(ast, interner, file_id, dialect)];
+    }
+
+    let mut modules = Vec::new();
+    for program in &programs {
+        let mut lowerer = HirLowerer::new(interner, file_id, dialect);
+        lowerer.lower_program(program);
+        modules.push(lowerer.finish());
+
+        // Recursively lower nested programs
+        for nested in program.nested_programs() {
+            let mut nested_lowerer = HirLowerer::new(interner, file_id, dialect);
+            nested_lowerer.lower_program(&nested);
+            modules.push(nested_lowerer.finish());
+        }
+    }
+    modules
 }
 
 /// Parse a COBOL PIC string into a [`PictureType`].
@@ -1025,6 +1067,7 @@ struct SelectInfo {
 struct HirLowerer<'a> {
     interner: &'a mut cobol_intern::Interner,
     file_id: cobol_span::FileId,
+    dialect: cobol_lexer::Dialect,
     data_items: la_arena::Arena<DataItemData>,
     working_storage: Vec<DataItemId>,
     linkage_items: Vec<DataItemId>,
@@ -1055,10 +1098,15 @@ struct HirLowerer<'a> {
 }
 
 impl<'a> HirLowerer<'a> {
-    fn new(interner: &'a mut cobol_intern::Interner, file_id: cobol_span::FileId) -> Self {
+    fn new(
+        interner: &'a mut cobol_intern::Interner,
+        file_id: cobol_span::FileId,
+        dialect: cobol_lexer::Dialect,
+    ) -> Self {
         Self {
             interner,
             file_id,
+            dialect,
             data_items: la_arena::Arena::new(),
             working_storage: Vec::new(),
             linkage_items: Vec::new(),
@@ -1109,6 +1157,40 @@ impl<'a> HirLowerer<'a> {
 
         // Lower PROCEDURE DIVISION
         if let Some(proc_div) = ast.procedure_division() {
+            self.lower_procedure_division(&proc_div);
+        }
+    }
+
+    /// Lower a single PROGRAM AST node (for nested/stacked programs).
+    fn lower_program(&mut self, program: &cobol_ast::Program) {
+        // Extract PROGRAM-ID
+        if let Some(id_div) = program.identification_division() {
+            if let Some(pid) = id_div.program_id() {
+                if let Some(name_tok) = pid.name() {
+                    let name_text = name_tok.text().to_string();
+                    self.program_name = Some(self.interner.intern(&name_text));
+                }
+            }
+        }
+
+        // Extract SELECT entries
+        if let Some(env_div) = program.environment_division() {
+            self.lower_environment_division(&env_div);
+        }
+
+        // Lower DATA DIVISION
+        if let Some(data_div) = program.data_division() {
+            self.lower_data_division(&data_div);
+        }
+
+        // Compute group item sizes
+        self.compute_group_sizes();
+
+        // Build file descriptors
+        self.build_file_descriptors();
+
+        // Lower PROCEDURE DIVISION
+        if let Some(proc_div) = program.procedure_division() {
             self.lower_procedure_division(&proc_div);
         }
     }
@@ -1576,7 +1658,7 @@ impl<'a> HirLowerer<'a> {
                     Ok(pt) => {
                         let usage = Self::extract_usage_type(item);
                         let encoding = Self::usage_to_encoding(usage);
-                        let byte_size = Self::compute_byte_size(usage, &pt);
+                        let byte_size = Self::compute_byte_size(usage, &pt, self.dialect);
                         let sd = StorageDescriptor {
                             byte_size,
                             encoding,
@@ -1817,16 +1899,45 @@ impl<'a> HirLowerer<'a> {
     /// - COMP-3 / PACKED-DECIMAL: (digits + 1) / 2 bytes (packed BCD)
     /// - INDEX: 4 bytes
     /// - POINTER / FUNCTION-POINTER: 4 bytes
-    fn compute_byte_size(usage: UsageType, pic: &PictureType) -> u32 {
+    fn compute_byte_size(
+        usage: UsageType,
+        pic: &PictureType,
+        dialect: cobol_lexer::Dialect,
+    ) -> u32 {
         match usage {
             UsageType::Display => {
                 // 1 byte per character/digit position
                 pic.size
             }
-            UsageType::Comp | UsageType::Comp4 | UsageType::Comp5 | UsageType::Binary => {
-                // Binary integer sized by digit count
+            UsageType::Comp | UsageType::Comp4 | UsageType::Binary => {
+                // Binary integer sized by digit count.
+                // IBM dialect uses larger minimum sizes (4 bytes for ≤9 digits).
                 let digits = pic.size;
-                if digits <= 4 {
+                match dialect {
+                    cobol_lexer::Dialect::Ibm => {
+                        if digits <= 9 {
+                            4
+                        } else {
+                            8
+                        }
+                    }
+                    _ => {
+                        if digits <= 4 {
+                            2
+                        } else if digits <= 9 {
+                            4
+                        } else {
+                            8
+                        }
+                    }
+                }
+            }
+            UsageType::Comp5 => {
+                // COMP-5: native binary, always uses minimum power-of-2 size
+                let digits = pic.size;
+                if digits <= 2 {
+                    1
+                } else if digits <= 4 {
                     2
                 } else if digits <= 9 {
                     4
@@ -6812,6 +6923,8 @@ impl<'a> HirLowerer<'a> {
 mod tests {
     use super::*;
 
+    const STD: cobol_lexer::Dialect = cobol_lexer::Dialect::Cobol85;
+
     #[test]
     fn picture_category_equality() {
         assert_eq!(PictureCategory::Numeric, PictureCategory::Numeric);
@@ -6982,60 +7095,78 @@ mod tests {
     #[test]
     fn compute_byte_size_display() {
         let pic = parse_picture("9(5)").unwrap();
-        assert_eq!(HirLowerer::compute_byte_size(UsageType::Display, &pic), 5);
+        assert_eq!(
+            HirLowerer::compute_byte_size(UsageType::Display, &pic, STD),
+            5
+        );
     }
 
     #[test]
     fn compute_byte_size_comp_small() {
         // PIC 9(4) COMP -> 2 bytes (i16)
         let pic = parse_picture("9(4)").unwrap();
-        assert_eq!(HirLowerer::compute_byte_size(UsageType::Comp, &pic), 2);
+        assert_eq!(HirLowerer::compute_byte_size(UsageType::Comp, &pic, STD), 2);
     }
 
     #[test]
     fn compute_byte_size_comp_medium() {
         // PIC 9(5) COMP -> 4 bytes (i32)
         let pic = parse_picture("9(5)").unwrap();
-        assert_eq!(HirLowerer::compute_byte_size(UsageType::Comp, &pic), 4);
+        assert_eq!(HirLowerer::compute_byte_size(UsageType::Comp, &pic, STD), 4);
     }
 
     #[test]
     fn compute_byte_size_comp_large() {
         // PIC 9(10) COMP -> 8 bytes (i64)
         let pic = parse_picture("9(10)").unwrap();
-        assert_eq!(HirLowerer::compute_byte_size(UsageType::Comp, &pic), 8);
+        assert_eq!(HirLowerer::compute_byte_size(UsageType::Comp, &pic, STD), 8);
     }
 
     #[test]
     fn compute_byte_size_binary() {
         let pic = parse_picture("9(7)").unwrap();
-        assert_eq!(HirLowerer::compute_byte_size(UsageType::Binary, &pic), 4);
+        assert_eq!(
+            HirLowerer::compute_byte_size(UsageType::Binary, &pic, STD),
+            4
+        );
     }
 
     #[test]
     fn compute_byte_size_comp4() {
         let pic = parse_picture("9(3)").unwrap();
-        assert_eq!(HirLowerer::compute_byte_size(UsageType::Comp4, &pic), 2);
+        assert_eq!(
+            HirLowerer::compute_byte_size(UsageType::Comp4, &pic, STD),
+            2
+        );
     }
 
     #[test]
     fn compute_byte_size_comp5() {
         let pic = parse_picture("9(18)").unwrap();
-        assert_eq!(HirLowerer::compute_byte_size(UsageType::Comp5, &pic), 8);
+        assert_eq!(
+            HirLowerer::compute_byte_size(UsageType::Comp5, &pic, STD),
+            8
+        );
     }
 
     #[test]
     fn compute_byte_size_comp1() {
         // COMP-1 is always 4 bytes regardless of PIC
         let pic = parse_picture("9(5)").unwrap();
-        assert_eq!(HirLowerer::compute_byte_size(UsageType::Comp1, &pic), 4);
+        assert_eq!(
+            HirLowerer::compute_byte_size(UsageType::Comp1, &pic, STD),
+            4
+        );
     }
 
     #[test]
     fn compute_byte_size_comp2() {
         // COMP-2 is always 8 bytes regardless of PIC
         let pic = parse_picture("9(5)").unwrap();
-        assert_eq!(HirLowerer::compute_byte_size(UsageType::Comp2, &pic), 8);
+        assert_eq!(
+            HirLowerer::compute_byte_size(UsageType::Comp2, &pic, STD),
+            8
+        );
     }
 
     #[test]
@@ -7043,7 +7174,10 @@ mod tests {
         // COMP-3: (digits + 1) / 2
         // PIC 9(5) -> (5 + 1) / 2 = 3 bytes
         let pic = parse_picture("9(5)").unwrap();
-        assert_eq!(HirLowerer::compute_byte_size(UsageType::Comp3, &pic), 3);
+        assert_eq!(
+            HirLowerer::compute_byte_size(UsageType::Comp3, &pic, STD),
+            3
+        );
     }
 
     #[test]
@@ -7052,7 +7186,7 @@ mod tests {
         // PIC 9(7) -> (7 + 1) / 2 = 4 bytes
         let pic = parse_picture("9(7)").unwrap();
         assert_eq!(
-            HirLowerer::compute_byte_size(UsageType::PackedDecimal, &pic),
+            HirLowerer::compute_byte_size(UsageType::PackedDecimal, &pic, STD),
             4
         );
     }
@@ -7062,7 +7196,40 @@ mod tests {
         // COMP-3: (digits + 1) / 2
         // PIC 9(4) -> (4 + 1) / 2 = 2 bytes (integer division)
         let pic = parse_picture("9(4)").unwrap();
-        assert_eq!(HirLowerer::compute_byte_size(UsageType::Comp3, &pic), 2);
+        assert_eq!(
+            HirLowerer::compute_byte_size(UsageType::Comp3, &pic, STD),
+            2
+        );
+    }
+
+    #[test]
+    fn compute_byte_size_ibm_comp_small() {
+        // IBM dialect: PIC 9(4) COMP -> 4 bytes (not 2 like COBOL-85)
+        let pic = parse_picture("9(4)").unwrap();
+        assert_eq!(
+            HirLowerer::compute_byte_size(UsageType::Comp, &pic, cobol_lexer::Dialect::Ibm),
+            4
+        );
+    }
+
+    #[test]
+    fn compute_byte_size_ibm_comp_large() {
+        // IBM dialect: PIC 9(10) COMP -> 8 bytes (same as COBOL-85)
+        let pic = parse_picture("9(10)").unwrap();
+        assert_eq!(
+            HirLowerer::compute_byte_size(UsageType::Comp, &pic, cobol_lexer::Dialect::Ibm),
+            8
+        );
+    }
+
+    #[test]
+    fn compute_byte_size_comp5_small() {
+        // COMP-5: native binary, PIC 9(2) -> 1 byte
+        let pic = parse_picture("9(2)").unwrap();
+        assert_eq!(
+            HirLowerer::compute_byte_size(UsageType::Comp5, &pic, STD),
+            1
+        );
     }
 
     #[test]

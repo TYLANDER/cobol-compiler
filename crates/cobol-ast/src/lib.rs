@@ -103,6 +103,7 @@ macro_rules! ast_node {
 // ---------------------------------------------------------------------------
 
 ast_node!(SourceFile, SOURCE_FILE);
+ast_node!(Program, PROGRAM);
 ast_node!(IdentificationDivision, IDENTIFICATION_DIVISION);
 ast_node!(ProgramIdClause, PROGRAM_ID_CLAUSE);
 ast_node!(EnvironmentDivision, ENVIRONMENT_DIVISION);
@@ -142,24 +143,74 @@ ast_node!(AcceptStmt, ACCEPT_STMT);
 // ---------------------------------------------------------------------------
 
 impl SourceFile {
-    /// Returns the IDENTIFICATION DIVISION, if present.
+    /// Returns all program units in this source file.
+    pub fn programs(&self) -> impl Iterator<Item = Program> + '_ {
+        children::<Program>(&self.syntax)
+    }
+
+    /// Returns the first (or only) IDENTIFICATION DIVISION.
+    /// Checks both direct children and inside the first PROGRAM node
+    /// for backward compatibility.
+    pub fn identification_division(&self) -> Option<IdentificationDivision> {
+        children::<IdentificationDivision>(&self.syntax)
+            .next()
+            .or_else(|| {
+                self.programs()
+                    .next()
+                    .and_then(|p| p.identification_division())
+            })
+    }
+
+    /// Returns the first ENVIRONMENT DIVISION.
+    pub fn environment_division(&self) -> Option<EnvironmentDivision> {
+        children::<EnvironmentDivision>(&self.syntax)
+            .next()
+            .or_else(|| {
+                self.programs()
+                    .next()
+                    .and_then(|p| p.environment_division())
+            })
+    }
+
+    /// Returns the first DATA DIVISION.
+    pub fn data_division(&self) -> Option<DataDivision> {
+        children::<DataDivision>(&self.syntax)
+            .next()
+            .or_else(|| self.programs().next().and_then(|p| p.data_division()))
+    }
+
+    /// Returns the first PROCEDURE DIVISION.
+    pub fn procedure_division(&self) -> Option<ProcedureDivision> {
+        children::<ProcedureDivision>(&self.syntax)
+            .next()
+            .or_else(|| self.programs().next().and_then(|p| p.procedure_division()))
+    }
+}
+
+impl Program {
+    /// Returns the IDENTIFICATION DIVISION of this program.
     pub fn identification_division(&self) -> Option<IdentificationDivision> {
         children::<IdentificationDivision>(&self.syntax).next()
     }
 
-    /// Returns the ENVIRONMENT DIVISION, if present.
+    /// Returns the ENVIRONMENT DIVISION of this program.
     pub fn environment_division(&self) -> Option<EnvironmentDivision> {
         children::<EnvironmentDivision>(&self.syntax).next()
     }
 
-    /// Returns the DATA DIVISION, if present.
+    /// Returns the DATA DIVISION of this program.
     pub fn data_division(&self) -> Option<DataDivision> {
         children::<DataDivision>(&self.syntax).next()
     }
 
-    /// Returns the PROCEDURE DIVISION, if present.
+    /// Returns the PROCEDURE DIVISION of this program.
     pub fn procedure_division(&self) -> Option<ProcedureDivision> {
         children::<ProcedureDivision>(&self.syntax).next()
+    }
+
+    /// Returns nested programs inside this program.
+    pub fn nested_programs(&self) -> impl Iterator<Item = Program> + '_ {
+        children::<Program>(&self.syntax)
     }
 }
 

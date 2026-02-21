@@ -123,6 +123,7 @@ run_test "SMOKE-SORT"
 run_test "SMOKE-INDEX"
 run_test "SMOKE-RELATIVE"
 run_test "SMOKE-FREE" "--format" "free"
+run_test "SMOKE-NESTED"
 
 echo ""
 echo "=== Results ==="

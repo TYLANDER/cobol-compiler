@@ -2746,10 +2746,18 @@ fn main() {
         std::process::exit(1);
     }
 
+    // Parse dialect flag
+    let dialect = match cli.dialect.as_str() {
+        "ibm" => cobol_lexer::Dialect::Ibm,
+        "microfocus" => cobol_lexer::Dialect::MicroFocus,
+        "gnucobol" => cobol_lexer::Dialect::GnuCobol,
+        _ => cobol_lexer::Dialect::Cobol85,
+    };
+
     if cli.verbose {
         eprintln!("cobolc v{}", env!("CARGO_PKG_VERSION"));
         eprintln!("Backend: {}", cli.backend);
-        eprintln!("Dialect: {}", cli.dialect);
+        eprintln!("Dialect: {:?}", dialect);
         eprintln!("Format: {}", cli.format);
         eprintln!("Optimization: O{}", cli.opt_level);
     }
@@ -2861,7 +2869,7 @@ fn main() {
                 let ast =
                     cobol_ast::SourceFile::cast(syntax).expect("root node should be SOURCE_FILE");
                 let mut interner = cobol_intern::Interner::new();
-                let hir = cobol_hir::lower(&ast, &mut interner, file_id);
+                let hir = cobol_hir::lower_with_dialect(&ast, &mut interner, file_id, dialect);
                 if cli.dump {
                     println!("{:#?}", hir);
                 }
@@ -2879,7 +2887,7 @@ fn main() {
                 let ast =
                     cobol_ast::SourceFile::cast(syntax).expect("root node should be SOURCE_FILE");
                 let mut interner = cobol_intern::Interner::new();
-                let hir = cobol_hir::lower(&ast, &mut interner, file_id);
+                let hir = cobol_hir::lower_with_dialect(&ast, &mut interner, file_id, dialect);
                 let mir = cobol_mir::lower(&hir, &interner);
                 if cli.dump {
                     println!("{:#?}", mir);
@@ -2910,92 +2918,104 @@ fn main() {
                     cobol_ast::SourceFile::cast(syntax).expect("root node should be SOURCE_FILE");
 
                 let mut interner = cobol_intern::Interner::new();
-                let hir = cobol_hir::lower(&ast, &mut interner, file_id);
-                for diag in &hir.diagnostics {
-                    if diag.severity == cobol_hir::DiagnosticSeverity::Error {
-                        eprintln!("error: {}", diag.message);
-                    }
-                }
 
-                // First input file is the main program; subsequent files are subprograms
-                let is_main = input_idx == 0;
-                let mut mir = cobol_mir::lower_with_options(&hir, &interner, is_main);
+                // Lower all programs in the file (supports nested/stacked programs)
+                let hir_modules =
+                    cobol_hir::lower_all_programs(&ast, &mut interner, file_id, dialect);
 
-                if !mir.errors.is_empty() {
-                    for err in &mir.errors {
-                        eprintln!("error: {}", err);
-                    }
-                    std::process::exit(1);
-                }
-
-                // Run MIR optimization passes.
                 let mir_opt_level = match cli.opt_level.as_str() {
                     "0" => cobol_mir::passes::OptLevel::None,
                     "1" => cobol_mir::passes::OptLevel::Basic,
                     _ => cobol_mir::passes::OptLevel::Full,
                 };
-                cobol_mir::passes::optimize(&mut mir, mir_opt_level);
 
-                if cli.verbose {
-                    eprintln!(
-                        "MIR: {} functions, {} globals",
-                        mir.functions.len(),
-                        mir.globals.len()
-                    );
-                }
-
-                // Determine object file path
-                let stem = input_path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("output");
-                let obj_path = if cli.emit == "obj" && cli.input.len() == 1 {
-                    cli.output
-                        .clone()
-                        .unwrap_or_else(|| input_path.with_extension("o"))
-                } else {
-                    // For exe or multi-file obj, use temp .o files
-                    std::env::temp_dir().join(format!("{}_{}.o", stem, std::process::id()))
-                };
-
-                // Codegen
-                use cobol_codegen_llvm::CodegenBackend;
-                let backend: Box<dyn CodegenBackend> = match cli.backend.as_str() {
-                    "cranelift" => Box::new(cobol_codegen_cranelift::CraneliftBackend::new()),
-                    "llvm" => {
-                        let llvm_opt = match cli.opt_level.as_str() {
-                            "0" => cobol_codegen_llvm::OptLevel::O0,
-                            "1" => cobol_codegen_llvm::OptLevel::O1,
-                            "2" => cobol_codegen_llvm::OptLevel::O2,
-                            "3" => cobol_codegen_llvm::OptLevel::O3,
-                            "s" => cobol_codegen_llvm::OptLevel::Os,
-                            _ => cobol_codegen_llvm::OptLevel::O2,
-                        };
-                        Box::new(cobol_codegen_llvm::LlvmBackend::new(llvm_opt))
+                for (prog_idx, hir) in hir_modules.iter().enumerate() {
+                    for diag in &hir.diagnostics {
+                        if diag.severity == cobol_hir::DiagnosticSeverity::Error {
+                            eprintln!("error: {}", diag.message);
+                        }
                     }
-                    other => {
-                        eprintln!(
-                            "error: unknown backend '{}', use 'cranelift' or 'llvm'",
-                            other
-                        );
+
+                    // First program of first file is the main program
+                    let is_main = input_idx == 0 && prog_idx == 0;
+                    let mut mir = cobol_mir::lower_with_options(hir, &interner, is_main);
+
+                    if !mir.errors.is_empty() {
+                        for err in &mir.errors {
+                            eprintln!("error: {}", err);
+                        }
                         std::process::exit(1);
                     }
-                };
 
-                if cli.verbose {
-                    eprintln!("codegen backend: {}", backend.name());
+                    cobol_mir::passes::optimize(&mut mir, mir_opt_level);
+
+                    if cli.verbose {
+                        eprintln!(
+                            "MIR: {} ({} functions, {} globals)",
+                            mir.name,
+                            mir.functions.len(),
+                            mir.globals.len()
+                        );
+                    }
+
+                    // Determine object file path
+                    let stem = input_path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("output");
+                    let obj_suffix = if prog_idx > 0 {
+                        format!("{}_{}_p{}.o", stem, std::process::id(), prog_idx)
+                    } else {
+                        format!("{}_{}.o", stem, std::process::id())
+                    };
+                    let obj_path =
+                        if cli.emit == "obj" && cli.input.len() == 1 && hir_modules.len() == 1 {
+                            cli.output
+                                .clone()
+                                .unwrap_or_else(|| input_path.with_extension("o"))
+                        } else {
+                            std::env::temp_dir().join(obj_suffix)
+                        };
+
+                    // Codegen
+                    use cobol_codegen_llvm::CodegenBackend;
+                    let backend: Box<dyn CodegenBackend> = match cli.backend.as_str() {
+                        "cranelift" => Box::new(cobol_codegen_cranelift::CraneliftBackend::new()),
+                        "llvm" => {
+                            let llvm_opt = match cli.opt_level.as_str() {
+                                "0" => cobol_codegen_llvm::OptLevel::O0,
+                                "1" => cobol_codegen_llvm::OptLevel::O1,
+                                "2" => cobol_codegen_llvm::OptLevel::O2,
+                                "3" => cobol_codegen_llvm::OptLevel::O3,
+                                "s" => cobol_codegen_llvm::OptLevel::Os,
+                                _ => cobol_codegen_llvm::OptLevel::O2,
+                            };
+                            Box::new(cobol_codegen_llvm::LlvmBackend::new(llvm_opt))
+                        }
+                        other => {
+                            eprintln!(
+                                "error: unknown backend '{}', use 'cranelift' or 'llvm'",
+                                other
+                            );
+                            std::process::exit(1);
+                        }
+                    };
+
+                    if cli.verbose {
+                        eprintln!("codegen backend: {}", backend.name());
+                    }
+
+                    if let Err(e) = backend.compile(&mir, &obj_path) {
+                        eprintln!("error: codegen failed: {}", e);
+                        std::process::exit(1);
+                    }
+
+                    if cli.verbose {
+                        eprintln!("wrote object file: {}", obj_path.display());
+                    }
+
+                    obj_files.push(obj_path);
                 }
-
-                if let Err(e) = backend.compile(&mir, &obj_path) {
-                    eprintln!("error: codegen failed: {}", e);
-                    std::process::exit(1);
-                }
-
-                if cli.verbose {
-                    eprintln!("wrote object file: {}", obj_path.display());
-                }
-
-                obj_files.push(obj_path);
             }
             _ => {
                 eprintln!("error: unknown --emit value: {}", cli.emit);

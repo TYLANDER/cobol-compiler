@@ -349,6 +349,20 @@ pub enum SourceFormat {
     Free,
 }
 
+/// COBOL dialect controlling language extensions and vendor-specific behavior.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum Dialect {
+    /// Strict COBOL-85 standard (ANSI X3.23-1985).
+    #[default]
+    Cobol85,
+    /// IBM Enterprise COBOL extensions (GOBACK, EXEC SQL/CICS, relaxed reserved words).
+    Ibm,
+    /// Micro Focus COBOL extensions (COMP-X, relaxed syntax).
+    MicroFocus,
+    /// GnuCOBOL extensions (most permissive, COMP-5, many non-standard features).
+    GnuCobol,
+}
+
 // ---------------------------------------------------------------------------
 // Layer 1: Line Normalizer
 // ---------------------------------------------------------------------------

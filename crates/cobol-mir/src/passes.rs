@@ -63,6 +63,8 @@ pub fn optimize(module: &mut MirModule, level: OptLevel) {
     // are already pre-inlined during lowering; this handles CALL targets).
     if level == OptLevel::Full {
         perform_inline(module);
+        // Remove functions that are never called and aren't the entry point.
+        dead_function_eliminate(module);
     }
 }
 
@@ -1569,6 +1571,42 @@ pub fn decimal_strength_reduce(func: &mut MirFunction) {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// Pass 6 – Dead function elimination
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Remove functions from the module that are never called and are not the
+/// entry point (index 0).
+///
+/// Builds a call graph from `CallRuntime` and `CallProgram` instructions,
+/// then removes functions whose names are never referenced.
+pub fn dead_function_eliminate(module: &mut MirModule) {
+    if module.functions.len() <= 1 {
+        return;
+    }
+
+    // Collect all called function names.
+    let mut called: HashSet<String> = HashSet::new();
+    for func in &module.functions {
+        for block in &func.blocks {
+            for inst in &block.instructions {
+                if let MirInst::CallRuntime { func: name, .. } = inst {
+                    called.insert(name.clone());
+                }
+            }
+        }
+    }
+
+    // Retain entry function (index 0) and any function that is called.
+    let mut retained = Vec::new();
+    for (i, func) in module.functions.drain(..).enumerate() {
+        if i == 0 || called.contains(&func.name) {
+            retained.push(func);
+        }
+    }
+    module.functions = retained;
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // Tests
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -2409,5 +2447,98 @@ mod tests {
 
         // Helper should still exist (called twice).
         assert_eq!(module.functions.len(), 2);
+    }
+
+    #[test]
+    fn dead_function_eliminate_removes_unused() {
+        let main_func = MirFunction {
+            name: "main".to_string(),
+            params: vec![],
+            return_type: MirType::Void,
+            blocks: vec![BasicBlock {
+                id: bid(0),
+                params: vec![],
+                instructions: vec![MirInst::CallRuntime {
+                    dest: None,
+                    func: "used".to_string(),
+                    args: vec![],
+                }],
+                terminator: Terminator::Return,
+            }],
+            entry_block: bid(0),
+            next_value: 0,
+            next_block: 1,
+        };
+        let used_func = MirFunction {
+            name: "used".to_string(),
+            params: vec![],
+            return_type: MirType::Void,
+            blocks: vec![BasicBlock {
+                id: bid(0),
+                params: vec![],
+                instructions: vec![],
+                terminator: Terminator::Return,
+            }],
+            entry_block: bid(0),
+            next_value: 0,
+            next_block: 1,
+        };
+        let unused_func = MirFunction {
+            name: "dead_code".to_string(),
+            params: vec![],
+            return_type: MirType::Void,
+            blocks: vec![BasicBlock {
+                id: bid(0),
+                params: vec![],
+                instructions: vec![],
+                terminator: Terminator::Return,
+            }],
+            entry_block: bid(0),
+            next_value: 0,
+            next_block: 1,
+        };
+        let mut module = MirModule {
+            name: "test".into(),
+            functions: vec![main_func, used_func, unused_func],
+            globals: vec![],
+            file_descriptors: vec![],
+            errors: vec![],
+        };
+
+        dead_function_eliminate(&mut module);
+
+        // dead_code should be removed, main + used retained
+        assert_eq!(module.functions.len(), 2);
+        assert_eq!(module.functions[0].name, "main");
+        assert_eq!(module.functions[1].name, "used");
+    }
+
+    #[test]
+    fn dead_function_eliminate_preserves_entry() {
+        // Even if entry function is never called, it should be preserved
+        let main_func = MirFunction {
+            name: "main".to_string(),
+            params: vec![],
+            return_type: MirType::Void,
+            blocks: vec![BasicBlock {
+                id: bid(0),
+                params: vec![],
+                instructions: vec![],
+                terminator: Terminator::Return,
+            }],
+            entry_block: bid(0),
+            next_value: 0,
+            next_block: 1,
+        };
+        let mut module = MirModule {
+            name: "test".into(),
+            functions: vec![main_func],
+            globals: vec![],
+            file_descriptors: vec![],
+            errors: vec![],
+        };
+
+        dead_function_eliminate(&mut module);
+        assert_eq!(module.functions.len(), 1);
     }
 }
