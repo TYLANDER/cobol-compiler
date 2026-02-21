@@ -258,11 +258,14 @@ PR gate: no regressions (any previously-passing test that now fails blocks merge
 - [x] RETURNING OMITTED handling, BY REFERENCE string literal args
 - [x] POINTER type and SET ADDRESS OF / SET ptr TO ADDRESS OF support
 - [x] Real-world repo testing: 35/35 files compile (100%), 421/421 NIST, 32/32 smoke
+- [x] MIR optimization passes: CSE (GlobalAddr dedup), store-to-load forwarding, LICM (loop-invariant hoisting)
+- [x] Improved decimal strength reduction: DecimalCmp → ISub, DecimalToInt roundtrip elimination
+- [x] Runtime benchmark suite: 8 programs (arith, decimal, move, perform, compare, table, string, intrinsic)
+- [x] NIST overall ≥ 99.5% (achieved 100%: 421/421)
+- [x] Real-world repos ≥ 95% compilation rate (achieved 100%)
 - [ ] Whole-program optimization (LTO, cross-module inlining)
 - [ ] Differential testing fully green
-- [ ] NIST overall ≥ 99.5%
-- [x] Real-world repos ≥ 95% compilation rate (achieved 100%)
-- [ ] Faster than GnuCOBOL on 6/8 benchmarks
+- [ ] Faster than GnuCOBOL on 6/8 benchmarks (infrastructure ready, needs GnuCOBOL install)
 - **Deliverable**: 1.0 release
 
 ---
