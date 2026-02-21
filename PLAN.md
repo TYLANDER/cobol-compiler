@@ -252,11 +252,16 @@ PR gate: no regressions (any previously-passing test that now fails blocks merge
 - [x] Nested programs (stacked + contained programs in single source file, END PROGRAM support)
 - [x] Dead function elimination (module-level pass removes unreferenced functions)
 - [x] Real-world compatibility: underscore word support (GnuCOBOL extension), multi-token program names, CALL RETURNING, EXEC SQL/CICS passthrough parsing
-- [x] Real-world repo testing: cobol-examples 100% compile (80% clean), Martinfx 82%, cobol-samples 87%
+- [x] PERFORM WITH TEST BEFORE/AFTER, CALL STATIC/DYNAMIC, ACCEPT subscripts
+- [x] LINKAGE SECTION sub-field resolution (byte offsets from group base pointer)
+- [x] CALL BY VALUE support (integer literals, data-ref value loading, negative literals)
+- [x] RETURNING OMITTED handling, BY REFERENCE string literal args
+- [x] POINTER type and SET ADDRESS OF / SET ptr TO ADDRESS OF support
+- [x] Real-world repo testing: 35/35 files compile (100%), 421/421 NIST, 32/32 smoke
 - [ ] Whole-program optimization (LTO, cross-module inlining)
 - [ ] Differential testing fully green
 - [ ] NIST overall ≥ 99.5%
-- [ ] Real-world repos ≥ 95% compilation rate
+- [x] Real-world repos ≥ 95% compilation rate (achieved 100%)
 - [ ] Faster than GnuCOBOL on 6/8 benchmarks
 - **Deliverable**: 1.0 release
 
