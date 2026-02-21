@@ -3344,6 +3344,20 @@ impl<'t> Parser<'t> {
             return;
         }
 
+        // Optional WITH TEST BEFORE/AFTER phrase
+        if self.at_word("WITH") {
+            self.bump(); // WITH
+            self.skip_ws();
+            if !self.at_end() && self.at_word("TEST") {
+                self.bump(); // TEST
+                self.skip_ws();
+            }
+            if !self.at_end() && (self.at_word("BEFORE") || self.at_word("AFTER")) {
+                self.bump(); // BEFORE or AFTER
+                self.skip_ws();
+            }
+        }
+
         // Determine the form of PERFORM:
         // 1. PERFORM paragraph-name [THRU paragraph-name]
         // 2. PERFORM paragraph-name VARYING ...
@@ -3792,6 +3806,12 @@ impl<'t> Parser<'t> {
         self.skip_ws();
         self.bump(); // CALL
 
+        // Optional STATIC/DYNAMIC keyword (GnuCOBOL extension)
+        self.skip_ws();
+        if !self.at_end() && (self.at_word("STATIC") || self.at_word("DYNAMIC")) {
+            self.bump(); // STATIC or DYNAMIC
+        }
+
         // Called program (literal or identifier)
         self.skip_ws();
         if !self.at_end() && self.current_kind() != cobol_lexer::TokenKind::Period {
@@ -3870,13 +3890,27 @@ impl<'t> Parser<'t> {
         self.skip_ws();
         self.bump(); // ACCEPT
 
-        // Identifier
+        // Identifier (may include subscripts and reference modification)
         self.skip_ws();
         if !self.at_end()
             && self.current_kind() != cobol_lexer::TokenKind::Period
             && (self.at_identifier() || self.current_is_word_like())
         {
-            self.bump();
+            self.bump(); // identifier name
+            // Consume optional subscript/reference modification: (...)
+            self.skip_ws();
+            if !self.at_end() && self.current_kind() == cobol_lexer::TokenKind::LeftParen {
+                self.bump(); // (
+                let mut depth = 1;
+                while !self.at_end() && depth > 0 {
+                    if self.current_kind() == cobol_lexer::TokenKind::LeftParen {
+                        depth += 1;
+                    } else if self.current_kind() == cobol_lexer::TokenKind::RightParen {
+                        depth -= 1;
+                    }
+                    self.bump();
+                }
+            }
         }
 
         // Optional FROM clause

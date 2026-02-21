@@ -251,6 +251,8 @@ PR gate: no regressions (any previously-passing test that now fails blocks merge
 - [x] Dialect support (IBM, MicroFocus, GnuCOBOL extensions — `--dialect` flag threaded through pipeline, dialect-aware COMP sizing)
 - [x] Nested programs (stacked + contained programs in single source file, END PROGRAM support)
 - [x] Dead function elimination (module-level pass removes unreferenced functions)
+- [x] Real-world compatibility: underscore word support (GnuCOBOL extension), multi-token program names, CALL RETURNING, EXEC SQL/CICS passthrough parsing
+- [x] Real-world repo testing: cobol-examples 100% compile (80% clean), Martinfx 82%, cobol-samples 87%
 - [ ] Whole-program optimization (LTO, cross-module inlining)
 - [ ] Differential testing fully green
 - [ ] NIST overall ≥ 99.5%

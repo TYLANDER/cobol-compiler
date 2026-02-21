@@ -5006,6 +5006,14 @@ impl<'a> HirLowerer<'a> {
             i += 1;
         }
 
+        // Skip optional STATIC/DYNAMIC keyword (GnuCOBOL extension)
+        if i < tokens.len()
+            && (tokens[i].1.eq_ignore_ascii_case("STATIC")
+                || tokens[i].1.eq_ignore_ascii_case("DYNAMIC"))
+        {
+            i += 1;
+        }
+
         // Get program name (string literal or identifier)
         if i >= tokens.len() {
             return None;
