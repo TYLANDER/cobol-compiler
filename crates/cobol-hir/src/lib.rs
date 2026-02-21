@@ -516,6 +516,10 @@ pub enum SetAction {
     DownBy(HirExpr),
     /// SET condition-name TO TRUE (move condition value to parent)
     ConditionTrue,
+    /// SET ptr TO ADDRESS OF data-item (store address in pointer)
+    AddressOf(HirDataRef),
+    /// SET ADDRESS OF linkage-item TO ptr (overlay linkage on pointer)
+    SetAddressTo(HirDataRef),
 }
 
 /// Key condition for the START statement.
@@ -1704,7 +1708,7 @@ impl<'a> HirLowerer<'a> {
                 UsageType::Comp1 => 4,
                 UsageType::Comp2 => 8,
                 UsageType::Index => 4,
-                UsageType::Pointer | UsageType::FunctionPointer => 4,
+                UsageType::Pointer | UsageType::FunctionPointer => 8,
                 _ => 0,
             };
             let sd = StorageDescriptor {
@@ -1898,7 +1902,7 @@ impl<'a> HirLowerer<'a> {
     /// - COMP-2: 8 bytes (f64), independent of PIC
     /// - COMP-3 / PACKED-DECIMAL: (digits + 1) / 2 bytes (packed BCD)
     /// - INDEX: 4 bytes
-    /// - POINTER / FUNCTION-POINTER: 4 bytes
+    /// - POINTER / FUNCTION-POINTER: 8 bytes
     fn compute_byte_size(
         usage: UsageType,
         pic: &PictureType,
@@ -1952,7 +1956,7 @@ impl<'a> HirLowerer<'a> {
                 pic.size.div_ceil(2)
             }
             UsageType::Index => 4,
-            UsageType::Pointer | UsageType::FunctionPointer => 4,
+            UsageType::Pointer | UsageType::FunctionPointer => 8,
         }
     }
 
@@ -5854,6 +5858,32 @@ impl<'a> HirLowerer<'a> {
         if idx >= tokens.len() {
             return None;
         }
+
+        // Check for SET ADDRESS OF linkage-item TO ptr
+        if tokens[idx].1.eq_ignore_ascii_case("ADDRESS") {
+            idx += 1; // skip ADDRESS
+            if idx < tokens.len() && tokens[idx].1.eq_ignore_ascii_case("OF") {
+                idx += 1; // skip OF
+            }
+            if idx >= tokens.len() {
+                return None;
+            }
+            let linkage_item = self.make_data_ref(&tokens[idx].1);
+            idx += 1;
+            // skip TO
+            if idx < tokens.len() && tokens[idx].1.eq_ignore_ascii_case("TO") {
+                idx += 1;
+            }
+            if idx >= tokens.len() {
+                return None;
+            }
+            let ptr_ref = self.make_data_ref(&tokens[idx].1);
+            return Some(HirStatement::Set {
+                target: linkage_item,
+                action: SetAction::SetAddressTo(ptr_ref),
+            });
+        }
+
         let target = self.make_data_ref(&tokens[idx].1);
         idx += 1;
 
@@ -5875,6 +5905,23 @@ impl<'a> HirLowerer<'a> {
                         target,
                         action: SetAction::ConditionTrue,
                     })
+                } else if val_upper == "ADDRESS" {
+                    // SET ptr TO ADDRESS OF data-item
+                    idx += 1; // skip ADDRESS
+                    if idx < tokens.len() && tokens[idx].1.eq_ignore_ascii_case("OF") {
+                        idx += 1; // skip OF
+                    }
+                    if idx >= tokens.len() {
+                        return None;
+                    }
+                    let data_ref = self.make_data_ref(&tokens[idx].1);
+                    Some(HirStatement::Set {
+                        target,
+                        action: SetAction::AddressOf(data_ref),
+                    })
+                } else if val_upper == "ENTRY" {
+                    // SET procedure-pointer TO ENTRY "name" — skip for now
+                    None
                 } else {
                     let value = self.token_to_expr(tokens[idx].0, &tokens[idx].1);
                     Some(HirStatement::Set {

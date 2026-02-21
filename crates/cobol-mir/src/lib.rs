@@ -611,6 +611,9 @@ struct MirLowerer<'a> {
     /// Block ID to jump to for EXIT SECTION (the first block after the current
     /// section, or the function epilogue block if at the last section).
     current_section_exit: Option<BlockId>,
+    /// Maps linkage item names to the POINTER global that holds their base address
+    /// (set via SET ADDRESS OF linkage-item TO ptr).
+    pointer_base_map: std::collections::HashMap<String, String>,
 }
 
 impl<'a> MirLowerer<'a> {
@@ -636,6 +639,7 @@ impl<'a> MirLowerer<'a> {
             is_main_program: true,
             current_paragraph_exit: None,
             current_section_exit: None,
+            pointer_base_map: std::collections::HashMap::new(),
         }
     }
 
@@ -805,6 +809,43 @@ impl<'a> MirLowerer<'a> {
             let child = &self.hir.data_items[child_id.into_raw()];
             if child.is_group {
                 self.register_linkage_children(child_id, param_value, group_offset);
+            }
+        }
+    }
+
+    /// Find the byte offset of a linkage item within its parent group.
+    /// Returns 0 if it is the group itself, or the offset relative to the group start.
+    fn find_linkage_group_offset(&self, name: &str) -> u32 {
+        // Find the item in linkage_items
+        for &item_id in &self.hir.linkage_items {
+            let item = &self.hir.data_items[item_id.into_raw()];
+            let item_name = item.name.map(|n| self.interner.resolve(n).to_string());
+            if item_name.as_deref() == Some(name) {
+                // Find its parent group to compute relative offset
+                if let Some(parent_id) = item.parent {
+                    let parent = &self.hir.data_items[parent_id.into_raw()];
+                    return item.offset.saturating_sub(parent.offset);
+                }
+                return 0;
+            }
+        }
+        0
+    }
+
+    /// Recursively register children of a pointer-based linkage group item
+    /// in the pointer_base_map, so that sub-field accesses resolve correctly.
+    fn register_pointer_children(&mut self, child_id: cobol_hir::DataItemId, ptr_name: &str) {
+        let child = &self.hir.data_items[child_id.into_raw()];
+        if let Some(child_name_sym) = child.name {
+            let child_name = self.interner.resolve(child_name_sym).to_string();
+            self.pointer_base_map
+                .insert(child_name, ptr_name.to_string());
+        }
+        let children: Vec<_> = self.hir.data_items[child_id.into_raw()].children.clone();
+        let is_group = self.hir.data_items[child_id.into_raw()].is_group;
+        if is_group {
+            for sub_child_id in children {
+                self.register_pointer_children(sub_child_id, ptr_name);
             }
         }
     }
@@ -3919,6 +3960,46 @@ impl<'a> MirLowerer<'a> {
                         right: off_val,
                     });
                     return Some((addr, info.byte_size));
+                }
+                // Check pointer-based linkage items (SET ADDRESS OF)
+                if let Some(ptr_global_name) = self.pointer_base_map.get(&name) {
+                    // Find the linkage item to get its size and offset
+                    for &item_id in &self.hir.linkage_items {
+                        let item = &self.hir.data_items[item_id.into_raw()];
+                        let item_name = item.name.map(|n| self.interner.resolve(n).to_string());
+                        if item_name.as_deref() == Some(&name) {
+                            let byte_size = item.storage.byte_size;
+                            // Load the pointer value from the POINTER global
+                            let ptr_addr = func.new_value();
+                            instructions.push(MirInst::GlobalAddr {
+                                dest: ptr_addr,
+                                name: ptr_global_name.clone(),
+                            });
+                            let base_ptr = func.new_value();
+                            instructions.push(MirInst::Load {
+                                dest: base_ptr,
+                                addr: ptr_addr,
+                                ty: MirType::I64,
+                            });
+                            // Find the group item this belongs to (for offset calculation)
+                            let group_offset = self.find_linkage_group_offset(&name);
+                            if group_offset > 0 {
+                                let off_val = func.new_value();
+                                instructions.push(MirInst::Const {
+                                    dest: off_val,
+                                    value: MirConst::Int(group_offset as i64),
+                                });
+                                let final_addr = func.new_value();
+                                instructions.push(MirInst::IAdd {
+                                    dest: final_addr,
+                                    left: base_ptr,
+                                    right: off_val,
+                                });
+                                return Some((final_addr, byte_size));
+                            }
+                            return Some((base_ptr, byte_size));
+                        }
+                    }
                 }
                 // Fall through to globals
                 if let Some((gname, size)) = self.resolve_data_ref(dr) {
@@ -8699,13 +8780,74 @@ impl<'a> MirLowerer<'a> {
 
     /// Lower SET statement.
     fn lower_set(
-        &self,
+        &mut self,
         target: &cobol_hir::HirDataRef,
         action: &cobol_hir::SetAction,
         func: &mut MirFunction,
         instructions: &mut Vec<MirInst>,
     ) {
         let target_name = self.interner.resolve(target.name).to_string();
+
+        // Handle SET ptr TO ADDRESS OF data-item
+        if let cobol_hir::SetAction::AddressOf(data_ref) = action {
+            let data_name = self.interner.resolve(data_ref.name).to_string();
+            // Get address of the data item
+            if let Some((gname, _size)) = self.resolve_data_ref(data_ref) {
+                let data_addr = func.new_value();
+                instructions.push(MirInst::GlobalAddr {
+                    dest: data_addr,
+                    name: gname,
+                });
+                // Store address into the POINTER global
+                if self.global_map.contains_key(&target_name) {
+                    let ptr_addr = func.new_value();
+                    instructions.push(MirInst::GlobalAddr {
+                        dest: ptr_addr,
+                        name: target_name.clone(),
+                    });
+                    instructions.push(MirInst::Store {
+                        addr: ptr_addr,
+                        value: data_addr,
+                    });
+                }
+            } else if let Some(info) = self.linkage_map.get(&data_name) {
+                // ADDRESS OF a linkage item — use its base pointer
+                let base = info.param_value;
+                if self.global_map.contains_key(&target_name) {
+                    let ptr_addr = func.new_value();
+                    instructions.push(MirInst::GlobalAddr {
+                        dest: ptr_addr,
+                        name: target_name.clone(),
+                    });
+                    instructions.push(MirInst::Store {
+                        addr: ptr_addr,
+                        value: base,
+                    });
+                }
+            }
+            return;
+        }
+
+        // Handle SET ADDRESS OF linkage-item TO ptr
+        if let cobol_hir::SetAction::SetAddressTo(ptr_ref) = action {
+            let ptr_name = self.interner.resolve(ptr_ref.name).to_string();
+            // Register that target_name (a linkage item) gets its base from ptr_name
+            self.pointer_base_map
+                .insert(target_name.clone(), ptr_name.clone());
+            // Also register sub-fields of the linkage group item
+            for &item_id in &self.hir.linkage_items {
+                let item = &self.hir.data_items[item_id.into_raw()];
+                let item_name = item.name.map(|n| self.interner.resolve(n).to_string());
+                if item_name.as_deref() == Some(&target_name) && item.is_group {
+                    let children: Vec<_> = item.children.clone();
+                    for child_id in children {
+                        self.register_pointer_children(child_id, &ptr_name);
+                    }
+                    break;
+                }
+            }
+            return;
+        }
 
         // Handle SET condition-name TO TRUE
         if matches!(action, cobol_hir::SetAction::ConditionTrue) {
@@ -8893,7 +9035,9 @@ impl<'a> MirLowerer<'a> {
                         value: result,
                     });
                 }
-                cobol_hir::SetAction::ConditionTrue => unreachable!(),
+                cobol_hir::SetAction::ConditionTrue
+                | cobol_hir::SetAction::AddressOf(_)
+                | cobol_hir::SetAction::SetAddressTo(_) => unreachable!(),
             }
         } else {
             let target_size = if let Some(&idx) = self.global_map.get(&target_name) {
@@ -8961,6 +9105,9 @@ impl<'a> MirLowerer<'a> {
                     });
                 }
                 cobol_hir::SetAction::ConditionTrue => unreachable!(),
+                cobol_hir::SetAction::AddressOf(_) | cobol_hir::SetAction::SetAddressTo(_) => {
+                    // Handled above — should not reach here
+                }
             }
         }
     }
