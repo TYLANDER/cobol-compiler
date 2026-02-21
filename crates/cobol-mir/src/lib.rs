@@ -927,7 +927,7 @@ impl<'a> MirLowerer<'a> {
             let name = item
                 .name
                 .map(|n| self.interner.resolve(n).to_string())
-                .unwrap_or_else(|| format!("FILLER_{}", offset));
+                .unwrap_or_else(|| format!("FILLER_{}_{}", offset, idx));
 
             // Skip 88-level items as globals (they are condition names, not storage)
             if item.level == 88 {
@@ -5653,15 +5653,82 @@ impl<'a> MirLowerer<'a> {
                     .data_item_pic_info(&tgt_name)
                     .map(|(_, _, _, is_signed)| is_signed)
                     .unwrap_or(false);
+                let tgt_fast = self.is_int_fast_eligible(&tgt_name);
 
-                for &(op_addr, op_size) in &operand_addrs {
+                for (i, op) in operands.iter().enumerate() {
+                    let (op_addr, op_size) = operand_addrs[i];
+
+                    // Fast path: SUBTRACT literal FROM integer-display-field
+                    if tgt_fast {
+                        if let Some(int_val) = Self::expr_literal_int(op) {
+                            let val = func.new_value();
+                            instructions.push(MirInst::Const {
+                                dest: val,
+                                value: MirConst::Int(int_val),
+                            });
+                            let te =
+                                cobol_hir::HirExpr::DataRef(Box::new(target_ref.clone()));
+                            let (tgt_addr, _) =
+                                match self.emit_expr_addr(&te, func, instructions) {
+                                    Some(v) => v,
+                                    None => continue,
+                                };
+                            let tgt_len = func.new_value();
+                            instructions.push(MirInst::Const {
+                                dest: tgt_len,
+                                value: MirConst::Int(target_size as i64),
+                            });
+                            instructions.push(MirInst::CallRuntime {
+                                dest: None,
+                                func: "cobolrt_sub_int_fast".to_string(),
+                                args: vec![val, tgt_addr, tgt_len],
+                            });
+                            continue;
+                        }
+
+                        if let cobol_hir::HirExpr::DataRef(ref op_ref) = op {
+                            let op_name = self.interner.resolve(op_ref.name).to_string();
+                            if self.is_int_fast_eligible(&op_name) {
+                                let op_len = func.new_value();
+                                instructions.push(MirInst::Const {
+                                    dest: op_len,
+                                    value: MirConst::Int(op_size as i64),
+                                });
+                                let op_int = func.new_value();
+                                instructions.push(MirInst::CallRuntime {
+                                    dest: Some(op_int),
+                                    func: "cobolrt_display_to_int".to_string(),
+                                    args: vec![op_addr, op_len],
+                                });
+                                let te =
+                                    cobol_hir::HirExpr::DataRef(Box::new(target_ref.clone()));
+                                let (tgt_addr, _) =
+                                    match self.emit_expr_addr(&te, func, instructions) {
+                                        Some(v) => v,
+                                        None => continue,
+                                    };
+                                let tgt_len = func.new_value();
+                                instructions.push(MirInst::Const {
+                                    dest: tgt_len,
+                                    value: MirConst::Int(target_size as i64),
+                                });
+                                instructions.push(MirInst::CallRuntime {
+                                    dest: None,
+                                    func: "cobolrt_sub_int_fast".to_string(),
+                                    args: vec![op_int, tgt_addr, tgt_len],
+                                });
+                                continue;
+                            }
+                        }
+                    }
+
+                    // Generic path
                     let op_len = func.new_value();
                     instructions.push(MirInst::Const {
                         dest: op_len,
                         value: MirConst::Int(op_size as i64),
                     });
 
-                    // target is both src1 and dest: target = target - operand
                     let te1 = cobol_hir::HirExpr::DataRef(Box::new(target_ref.clone()));
                     let (t_addr1, _) = self.emit_expr_addr(&te1, func, instructions).unwrap();
                     let t_len1 = func.new_value();
@@ -6974,6 +7041,30 @@ impl<'a> MirLowerer<'a> {
     }
 
     /// Lower ADD op1 [op2...] TO target (accumulate form)
+    /// Check if a data item is eligible for the native integer fast path:
+    /// - Numeric PIC 9(n) with no decimal places (scale == 0)
+    /// - DISPLAY encoding (not COMP/COMP-3)
+    /// - Not signed (no S in PIC)
+    fn is_int_fast_eligible(&self, name: &str) -> bool {
+        let pic_info = self.data_item_pic_info(name);
+        let enc_info = self.data_item_encoding_type(name);
+        match (pic_info, enc_info) {
+            (Some((true, scale, _, false)), (0, _)) => scale == 0,
+            _ => false,
+        }
+    }
+
+    /// Try to extract a literal integer value from a HirExpr.
+    fn expr_literal_int(expr: &cobol_hir::HirExpr) -> Option<i64> {
+        match expr {
+            cobol_hir::HirExpr::Literal(cobol_hir::LiteralValue::Integer(n)) => Some(*n),
+            cobol_hir::HirExpr::Literal(cobol_hir::LiteralValue::Figurative(
+                cobol_hir::FigurativeConstant::Zero,
+            )) => Some(0),
+            _ => None,
+        }
+    }
+
     fn lower_add_to(
         &self,
         operands: &[cobol_hir::HirExpr],
@@ -6990,14 +7081,84 @@ impl<'a> MirLowerer<'a> {
                     None => continue,
                 };
 
-            // Look up whether the target field is signed
+            // Look up whether the target field is signed and eligible for fast path
             let tgt_name = self.interner.resolve(target_ref.name).to_string();
             let tgt_is_signed = self
                 .data_item_pic_info(&tgt_name)
                 .map(|(_, _, _, is_signed)| is_signed)
                 .unwrap_or(false);
+            let tgt_fast = self.is_int_fast_eligible(&tgt_name);
 
             for op in operands {
+                // Fast path: ADD literal TO integer-display-field
+                if tgt_fast {
+                    if let Some(int_val) = Self::expr_literal_int(op) {
+                        let val = func.new_value();
+                        instructions.push(MirInst::Const {
+                            dest: val,
+                            value: MirConst::Int(int_val),
+                        });
+                        let te = cobol_hir::HirExpr::DataRef(Box::new(target_ref.clone()));
+                        let (tgt_addr, _) = match self.emit_expr_addr(&te, func, instructions) {
+                            Some(v) => v,
+                            None => continue,
+                        };
+                        let tgt_len = func.new_value();
+                        instructions.push(MirInst::Const {
+                            dest: tgt_len,
+                            value: MirConst::Int(target_size as i64),
+                        });
+                        instructions.push(MirInst::CallRuntime {
+                            dest: None,
+                            func: "cobolrt_add_int_fast".to_string(),
+                            args: vec![val, tgt_addr, tgt_len],
+                        });
+                        continue;
+                    }
+
+                    // Fast path: ADD integer-display-field TO integer-display-field
+                    if let cobol_hir::HirExpr::DataRef(ref op_ref) = op {
+                        let op_name = self.interner.resolve(op_ref.name).to_string();
+                        if self.is_int_fast_eligible(&op_name) {
+                            // Convert operand to int, then add to target
+                            if let Some((op_addr, op_size)) =
+                                self.emit_expr_addr(op, func, instructions)
+                            {
+                                let op_len = func.new_value();
+                                instructions.push(MirInst::Const {
+                                    dest: op_len,
+                                    value: MirConst::Int(op_size as i64),
+                                });
+                                let op_int = func.new_value();
+                                instructions.push(MirInst::CallRuntime {
+                                    dest: Some(op_int),
+                                    func: "cobolrt_display_to_int".to_string(),
+                                    args: vec![op_addr, op_len],
+                                });
+                                let te =
+                                    cobol_hir::HirExpr::DataRef(Box::new(target_ref.clone()));
+                                let (tgt_addr, _) =
+                                    match self.emit_expr_addr(&te, func, instructions) {
+                                        Some(v) => v,
+                                        None => continue,
+                                    };
+                                let tgt_len = func.new_value();
+                                instructions.push(MirInst::Const {
+                                    dest: tgt_len,
+                                    value: MirConst::Int(target_size as i64),
+                                });
+                                instructions.push(MirInst::CallRuntime {
+                                    dest: None,
+                                    func: "cobolrt_add_int_fast".to_string(),
+                                    args: vec![op_int, tgt_addr, tgt_len],
+                                });
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+                // Generic path: cobolrt_add_numeric
                 if let Some((op_addr, op_size)) = self.emit_expr_addr(op, func, instructions) {
                     let op_len = func.new_value();
                     instructions.push(MirInst::Const {
@@ -7005,9 +7166,6 @@ impl<'a> MirLowerer<'a> {
                         value: MirConst::Int(op_size as i64),
                     });
 
-                    // For ADD ... TO target, target is both a source operand and the destination.
-                    // We need two separate address computations since the runtime reads src and writes dest.
-                    // Re-emit target addr for each use since runtime may read then write.
                     let target_expr2 = cobol_hir::HirExpr::DataRef(Box::new(target_ref.clone()));
                     let (target_addr1, _) =
                         match self.emit_expr_addr(&target_expr2, func, instructions) {
@@ -7973,6 +8131,75 @@ impl<'a> MirLowerer<'a> {
                                 left: logical_val,
                                 right: rhs_val,
                             },
+                        };
+                        instructions.push(cmp_inst);
+                        return bool_result;
+                    }
+
+                    // Fast path: if both sides are integer-display eligible,
+                    // convert to native int and compare directly (no runtime call).
+                    let l_fast_name = match left {
+                        cobol_hir::HirExpr::DataRef(dr) => {
+                            let n = self.interner.resolve(dr.name).to_string();
+                            if self.is_int_fast_eligible(&n) { Some(n) } else { None }
+                        }
+                        _ => None,
+                    };
+                    let r_fast_name = match right {
+                        cobol_hir::HirExpr::DataRef(dr) => {
+                            let n = self.interner.resolve(dr.name).to_string();
+                            if self.is_int_fast_eligible(&n) { Some(n) } else { None }
+                        }
+                        _ => None,
+                    };
+                    // Also allow literal integer on the right side
+                    let r_literal = Self::expr_literal_int(right);
+                    if l_fast_name.is_some() && (r_fast_name.is_some() || r_literal.is_some()) {
+                        // Convert left to int
+                        let (l_addr, l_size) = self.emit_expr_addr(left, func, instructions).unwrap();
+                        let l_len = func.new_value();
+                        instructions.push(MirInst::Const {
+                            dest: l_len,
+                            value: MirConst::Int(l_size as i64),
+                        });
+                        let l_int = func.new_value();
+                        instructions.push(MirInst::CallRuntime {
+                            dest: Some(l_int),
+                            func: "cobolrt_display_to_int".to_string(),
+                            args: vec![l_addr, l_len],
+                        });
+                        // Right side: literal or display field
+                        let r_int = if let Some(rval) = r_literal {
+                            let v = func.new_value();
+                            instructions.push(MirInst::Const {
+                                dest: v,
+                                value: MirConst::Int(rval),
+                            });
+                            v
+                        } else {
+                            let (r_addr, r_size) = self.emit_expr_addr(right, func, instructions).unwrap();
+                            let r_len = func.new_value();
+                            instructions.push(MirInst::Const {
+                                dest: r_len,
+                                value: MirConst::Int(r_size as i64),
+                            });
+                            let rv = func.new_value();
+                            instructions.push(MirInst::CallRuntime {
+                                dest: Some(rv),
+                                func: "cobolrt_display_to_int".to_string(),
+                                args: vec![r_addr, r_len],
+                            });
+                            rv
+                        };
+                        let bool_result = func.new_value();
+                        let cmp_inst = match op {
+                            cobol_hir::BinaryOp::Eq => MirInst::ICmpEq { dest: bool_result, left: l_int, right: r_int },
+                            cobol_hir::BinaryOp::Ne => MirInst::ICmpNe { dest: bool_result, left: l_int, right: r_int },
+                            cobol_hir::BinaryOp::Lt => MirInst::ICmpLt { dest: bool_result, left: l_int, right: r_int },
+                            cobol_hir::BinaryOp::Gt => MirInst::ICmpGt { dest: bool_result, left: l_int, right: r_int },
+                            cobol_hir::BinaryOp::Le => MirInst::ICmpLe { dest: bool_result, left: l_int, right: r_int },
+                            cobol_hir::BinaryOp::Ge => MirInst::ICmpGe { dest: bool_result, left: l_int, right: r_int },
+                            _ => MirInst::ICmpEq { dest: bool_result, left: l_int, right: r_int },
                         };
                         instructions.push(cmp_inst);
                         return bool_result;
@@ -9627,33 +9854,10 @@ impl<'a> MirLowerer<'a> {
             }
         };
 
-        // Store counter into a temporary global-like location.
-        // We use a runtime approach: allocate a scratch area via a named
-        // temp string that holds the integer counter.  However, since MIR
-        // uses SSA and we need a mutable counter, we use a simple approach:
-        // store the initial count in a dedicated temp variable, and use
-        // runtime calls to decrement and check.
-        //
-        // Simpler approach for SSA: use a counter variable stored as a
-        // global scratch buffer.  We emit runtime calls:
-        //   cobolrt_init_counter(counter_val) -> counter_id
-        //   cobolrt_counter_gt_zero(counter_id) -> bool
-        //   cobolrt_decrement_counter(counter_id)
-        //
-        // But since the runtime may not have these, we use the MIR integer
-        // ops directly.  The challenge is SSA: we cannot re-assign a Value.
-        // We work around this by using a scratch global variable.
-        //
-        // Alternative approach matching the VARYING pattern: use a display
-        // format counter stored in a temporary buffer via CallRuntime.
-        //
-        // Simplest working approach: allocate a temporary 8-byte buffer,
-        // store the count, and use runtime for decrement/compare.
-
-        // We'll use a named temporary for the counter — declare it as a global
+        // Use a native i64 global to store the loop counter.
+        // This avoids display-format roundtrips (int_to_display/display_to_int).
         let counter_name = format!("_PERFORM_COUNTER_{}", func.next_value);
 
-        // Register the counter as a global data item (8 bytes, zero-initialized)
         if !self.global_map.contains_key(&counter_name) {
             let offset = self
                 .module
@@ -9666,7 +9870,7 @@ impl<'a> MirLowerer<'a> {
                 .insert(counter_name.clone(), self.module.globals.len());
             self.module.globals.push(MirGlobal {
                 name: counter_name.clone(),
-                ty: MirType::Bytes(8),
+                ty: MirType::I64,
                 initial_value: None,
                 offset,
                 redefines: None,
@@ -9674,16 +9878,15 @@ impl<'a> MirLowerer<'a> {
             });
         }
 
+        // Store initial count as native i64
         let counter_addr = func.new_value();
         instructions.push(MirInst::GlobalAddr {
             dest: counter_addr,
             name: counter_name.clone(),
         });
-        // Store initial count
-        instructions.push(MirInst::CallRuntime {
-            dest: None,
-            func: "cobolrt_int_to_display".to_string(),
-            args: vec![counter_val, counter_addr],
+        instructions.push(MirInst::Store {
+            addr: counter_addr,
+            value: counter_val,
         });
 
         // Finalize current block -> goto cond
@@ -9702,16 +9905,11 @@ impl<'a> MirLowerer<'a> {
             dest: cond_counter_addr,
             name: counter_name.clone(),
         });
-        let counter_size = func.new_value();
-        cond_insts.push(MirInst::Const {
-            dest: counter_size,
-            value: MirConst::Int(8),
-        });
         let current_count = func.new_value();
-        cond_insts.push(MirInst::CallRuntime {
-            dest: Some(current_count),
-            func: "cobolrt_display_to_int".to_string(),
-            args: vec![cond_counter_addr, counter_size],
+        cond_insts.push(MirInst::Load {
+            dest: current_count,
+            addr: cond_counter_addr,
+            ty: MirType::I64,
         });
         let zero = func.new_value();
         cond_insts.push(MirInst::Const {
@@ -9769,22 +9967,17 @@ impl<'a> MirLowerer<'a> {
             }
         }
 
-        // Decrement counter
+        // Decrement counter: load i64, subtract 1, store back
         let dec_counter_addr = func.new_value();
         body_insts.push(MirInst::GlobalAddr {
             dest: dec_counter_addr,
             name: counter_name.clone(),
         });
-        let dec_size = func.new_value();
-        body_insts.push(MirInst::Const {
-            dest: dec_size,
-            value: MirConst::Int(8),
-        });
         let dec_current = func.new_value();
-        body_insts.push(MirInst::CallRuntime {
-            dest: Some(dec_current),
-            func: "cobolrt_display_to_int".to_string(),
-            args: vec![dec_counter_addr, dec_size],
+        body_insts.push(MirInst::Load {
+            dest: dec_current,
+            addr: dec_counter_addr,
+            ty: MirType::I64,
         });
         let one = func.new_value();
         body_insts.push(MirInst::Const {
@@ -9802,10 +9995,9 @@ impl<'a> MirLowerer<'a> {
             dest: store_addr,
             name: counter_name,
         });
-        body_insts.push(MirInst::CallRuntime {
-            dest: None,
-            func: "cobolrt_int_to_display".to_string(),
-            args: vec![new_count, store_addr],
+        body_insts.push(MirInst::Store {
+            addr: store_addr,
+            value: new_count,
         });
 
         func.blocks.push(BasicBlock {
@@ -9865,7 +10057,7 @@ impl<'a> MirLowerer<'a> {
                 .insert(counter_name.clone(), self.module.globals.len());
             self.module.globals.push(MirGlobal {
                 name: counter_name.clone(),
-                ty: MirType::Bytes(8),
+                ty: MirType::I64,
                 initial_value: None,
                 offset,
                 redefines: None,
@@ -9873,15 +10065,15 @@ impl<'a> MirLowerer<'a> {
             });
         }
 
+        // Store initial count as native i64
         let counter_addr = func.new_value();
         instructions.push(MirInst::GlobalAddr {
             dest: counter_addr,
             name: counter_name.clone(),
         });
-        instructions.push(MirInst::CallRuntime {
-            dest: None,
-            func: "cobolrt_int_to_display".to_string(),
-            args: vec![counter_val, counter_addr],
+        instructions.push(MirInst::Store {
+            addr: counter_addr,
+            value: counter_val,
         });
 
         let current_insts = std::mem::take(instructions);
@@ -9892,23 +10084,18 @@ impl<'a> MirLowerer<'a> {
             terminator: Terminator::Goto(cond_block_id),
         });
 
-        // Condition block
+        // Condition block: load i64 counter, compare > 0
         let mut cond_insts = Vec::new();
         let cond_counter_addr = func.new_value();
         cond_insts.push(MirInst::GlobalAddr {
             dest: cond_counter_addr,
             name: counter_name.clone(),
         });
-        let counter_size = func.new_value();
-        cond_insts.push(MirInst::Const {
-            dest: counter_size,
-            value: MirConst::Int(8),
-        });
         let current_count = func.new_value();
-        cond_insts.push(MirInst::CallRuntime {
-            dest: Some(current_count),
-            func: "cobolrt_display_to_int".to_string(),
-            args: vec![cond_counter_addr, counter_size],
+        cond_insts.push(MirInst::Load {
+            dest: current_count,
+            addr: cond_counter_addr,
+            ty: MirType::I64,
         });
         let zero = func.new_value();
         cond_insts.push(MirInst::Const {
@@ -9939,22 +10126,17 @@ impl<'a> MirLowerer<'a> {
             self.lower_statement_to_blocks(stmt, func, &mut body_bid, &mut body_insts);
         }
 
-        // Decrement counter
+        // Decrement counter: load i64, subtract 1, store back
         let dec_counter_addr = func.new_value();
         body_insts.push(MirInst::GlobalAddr {
             dest: dec_counter_addr,
             name: counter_name.clone(),
         });
-        let dec_size = func.new_value();
-        body_insts.push(MirInst::Const {
-            dest: dec_size,
-            value: MirConst::Int(8),
-        });
         let dec_current = func.new_value();
-        body_insts.push(MirInst::CallRuntime {
-            dest: Some(dec_current),
-            func: "cobolrt_display_to_int".to_string(),
-            args: vec![dec_counter_addr, dec_size],
+        body_insts.push(MirInst::Load {
+            dest: dec_current,
+            addr: dec_counter_addr,
+            ty: MirType::I64,
         });
         let one = func.new_value();
         body_insts.push(MirInst::Const {
@@ -9972,10 +10154,9 @@ impl<'a> MirLowerer<'a> {
             dest: store_addr,
             name: counter_name,
         });
-        body_insts.push(MirInst::CallRuntime {
-            dest: None,
-            func: "cobolrt_int_to_display".to_string(),
-            args: vec![new_count, store_addr],
+        body_insts.push(MirInst::Store {
+            addr: store_addr,
+            value: new_count,
         });
 
         func.blocks.push(BasicBlock {
@@ -10266,6 +10447,29 @@ impl<'a> MirLowerer<'a> {
                 return;
             }
 
+            // Fast path: integer-display variable with literal BY
+            if self.is_int_fast_eligible(var_name) {
+                let val = func.new_value();
+                instructions.push(MirInst::Const {
+                    dest: val,
+                    value: MirConst::Int(*by_val),
+                });
+                let var_addr = func.new_value();
+                instructions.push(MirInst::GlobalAddr {
+                    dest: var_addr,
+                    name: var_name.to_string(),
+                });
+                let var_len = func.new_value();
+                instructions.push(MirInst::Const {
+                    dest: var_len,
+                    value: MirConst::Int(var_size as i64),
+                });
+                instructions.push(MirInst::CallRuntime {
+                    dest: None,
+                    func: "cobolrt_add_int_fast".to_string(),
+                    args: vec![val, var_addr, var_len],
+                });
+            } else {
             let by_str = if *by_val < 0 {
                 // Format negative: "-" followed by zero-padded absolute value
                 let abs_str = format!(
@@ -10323,6 +10527,7 @@ impl<'a> MirLowerer<'a> {
                 func: "cobolrt_add_numeric".to_string(),
                 args: vec![by_addr, by_len, var_addr, var_len, var_addr2, var_len2, sf],
             });
+            }
         }
     }
 

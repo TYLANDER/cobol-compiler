@@ -637,6 +637,102 @@ pub unsafe extern "C" fn cobolrt_string_append(
     int_to_display(new_pos, ptr_slice);
 }
 
+// ---------------------------------------------------------------------------
+// Fast-path integer arithmetic on display-format fields
+//
+// These bypass the generic parse → compute → write-back cycle by working
+// directly with i64 values. Used when the MIR lowerer knows both operands
+// are integer-PIC items (no decimal places).
+// ---------------------------------------------------------------------------
+
+/// Add `addend` (an i64 value) to a display-format field in-place.
+///
+/// Equivalent to: dest = display_to_int(dest) + addend, then write back.
+/// Much faster than `cobolrt_add_numeric` because it avoids parsing a
+/// second display-format operand.
+///
+/// # Safety
+///
+/// - `dest` must point to at least `dest_len` writable bytes, or be null.
+#[no_mangle]
+pub unsafe extern "C" fn cobolrt_add_int_fast(addend: i64, dest: *mut u8, dest_len: u32) {
+    if dest.is_null() {
+        return;
+    }
+    let d_slice = std::slice::from_raw_parts_mut(dest, dest_len as usize);
+
+    // Fast integer parse — no sign/decimal handling for unsigned PIC 9(n).
+    let mut cur_val: i64 = 0;
+    for &b in d_slice.iter() {
+        if b >= b'0' && b <= b'9' {
+            cur_val = cur_val.wrapping_mul(10).wrapping_add((b - b'0') as i64);
+        }
+    }
+
+    let result = cur_val.wrapping_add(addend);
+    int_to_display(result, d_slice);
+}
+
+/// Subtract `subtrahend` (an i64 value) from a display-format field in-place.
+///
+/// # Safety
+///
+/// - `dest` must point to at least `dest_len` writable bytes, or be null.
+#[no_mangle]
+pub unsafe extern "C" fn cobolrt_sub_int_fast(subtrahend: i64, dest: *mut u8, dest_len: u32) {
+    if dest.is_null() {
+        return;
+    }
+    let d_slice = std::slice::from_raw_parts_mut(dest, dest_len as usize);
+
+    let mut cur_val: i64 = 0;
+    for &b in d_slice.iter() {
+        if b >= b'0' && b <= b'9' {
+            cur_val = cur_val.wrapping_mul(10).wrapping_add((b - b'0') as i64);
+        }
+    }
+
+    let result = cur_val.wrapping_sub(subtrahend);
+    int_to_display(result, d_slice);
+}
+
+/// Multiply a display-format field in-place by `factor` (an i64 value).
+///
+/// # Safety
+///
+/// - `dest` must point to at least `dest_len` writable bytes, or be null.
+#[no_mangle]
+pub unsafe extern "C" fn cobolrt_mul_int_fast(factor: i64, dest: *mut u8, dest_len: u32) {
+    if dest.is_null() {
+        return;
+    }
+    let d_slice = std::slice::from_raw_parts_mut(dest, dest_len as usize);
+
+    let mut cur_val: i64 = 0;
+    for &b in d_slice.iter() {
+        if b >= b'0' && b <= b'9' {
+            cur_val = cur_val.wrapping_mul(10).wrapping_add((b - b'0') as i64);
+        }
+    }
+
+    let result = cur_val.wrapping_mul(factor);
+    int_to_display(result, d_slice);
+}
+
+/// Convert an i64 value into a display-format buffer and write it.
+///
+/// # Safety
+///
+/// - `dest` must point to at least `dest_len` writable bytes, or be null.
+#[no_mangle]
+pub unsafe extern "C" fn cobolrt_int_to_display(value: i64, dest: *mut u8, dest_len: u32) {
+    if dest.is_null() {
+        return;
+    }
+    let d_slice = std::slice::from_raw_parts_mut(dest, dest_len as usize);
+    int_to_display(value, d_slice);
+}
+
 /// Write an integer value into a display-format buffer (right-justified,
 /// zero-padded).
 fn int_to_display(value: i64, dest: &mut [u8]) {

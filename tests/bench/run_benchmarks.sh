@@ -8,7 +8,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-COBOLC="${1:-$(dirname "$SCRIPT_DIR")/../../target/release/cobolc}"
+COBOLC="${1:-$SCRIPT_DIR/../../target/release/cobolc}"
 GNUCOBC="${2:-cobc}"
 TMPDIR=$(mktemp -d)
 trap "rm -rf $TMPDIR" EXIT

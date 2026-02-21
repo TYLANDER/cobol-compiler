@@ -1758,12 +1758,42 @@ char* cobolrt_decimal_pow(const char *base, unsigned int base_len,
 }
 
 /* Convert integer to display-format in a buffer */
-void cobolrt_int_to_display(long long val, char *dest) {
-    /* Write 8-byte zero-padded display */
+void cobolrt_int_to_display(long long val, char *dest, unsigned int dest_len) {
     if (val < 0) val = -val;
-    for (int i = 7; i >= 0; i--) {
+    for (int i = (int)dest_len - 1; i >= 0; i--) {
         dest[i] = '0' + (val % 10);
         val /= 10;
+    }
+}
+
+/* Fast-path integer arithmetic for PIC 9(n) DISPLAY fields */
+void cobolrt_add_int_fast(long long addend, char *dest, unsigned int dest_len) {
+    long long cur = display_to_int(dest, dest_len);
+    long long result = cur + addend;
+    if (result < 0) result = -result;
+    for (int i = (int)dest_len - 1; i >= 0; i--) {
+        dest[i] = '0' + (result % 10);
+        result /= 10;
+    }
+}
+
+void cobolrt_sub_int_fast(long long subtrahend, char *dest, unsigned int dest_len) {
+    long long cur = display_to_int(dest, dest_len);
+    long long result = cur - subtrahend;
+    if (result < 0) result = -result;
+    for (int i = (int)dest_len - 1; i >= 0; i--) {
+        dest[i] = '0' + (result % 10);
+        result /= 10;
+    }
+}
+
+void cobolrt_mul_int_fast(long long factor, char *dest, unsigned int dest_len) {
+    long long cur = display_to_int(dest, dest_len);
+    long long result = cur * factor;
+    if (result < 0) result = -result;
+    for (int i = (int)dest_len - 1; i >= 0; i--) {
+        dest[i] = '0' + (result % 10);
+        result /= 10;
     }
 }
 

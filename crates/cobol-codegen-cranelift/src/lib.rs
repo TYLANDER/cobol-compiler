@@ -210,8 +210,13 @@ impl CraneliftCodegen {
                     if let Some((ref parent_name, byte_offset)) = g.parent_offset {
                         let mut total_offset = byte_offset;
                         let mut current = parent_name.clone();
+                        let mut depth = 0u32;
                         while let Some((grandparent, gp_offset)) = raw_parent_offsets.get(&current)
                         {
+                            depth += 1;
+                            if depth > 100 || *grandparent == current {
+                                break;
+                            }
                             total_offset += gp_offset;
                             current = grandparent.clone();
                         }
@@ -229,7 +234,12 @@ impl CraneliftCodegen {
                     // Walk the parent chain to accumulate the total offset from the root.
                     let mut total_offset = byte_offset;
                     let mut current = parent_name.clone();
+                    let mut depth = 0u32;
                     while let Some((grandparent, gp_offset)) = raw_parent_offsets.get(&current) {
+                        depth += 1;
+                        if depth > 100 || *grandparent == current {
+                            break;
+                        }
                         total_offset += gp_offset;
                         current = grandparent.clone();
                     }
@@ -414,6 +424,18 @@ impl CraneliftCodegen {
                 sig.params.push(AbiParam::new(ptr)); // dest
                 sig.params.push(AbiParam::new(types::I32)); // dest_len
                 sig.params.push(AbiParam::new(types::I32)); // dest_is_signed
+            }
+            "cobolrt_add_int_fast"
+            | "cobolrt_sub_int_fast"
+            | "cobolrt_mul_int_fast" => {
+                sig.params.push(AbiParam::new(types::I64)); // operand (i64)
+                sig.params.push(AbiParam::new(ptr)); // dest ptr
+                sig.params.push(AbiParam::new(types::I32)); // dest_len
+            }
+            "cobolrt_int_to_display" => {
+                sig.params.push(AbiParam::new(types::I64)); // value (i64)
+                sig.params.push(AbiParam::new(ptr)); // dest ptr
+                sig.params.push(AbiParam::new(types::I32)); // dest_len
             }
             "cobolrt_add_numeric_enc"
             | "cobolrt_subtract_numeric_enc"
@@ -623,10 +645,6 @@ impl CraneliftCodegen {
                 sig.params.push(AbiParam::new(ptr)); // data ptr
                 sig.params.push(AbiParam::new(types::I32)); // len
                 sig.returns.push(AbiParam::new(types::I64)); // integer value
-            }
-            "cobolrt_int_to_display" => {
-                sig.params.push(AbiParam::new(types::I64)); // value
-                sig.params.push(AbiParam::new(ptr)); // dest ptr
             }
             "cobolrt_format_numeric_edited" => {
                 sig.params.push(AbiParam::new(ptr)); // data ptr
