@@ -5050,7 +5050,8 @@ impl<'a> HirLowerer<'a> {
                 }
                 "RETURNING" | "GIVING" => {
                     i += 1; // skip RETURNING/GIVING
-                    if i < tokens.len() {
+                            // RETURNING OMITTED means no return value
+                    if i < tokens.len() && !tokens[i].1.eq_ignore_ascii_case("OMITTED") {
                         let (dr, _next) = self.parse_data_ref_at(&tokens, i);
                         returning_target = Some(dr);
                     }
@@ -5058,7 +5059,26 @@ impl<'a> HirLowerer<'a> {
                 }
                 "END-CALL" => break,
                 "ON" | "NOT" => break, // handled below
+                "OMITTED" => {
+                    // OMITTED argument placeholder — skip
+                    i += 1;
+                    continue;
+                }
                 _ => {
+                    // Handle negative literals: "-" followed by a number
+                    if tokens[i].1 == "-"
+                        && i + 1 < tokens.len()
+                        && tokens[i + 1].0 == SyntaxKind::INTEGER_LITERAL
+                    {
+                        if let Ok(n) = tokens[i + 1].1.parse::<i64>() {
+                            using_args.push(CallArg {
+                                mode,
+                                value: HirExpr::Literal(LiteralValue::Integer(-n)),
+                            });
+                            i += 2;
+                            continue;
+                        }
+                    }
                     let expr = self.token_to_expr(tokens[i].0, &tokens[i].1);
                     using_args.push(CallArg { mode, value: expr });
                     i += 1;

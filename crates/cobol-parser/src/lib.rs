@@ -3897,7 +3897,7 @@ impl<'t> Parser<'t> {
             && (self.at_identifier() || self.current_is_word_like())
         {
             self.bump(); // identifier name
-            // Consume optional subscript/reference modification: (...)
+                         // Consume optional subscript/reference modification: (...)
             self.skip_ws();
             if !self.at_end() && self.current_kind() == cobol_lexer::TokenKind::LeftParen {
                 self.bump(); // (

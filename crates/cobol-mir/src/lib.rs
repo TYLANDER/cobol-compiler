@@ -559,8 +559,10 @@ pub fn lower_with_options(
 
 /// Info about a LINKAGE SECTION item that is a function parameter.
 struct LinkageInfo {
-    /// MIR Value representing the pointer parameter.
+    /// MIR Value representing the pointer parameter (base of the group).
     param_value: Value,
+    /// Byte offset of this sub-field within the group (0 for top-level).
+    offset: u32,
     /// Byte size of the data item.
     byte_size: u32,
     /// Decimal scale.
@@ -724,18 +726,21 @@ impl<'a> MirLowerer<'a> {
 
     /// For subprograms (PROCEDURE DIVISION USING ...), build a mapping from
     /// linkage item names to their function parameter Value IDs.
+    /// Also registers sub-fields of group linkage items with their byte offsets.
     fn prepare_linkage(&mut self) {
         if self.hir.using_params.is_empty() {
             return;
         }
         for (i, &param_name) in self.hir.using_params.iter().enumerate() {
             let param_str = self.interner.resolve(param_name).to_string();
+            let param_value = Value::from_raw(i as u32);
             // Find the linkage item with this name
             for &item_id in &self.hir.linkage_items {
                 let item = &self.hir.data_items[item_id.into_raw()];
                 let item_name = item.name.map(|n| self.interner.resolve(n).to_string());
                 if item_name.as_deref() == Some(&param_str) {
                     let byte_size = item.storage.byte_size;
+                    let group_offset = item.offset;
                     let scale = item.storage.picture.as_ref().map(|p| p.scale).unwrap_or(0);
                     let dot_pos = item
                         .storage
@@ -746,14 +751,60 @@ impl<'a> MirLowerer<'a> {
                     self.linkage_map.insert(
                         param_str.clone(),
                         LinkageInfo {
-                            param_value: Value::from_raw(i as u32),
+                            param_value,
+                            offset: 0,
                             byte_size,
                             scale,
                             dot_pos,
                         },
                     );
+                    // Register sub-fields of group items
+                    if item.is_group {
+                        self.register_linkage_children(item_id, param_value, group_offset);
+                    }
                     break;
                 }
+            }
+        }
+    }
+
+    /// Recursively register children of a linkage group item in the linkage_map.
+    fn register_linkage_children(
+        &mut self,
+        parent_id: cobol_hir::DataItemId,
+        param_value: Value,
+        group_offset: u32,
+    ) {
+        let parent = &self.hir.data_items[parent_id.into_raw()];
+        let children: Vec<cobol_hir::DataItemId> = parent.children.clone();
+        for child_id in children {
+            let child = &self.hir.data_items[child_id.into_raw()];
+            if let Some(child_name_sym) = child.name {
+                let child_name = self.interner.resolve(child_name_sym).to_string();
+                let child_offset = child.offset.saturating_sub(group_offset);
+                let child_size = child.storage.byte_size;
+                let scale = child.storage.picture.as_ref().map(|p| p.scale).unwrap_or(0);
+                let dot_pos = child
+                    .storage
+                    .picture
+                    .as_ref()
+                    .map(|p| Self::pic_dot_position(&p.pic_string))
+                    .unwrap_or(-1);
+                self.linkage_map.insert(
+                    child_name,
+                    LinkageInfo {
+                        param_value,
+                        offset: child_offset,
+                        byte_size: child_size,
+                        scale,
+                        dot_pos,
+                    },
+                );
+            }
+            // Recurse into nested groups
+            let child = &self.hir.data_items[child_id.into_raw()];
+            if child.is_group {
+                self.register_linkage_children(child_id, param_value, group_offset);
             }
         }
     }
@@ -3852,7 +3903,22 @@ impl<'a> MirLowerer<'a> {
                 let name = self.interner.resolve(dr.name).to_string();
                 // Check linkage params first (subprogram parameters)
                 if let Some(info) = self.linkage_map.get(&name) {
-                    return Some((info.param_value, info.byte_size));
+                    if info.offset == 0 {
+                        return Some((info.param_value, info.byte_size));
+                    }
+                    // Sub-field: compute base_ptr + offset
+                    let off_val = func.new_value();
+                    instructions.push(MirInst::Const {
+                        dest: off_val,
+                        value: MirConst::Int(info.offset as i64),
+                    });
+                    let addr = func.new_value();
+                    instructions.push(MirInst::IAdd {
+                        dest: addr,
+                        left: info.param_value,
+                        right: off_val,
+                    });
+                    return Some((addr, info.byte_size));
                 }
                 // Fall through to globals
                 if let Some((gname, size)) = self.resolve_data_ref(dr) {
@@ -5116,20 +5182,106 @@ impl<'a> MirLowerer<'a> {
             _ => return,
         };
 
-        // Collect argument addresses (BY REFERENCE → pointer to data item)
+        // Collect arguments based on their passing mode
         let mut arg_values = Vec::new();
         for call_arg in using {
-            if let cobol_hir::HirExpr::DataRef(dr) = &call_arg.value {
-                let name = self.interner.resolve(dr.name).to_string();
-                if let Some(info) = self.linkage_map.get(&name) {
-                    arg_values.push(info.param_value);
-                } else if let Some((gname, _size)) = self.resolve_data_ref(dr) {
-                    let addr = func.new_value();
-                    instructions.push(MirInst::GlobalAddr {
-                        dest: addr,
-                        name: gname,
-                    });
-                    arg_values.push(addr);
+            match call_arg.mode {
+                cobol_hir::CallArgMode::ByValue => {
+                    // BY VALUE: pass the actual value, not a pointer.
+                    // For literals, emit a constant; for data refs, load the value.
+                    match &call_arg.value {
+                        cobol_hir::HirExpr::Literal(cobol_hir::LiteralValue::Integer(n)) => {
+                            let v = func.new_value();
+                            instructions.push(MirInst::Const {
+                                dest: v,
+                                value: MirConst::Int(*n),
+                            });
+                            arg_values.push(v);
+                        }
+                        cobol_hir::HirExpr::DataRef(_) => {
+                            // Load the numeric value from the data item
+                            if let Some((addr, size)) =
+                                self.emit_expr_addr(&call_arg.value, func, instructions)
+                            {
+                                let sz = func.new_value();
+                                instructions.push(MirInst::Const {
+                                    dest: sz,
+                                    value: MirConst::Int(size as i64),
+                                });
+                                let val = func.new_value();
+                                instructions.push(MirInst::CallRuntime {
+                                    dest: Some(val),
+                                    func: "cobolrt_display_to_int".to_string(),
+                                    args: vec![addr, sz],
+                                });
+                                arg_values.push(val);
+                            }
+                        }
+                        _ => {
+                            // Other literal types — emit as 0
+                            let v = func.new_value();
+                            instructions.push(MirInst::Const {
+                                dest: v,
+                                value: MirConst::Int(0),
+                            });
+                            arg_values.push(v);
+                        }
+                    }
+                }
+                _ => {
+                    // BY REFERENCE / BY CONTENT: pass a pointer to the data item
+                    match &call_arg.value {
+                        cobol_hir::HirExpr::DataRef(dr) => {
+                            let name = self.interner.resolve(dr.name).to_string();
+                            if let Some(info) = self.linkage_map.get(&name) {
+                                if info.offset == 0 {
+                                    arg_values.push(info.param_value);
+                                } else {
+                                    let off_val = func.new_value();
+                                    instructions.push(MirInst::Const {
+                                        dest: off_val,
+                                        value: MirConst::Int(info.offset as i64),
+                                    });
+                                    let addr = func.new_value();
+                                    instructions.push(MirInst::IAdd {
+                                        dest: addr,
+                                        left: info.param_value,
+                                        right: off_val,
+                                    });
+                                    arg_values.push(addr);
+                                }
+                            } else if let Some((gname, _size)) = self.resolve_data_ref(dr) {
+                                let addr = func.new_value();
+                                instructions.push(MirInst::GlobalAddr {
+                                    dest: addr,
+                                    name: gname,
+                                });
+                                arg_values.push(addr);
+                            }
+                        }
+                        cobol_hir::HirExpr::Literal(cobol_hir::LiteralValue::String_(s)) => {
+                            // BY REFERENCE string literal: allocate as anonymous global
+                            let anon_name = format!("_CALL_LIT_{}", self.module.globals.len());
+                            let bytes = s.as_bytes().to_vec();
+                            let size = bytes.len() as u32;
+                            let global = MirGlobal {
+                                name: anon_name.clone(),
+                                ty: MirType::Bytes(size),
+                                initial_value: Some(MirConst::Bytes(bytes)),
+                                offset: 0,
+                                redefines: None,
+                                parent_offset: None,
+                            };
+                            self.module.globals.push(global);
+                            let addr = func.new_value();
+                            instructions.push(MirInst::GlobalAddr {
+                                dest: addr,
+                                name: anon_name,
+                            });
+                            arg_values.push(addr);
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
@@ -10685,6 +10837,9 @@ PROCEDURE DIVISION.
                     if func == "SUBPROG" && args.len() == 2)
             })
         });
-        assert!(has_call, "should have CallRuntime with 2 args (USING + RETURNING)");
+        assert!(
+            has_call,
+            "should have CallRuntime with 2 args (USING + RETURNING)"
+        );
     }
 }
