@@ -587,16 +587,44 @@ fn tokenize_line(text: &str, base_offset: u32, file_id: FileId, tokens: &mut Vec
                         break;
                     }
                 }
-                let kind = if has_dot {
-                    TokenKind::DecimalLiteral
+                // If digits are immediately followed by _ or letter, this is a
+                // word (e.g. "01_HELLO_WORLD", "88VALUE"). Continue scanning
+                // as a word token.
+                if pos < len
+                    && (bytes[pos] == b'_'
+                        || bytes[pos].is_ascii_uppercase()
+                        || bytes[pos].is_ascii_lowercase())
+                {
+                    while pos < len {
+                        let b = bytes[pos];
+                        if b.is_ascii_uppercase()
+                            || b.is_ascii_lowercase()
+                            || b.is_ascii_digit()
+                            || b == b'-'
+                            || b == b'_'
+                        {
+                            pos += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    tokens.push(Token {
+                        kind: TokenKind::Word,
+                        text: SmolStr::new(&text[start..pos]),
+                        span: make_span(file_id, base_offset, start as u32, pos as u32),
+                    });
                 } else {
-                    TokenKind::IntegerLiteral
-                };
-                tokens.push(Token {
-                    kind,
-                    text: SmolStr::new(&text[start..pos]),
-                    span: make_span(file_id, base_offset, start as u32, pos as u32),
-                });
+                    let kind = if has_dot {
+                        TokenKind::DecimalLiteral
+                    } else {
+                        TokenKind::IntegerLiteral
+                    };
+                    tokens.push(Token {
+                        kind,
+                        text: SmolStr::new(&text[start..pos]),
+                        span: make_span(file_id, base_offset, start as u32, pos as u32),
+                    });
+                }
             }
 
             // -----------------------------------------------------------
@@ -628,15 +656,17 @@ fn tokenize_line(text: &str, base_offset: u32, file_id: FileId, tokens: &mut Vec
                     continue;
                 }
 
-                // Regular word: letters, digits, hyphens.
+                // Regular word: letters, digits, hyphens, underscores.
                 // COBOL words can contain hyphens (e.g., WORKING-STORAGE,
-                // END-IF, PROGRAM-ID). They must start with a letter.
+                // END-IF, PROGRAM-ID). Underscores are a GnuCOBOL extension
+                // widely used in real-world code (e.g., F_PERSON).
                 while pos < len {
                     let b = bytes[pos];
                     if b.is_ascii_uppercase()
                         || b.is_ascii_lowercase()
                         || b.is_ascii_digit()
                         || b == b'-'
+                        || b == b'_'
                     {
                         pos += 1;
                     } else {

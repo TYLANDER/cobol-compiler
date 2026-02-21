@@ -701,6 +701,7 @@ impl<'t> Parser<'t> {
                 | TokenKind::Subtract
                 | TokenKind::Unstring
                 | TokenKind::Write_
+                | TokenKind::ExecSql
         ) || (self.current_kind() == TokenKind::Word && {
             let t = self.current_text_upper();
             matches!(
@@ -742,6 +743,7 @@ impl<'t> Parser<'t> {
                     | "SUBTRACT"
                     | "UNSTRING"
                     | "WRITE"
+                    | "EXEC"
             )
         })
     }
@@ -952,9 +954,9 @@ impl<'t> Parser<'t> {
             self.bump(); // PROGRAM
         }
         self.skip_ws();
-        // Consume the program name
-        if !self.at_end() && self.current_kind() != cobol_lexer::TokenKind::Period {
-            self.bump(); // program-name
+        // Consume the program name (may be multi-token, e.g. "01_HELLO_WORLD")
+        while !self.at_end() && self.current_kind() != cobol_lexer::TokenKind::Period {
+            self.bump();
         }
         self.skip_ws();
         // Consume the period
@@ -1009,12 +1011,32 @@ impl<'t> Parser<'t> {
         self.skip_ws();
         self.expect_period();
 
-        // Program name (a Word token)
+        // Program name — may be a word, a string literal, or a multi-token
+        // name containing digits/underscores (e.g. "01_HELLO_WORLD").
+        // Consume all tokens up to the period or IS/INITIAL/COMMON keywords.
         self.skip_ws();
-        if !self.at_end() && (self.at_identifier() || self.current_is_word_like()) {
+        let mut found_name = false;
+        while !self.at_end() && self.current_kind() != cobol_lexer::TokenKind::Period {
+            // Stop at IS/INITIAL/COMMON (optional clauses after program name)
+            if self.at_word("IS") || self.at_word("INITIAL") || self.at_word("COMMON") {
+                break;
+            }
             self.bump_as(SyntaxKind::WORD);
-        } else {
+            found_name = true;
+        }
+        if !found_name {
             self.error("expected program name");
+        }
+
+        // Optional IS INITIAL/COMMON clause
+        self.skip_ws();
+        if !self.at_end() && self.at_word("IS") {
+            self.bump(); // IS
+            self.skip_ws();
+        }
+        if !self.at_end() && (self.at_word("INITIAL") || self.at_word("COMMON")) {
+            self.bump(); // INITIAL or COMMON
+            self.skip_ws();
         }
 
         // Optional period after program name
@@ -1935,6 +1957,7 @@ impl<'t> Parser<'t> {
             TokenKind::Unstring => self.parse_unstring_stmt(),
             TokenKind::Start => self.parse_generic_stmt(SyntaxKind::START_STMT),
             TokenKind::Alter => self.parse_generic_stmt(SyntaxKind::ALTER_STMT),
+            TokenKind::ExecSql => self.parse_exec_block(),
             TokenKind::Enter => self.parse_generic_stmt(SyntaxKind::STATEMENT),
             _ if kind == TokenKind::Word => {
                 // Dispatch by text content for Word tokens
@@ -1973,6 +1996,7 @@ impl<'t> Parser<'t> {
                     "RELEASE" => self.parse_generic_stmt(SyntaxKind::RELEASE_STMT),
                     "RETURN" => self.parse_generic_stmt(SyntaxKind::RETURN_STMT),
                     "START" => self.parse_generic_stmt(SyntaxKind::START_STMT),
+                    "EXEC" | "EXECUTE" => self.parse_exec_block(),
                     _ => self.parse_generic_stmt(SyntaxKind::STATEMENT),
                 }
             }
@@ -3880,6 +3904,32 @@ impl<'t> Parser<'t> {
         self.start_node(SyntaxKind::CONTINUE_STMT);
         self.skip_ws();
         self.bump(); // CONTINUE
+        self.finish_node();
+    }
+
+    // ------------------------------------------------------------------
+    // EXEC SQL / EXEC CICS blocks (skip gracefully)
+    // ------------------------------------------------------------------
+
+    /// Parse EXEC SQL / EXEC CICS blocks by consuming everything until
+    /// END-EXEC. The block content is preserved in the CST but not
+    /// semantically analyzed. This allows programs with embedded SQL/CICS
+    /// to compile (SQL/CICS statements become no-ops).
+    fn parse_exec_block(&mut self) {
+        self.start_node(SyntaxKind::STATEMENT);
+        self.bump(); // EXEC or EXECUTE
+        self.skip_ws();
+        // Consume tokens until END-EXEC or period
+        while !self.at_end() {
+            if self.at_word("END-EXEC") || self.at_word("ENDEXEC") {
+                self.bump(); // END-EXEC
+                break;
+            }
+            if self.current_kind() == cobol_lexer::TokenKind::Period {
+                break;
+            }
+            self.bump();
+        }
         self.finish_node();
     }
 

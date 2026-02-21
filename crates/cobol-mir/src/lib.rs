@@ -5134,15 +5134,21 @@ impl<'a> MirLowerer<'a> {
             }
         }
 
-        // RETURNING is not yet implemented — emit a structured error so the
-        // compiler exits gracefully instead of panicking.
-        if returning.is_some() {
-            self.module.errors.push(
-                "CALL ... RETURNING is not yet supported. \
-                 Remove the RETURNING clause or use BY REFERENCE parameters instead."
-                    .to_string(),
-            );
-            return;
+        // RETURNING clause: pass the return variable as an extra BY REFERENCE
+        // argument. The called program's PROCEDURE DIVISION RETURNING writes to
+        // this pointer, which updates the caller's variable in place.
+        if let Some(ret_ref) = returning {
+            let name = self.interner.resolve(ret_ref.name).to_string();
+            if let Some(info) = self.linkage_map.get(&name) {
+                arg_values.push(info.param_value);
+            } else if let Some((gname, _size)) = self.resolve_data_ref(ret_ref) {
+                let addr = func.new_value();
+                instructions.push(MirInst::GlobalAddr {
+                    dest: addr,
+                    name: gname,
+                });
+                arg_values.push(addr);
+            }
         }
 
         instructions.push(MirInst::CallRuntime {
@@ -10642,9 +10648,9 @@ mod tests {
     // ------------------------------------------------------------------
 
     #[test]
-    fn call_returning_produces_error_not_panic() {
-        // CALL ... RETURNING should produce a structured error in
-        // mir.errors rather than panicking.
+    fn call_returning_compiles_successfully() {
+        // CALL ... RETURNING should compile without errors.
+        // The RETURNING variable is passed as an extra BY REFERENCE argument.
         let src = r#"
 IDENTIFICATION DIVISION.
 PROGRAM-ID. TEST-RET.
@@ -10665,16 +10671,20 @@ PROCEDURE DIVISION.
         let hir = cobol_hir::lower(&sf, &mut interner, file_id);
         let mir = lower(&hir, &interner);
 
-        // Should NOT have panicked. Instead, errors should contain a message
-        // about RETURNING not being supported.
+        // Should compile without errors.
         assert!(
-            !mir.errors.is_empty(),
-            "MIR should contain an error for CALL RETURNING"
+            mir.errors.is_empty(),
+            "CALL RETURNING should compile successfully, got: {:?}",
+            mir.errors
         );
-        assert!(
-            mir.errors[0].contains("RETURNING"),
-            "error message should mention RETURNING, got: {}",
-            mir.errors[0]
-        );
+        // Should have a CallRuntime with 2 args (WS-X + WS-RET)
+        let main_func = &mir.functions[0];
+        let has_call = main_func.blocks.iter().any(|b| {
+            b.instructions.iter().any(|i| {
+                matches!(i, MirInst::CallRuntime { func, args, .. }
+                    if func == "SUBPROG" && args.len() == 2)
+            })
+        });
+        assert!(has_call, "should have CallRuntime with 2 args (USING + RETURNING)");
     }
 }
